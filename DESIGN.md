@@ -14,6 +14,11 @@ way, fix the disagreement before building on it.
   removing them (see §5) is what this design is shaped around.
 - **Game-like**: 6-DOF flight, nested rotating reference frames you can ride, levels of detail
   that resolve from mote → label → card → full content as you approach.
+- **The Milky Way test**: using the library one can build a game that shows the full Milky Way
+  with all its real clusterings — spiral arms, star clusters, solar systems, planetary systems —
+  and fly it continuously from the galactic rim down to a single planet, close enough that Earth
+  shows oceans and continents. Not v1 scope; it is the stress test every API decision is checked
+  against (§12).
 - **Hierarchy without limits**: group nodes on arbitrarily many levels; every level picks its own
   arrangement, distribution, spacing and rotation. The predecessor hardcoded two levels
   (galaxy/system); starscape takes a list.
@@ -64,6 +69,9 @@ interface Graph {
 (offsets + neighbours + edge indices) and the importance-ordered link buffer. ~8 bytes per link,
 not the ~130 of object-shaped graph libraries. Any reduction over a node-length array is a loop
 — spreading a typed array into a call blows the stack at 10⁶ (measured in the predecessor).
+
+A `Graph` is one eager *source*, good to ~10⁷. Chunked and procedural sources (§12) present the
+same columnar shape per chunk, so nothing downstream may assume "all nodes exist".
 
 ### 3.2 The spec: a scene grammar
 
@@ -283,7 +291,41 @@ Stage 3 is deliberately early and small: it is the TSL/WebGPU risk retired befor
 depends on it. If TSL proves unworkable for the glyph shader, the fallback is raw
 GLSL/WebGL2 with the material behind an interface — decided there, not later.
 
-## 12. Open questions
+Post-v1, the Milky Way test (§12) drives the next arc: chunked sources, floating origin, and
+the mote → mesh handoff demo.
+
+## 12. The Milky Way test
+
+The goal in §1, unpacked into what it demands of the design — none of it v1 scope, all of it
+shaping v1 decisions:
+
+- **Dynamic range.** Galactic disc to coastline is ~16 orders of magnitude, far past Float32's
+  ~7 significant digits. The answer is structural, and the hierarchy already is it: a position
+  lives in its *frame's* local space (planet in system, system in cluster, cluster in galaxy),
+  so no stored coordinate ever spans the full range. Rendering is camera-relative — the
+  floating origin is subtracted at *pivot* granularity on the CPU, never per node — with a
+  logarithmic depth buffer. The rule for every API: world space is a chain of local spaces; a
+  global Float32 coordinate does not exist.
+- **Population.** 10¹¹ stars do not fit in one typed array. The eager `Graph` stays the v1
+  source (§3.1); the game needs a chunked **source** behind the same columnar shape — a region
+  materializes as you approach it, and because placement is deterministic (§3.3), a chunk can
+  be *generated* on demand rather than stored: a procedural universe is `hash(i, salt)` all the
+  way down. Budgets, picking and the ladder therefore operate on what is *resident*, never on
+  "all nodes" — a constraint cheap to honor from stage 2 and expensive to retrofit.
+- **Mote → mesh.** The zoom ladder's top tier is content-agnostic: `getBody(i)` may return an
+  HTML body *or a custom layer object* (§5 tier 3) — a textured, shaded sphere with its own
+  surface LOD is the app's business. The library's job is the handoff: sprite and mesh
+  co-located in the same frame chain, cross-faded with no pop, so approaching Earth is one
+  continuous act from mote to oceans.
+- **Orbits are frames.** Planets around stars, stars around the core: the nested spin frames of
+  §3.5, with per-level rates and axes. "Ride it" is how you stand on a turning body and watch
+  its moons move.
+
+Acceptance scenario, after stage 10: one uninterrupted flight — galactic rim → a spiral arm →
+an open cluster → a solar system → a planet showing coasts on its day side — with telemetry
+reporting frame-chain depth and resident-set size the whole way down.
+
+## 13. Open questions
 
 - Label rendering at scale: DOM labels cap out in the hundreds; an SDF glyph atlas is the
   likely stage-7 answer, sized by what stage 9 measures.
@@ -291,5 +333,8 @@ GLSL/WebGL2 with the material behind an interface — decided there, not later.
   storage-buffer limits actually available (stage 6).
 - In-browser layout as a compute-shader plugin (post-v1): the frozen-layout philosophy stays
   the default either way.
+- Chunked-source protocol (§12): what a chunk promises (counts, extents, facet dictionaries),
+  and when it may be evicted — sketched during stage 2 so the API never assumes full residency,
+  decided post-v1.
 - VR/XR: nothing in the design precludes it (three.js carries it); explicitly out of scope
   until after stage 10.
