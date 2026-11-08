@@ -21,7 +21,9 @@
 
 /** Reorder `links` (2m node-index pairs) by descending worth. `group` is a categorical
  *  assignment per node (the predecessor's "community"), or null to rank by length alone.
- *  `pos` is the 3n frozen layout the lengths are measured in. Pure and deterministic;
+ *  `pos` is the 3n frozen layout the lengths are measured in, or null when no layout
+ *  exists — then every quantised length is 0 and the ordering degenerates to
+ *  intra-group-before-inter, which needs no geometry at all. Pure and deterministic;
  *  returns the input array untouched when there is nothing to order (m < 2).
  *
  *  NOTE: order links BEFORE building the CSR — the CSR stores edge indices, so permuting
@@ -30,7 +32,7 @@ export function orderLinks(
   n: number,
   links: Uint32Array,
   group: ArrayLike<number> | null,
-  pos: Float32Array,
+  pos: Float32Array | null,
 ): Uint32Array {
   void n; // part of the shared signature; the ordering needs only links/group/pos
   const m = links.length >> 1;
@@ -38,17 +40,23 @@ export function orderLinks(
   const BITS = 15;
   const SPAN = (1 << BITS) - 1;
 
-  // one pass for the length scale, so the quantisation uses the range the data actually has
-  let maxL = 0;
-  const len = new Float32Array(m);
-  for (let e = 0; e < m; e++) {
-    const a = links[e * 2]! * 3;
-    const b = links[e * 2 + 1]! * 3;
-    const L = Math.hypot(pos[a]! - pos[b]!, pos[a + 1]! - pos[b + 1]!, pos[a + 2]! - pos[b + 2]!);
-    len[e] = L;
-    if (L > maxL) maxL = L;
+  // one pass for the length scale, so the quantisation uses the range the data actually
+  // has. Without positions there are no lengths: skip the pass and treat every quantised
+  // length as 0, leaving only the inter bit to order by.
+  let q = 0;
+  let len: Float32Array | null = null;
+  if (pos) {
+    let maxL = 0;
+    len = new Float32Array(m);
+    for (let e = 0; e < m; e++) {
+      const a = links[e * 2]! * 3;
+      const b = links[e * 2 + 1]! * 3;
+      const L = Math.hypot(pos[a]! - pos[b]!, pos[a + 1]! - pos[b + 1]!, pos[a + 2]! - pos[b + 2]!);
+      len[e] = L;
+      if (L > maxL) maxL = L;
+    }
+    q = maxL > 0 ? SPAN / maxL : 0;
   }
-  const q = maxL > 0 ? SPAN / maxL : 0;
 
   const key = new Uint16Array(m);
   for (let e = 0; e < m; e++) {
@@ -58,7 +66,8 @@ export function orderLinks(
     // 15 bits of length under 1 bit of inter-ness: intra sorts entirely before inter, and
     // within each half, short before long. The SPAN>>1 clamp folds the long tail into one
     // bucket — past half the max length, finer ranking buys nothing.
-    key[e] = (inter << BITS) | Math.min(SPAN >> 1, (len[e]! * q) | 0);
+    const bucket = len ? Math.min(SPAN >> 1, (len[e]! * q) | 0) : 0;
+    key[e] = (inter << BITS) | bucket;
   }
 
   const B = 1 << 16;

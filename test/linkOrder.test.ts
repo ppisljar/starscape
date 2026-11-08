@@ -15,6 +15,15 @@ function fnv1a(bytes: Uint8Array): number {
   return h >>> 0;
 }
 
+/** Byte-for-byte equality of two typed arrays — the literal determinism contract. */
+function bytesEqual(x: Uint32Array, y: Uint32Array): boolean {
+  if (x.byteLength !== y.byteLength) return false;
+  const a = new Uint8Array(x.buffer, x.byteOffset, x.byteLength);
+  const b = new Uint8Array(y.buffer, y.byteOffset, y.byteLength);
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+  return true;
+}
+
 /** A small positioned graph with two spatial groups, fully deterministic from hash(). */
 function makeGraph(n: number, m: number, seed: number) {
   const pos = new Float32Array(n * 3);
@@ -129,6 +138,49 @@ describe('orderLinks', () => {
       if (inter && firstInter === ordered.length >> 1) firstInter = e;
       if (!inter) expect(e).toBeLessThan(firstInter);
     }
+    // and it is deterministic: a second call over the same degenerate layout is byte-identical
+    const again = orderLinks(64, links, group, flat);
+    expect(bytesEqual(ordered, again)).toBe(true);
+  });
+
+  it('pos = null: ordering degenerates to intra-before-inter, no geometry needed', () => {
+    const ordered = orderLinks(64, links, group, null);
+    expect(ordered.length).toBe(links.length);
+    const m2 = ordered.length >> 1;
+    let firstInter = m2;
+    for (let e = 0; e < m2; e++) {
+      const inter = group[ordered[e * 2]!] !== group[ordered[e * 2 + 1]!];
+      if (inter && firstInter === m2) firstInter = e;
+      if (!inter) expect(e).toBeLessThan(firstInter);
+    }
+    expect(firstInter).toBeGreaterThan(0);
+    expect(firstInter).toBeLessThan(m2);
+    // byte-identical across calls
+    const again = orderLinks(64, links, group, null);
+    expect(bytesEqual(ordered, again)).toBe(true);
+  });
+
+  it('a single-group array is byte-identical to group = null (pos non-null)', () => {
+    // when every node shares one group the inter bit is 0 for every link, so ordering must
+    // degenerate to exactly the length-only ranking that group = null produces
+    const uniform = new Uint8Array(64); // all zeros: one group
+    const a = orderLinks(64, links, uniform, pos);
+    const b = orderLinks(64, links, null, pos);
+    expect(bytesEqual(a, b)).toBe(true);
+  });
+
+  it('does not mutate its inputs: links and pos are unchanged byte-for-byte', () => {
+    const before = [
+      fnv1a(new Uint8Array(links.buffer, links.byteOffset, links.byteLength)),
+      fnv1a(new Uint8Array(pos.buffer, pos.byteOffset, pos.byteLength)),
+    ];
+    orderLinks(64, links, group, pos);
+    orderLinks(64, links, group, null);
+    const after = [
+      fnv1a(new Uint8Array(links.buffer, links.byteOffset, links.byteLength)),
+      fnv1a(new Uint8Array(pos.buffer, pos.byteOffset, pos.byteLength)),
+    ];
+    expect(after).toEqual(before); // DESIGN §4: nothing mutates in place
   });
 
   it('is deterministic: two calls are byte-identical', () => {

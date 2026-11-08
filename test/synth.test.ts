@@ -30,6 +30,19 @@ describe('generateSynth', () => {
     expect(fnv1a(bytesOf(a.columns!['words'] as Uint32Array))).toBe(fnv1a(bytesOf(b.columns!['words'] as Uint32Array)));
   });
 
+  it('GOLDEN: {n:1000, seed:42} positions+links pin a recorded FNV-1a digest', () => {
+    // A real golden, not two-runs-agree: the determinism test above would pass even if the
+    // generator's bytes silently changed (reordered streams, new salts). This constant was
+    // recorded from a run and pins the actual output forever (DESIGN.md §10.9).
+    const g = generateSynth({ n: 1000, seed: 42 });
+    const pb = bytesOf(g.positions!);
+    const lb = bytesOf(g.links);
+    const cat = new Uint8Array(pb.length + lb.length);
+    cat.set(pb, 0);
+    cat.set(lb, pb.length);
+    expect(fnv1a(cat)).toBe(4136852649);
+  });
+
   it('a different seed produces different bytes', () => {
     const a = generateSynth({ n: 5000, seed: 7 });
     const b = generateSynth({ n: 5000, seed: 8 });

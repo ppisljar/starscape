@@ -27,14 +27,25 @@ describe('buildGraph: dedup', () => {
       n: 4,
       links: Uint32Array.from([0, 1, 1, 0, 2, 2, 0, 1, 1, 2, 2, 1]),
     });
-    // no positions -> no reordering, so the buffer is the canonical first-seen pairs
+    // no positions/facet -> no reordering, so the buffer is the canonical pairs in
+    // ascending (lo, hi) order — the bucketed dedup emits them sorted, not first-seen
     expect(Array.from(g.links)).toEqual([0, 1, 1, 2]);
     expect(g.counts).toEqual({ nodes: 4, links: 2 });
   });
 
   it('canonicalises orientation: a pair arrives as (lo, hi) regardless of direction', () => {
     const g = buildGraph({ n: 5, links: Uint32Array.from([4, 1, 3, 0]) });
-    expect(Array.from(g.links)).toEqual([1, 4, 0, 3]);
+    expect(Array.from(g.links)).toEqual([0, 3, 1, 4]);
+  });
+
+  it('self-link-only input: zero links, zero degrees, empty CSR', () => {
+    const g = buildGraph({ n: 3, links: Uint32Array.from([0, 0, 1, 1, 2, 2]) });
+    expect(g.counts.links).toBe(0);
+    expect(g.links.length).toBe(0);
+    expect(Array.from(g.columns['degree']!.data)).toEqual([0, 0, 0]);
+    expect(Array.from(g.csr.off)).toEqual([0, 0, 0, 0]);
+    expect(g.csr.nbr.length).toBe(0);
+    expect(g.csr.edge.length).toBe(0);
   });
 
   it('handles the empty graph', () => {
@@ -114,6 +125,16 @@ describe('buildGraph: validation', () => {
     ).toThrowError(/facet "type"/);
   });
 
+  it('throws on a facet code outside its values table, naming facet/node/code/size', () => {
+    expect(() =>
+      buildGraph({
+        n: 2,
+        links: new Uint32Array(0),
+        facets: { type: { values: ['note'], data: Uint8Array.from([0, 7]) } },
+      }),
+    ).toThrowError(/facet "type" code 7 at node 1 .*1 entries/);
+  });
+
   it('throws on a column whose length is not n', () => {
     expect(() =>
       buildGraph({ n: 4, links: new Uint32Array(0), columns: { w: new Uint32Array(5) } }),
@@ -162,6 +183,29 @@ describe('buildGraph: link ordering and CSR agreement', () => {
       { orderByFacet: 'group' },
     );
     expect(Array.from(g.links)).toEqual([0, 1, 2, 3, 0, 2]);
+  });
+
+  it('orderByFacet WITHOUT positions still orders intra-group before inter', () => {
+    // The intra-before-inter half of the contract needs no geometry: a budget cutting the
+    // tail must drop the inter-group chord, not an intra-group edge, positions or not.
+    const g = buildGraph(
+      {
+        n: 4,
+        links: Uint32Array.from([0, 2, 0, 1, 2, 3]),
+        facets: { grp: { values: ['a', 'b'], data: Uint8Array.from([0, 0, 1, 1]) } },
+      },
+      { orderByFacet: 'grp' },
+    );
+    expect(g.positions).toBeNull();
+    // dedup yields (0,1), (0,2), (2,3); ordering demotes the inter link (0,2) to the end
+    expect(Array.from(g.links)).toEqual([0, 1, 2, 3, 0, 2]);
+  });
+
+  it('positions WITHOUT orderByFacet: length-only ordering through the full pipeline', () => {
+    // (0,1) spans 50 units, (1,2) spans 1 — short before long, no facet involved
+    const positions = Float32Array.from([0, 0, 0, 50, 0, 0, 51, 0, 0]);
+    const g = buildGraph({ n: 3, positions, links: Uint32Array.from([0, 1, 1, 2]) });
+    expect(Array.from(g.links)).toEqual([1, 2, 0, 1]);
   });
 
   it('CSR is built from the ORDERED buffer: edge indices resolve to the links they sit at', () => {
@@ -215,14 +259,53 @@ function synthInput(n: number, m: number): GraphInput {
 }
 
 describe('buildGraph: determinism (golden)', () => {
-  it('fixed input -> byte-identical ordered links and offsets, pinned by FNV-1a', () => {
+  it('fixed input -> byte-identical links, CSR and degree, pinned by FNV-1a', () => {
     const a = buildGraph(synthInput(64, 200), { orderByFacet: 'g' });
     const b = buildGraph(synthInput(64, 200), { orderByFacet: 'g' });
-    const ha = fnv1a([a.links, a.csr.off]);
-    const hb = fnv1a([b.links, b.csr.off]);
+    const parts = (g: typeof a) => [
+      g.links,
+      g.csr.off,
+      g.csr.nbr,
+      g.csr.edge,
+      g.columns['degree']!.data as Uint32Array,
+    ];
+    const ha = fnv1a(parts(a));
+    const hb = fnv1a(parts(b));
     expect(ha).toBe(hb);
-    // Golden: pins the exact bytes across refactors. If this moves, dedup order, link
-    // ranking, or CSR layout changed — that is a breaking change, not noise.
-    expect(ha).toBe(1724496879);
+    // Golden: pins the exact bytes across refactors — links AND the full CSR (off, nbr,
+    // edge) AND the computed degree column, so a permuted scatter order or a changed
+    // degree pass cannot hide behind unchanged offsets. If this moves, dedup order, link
+    // ranking, CSR layout, or degree computation changed — a breaking change, not noise.
+    // Re-recorded for the typed-array dedup (pairs now emitted in (lo, hi)-sorted order,
+    // not first-seen) and the widened fingerprint; the prior links+off-only golden was
+    // 1724496879.
+    expect(ha).toBe(72153371);
+  });
+
+  it('does not mutate its inputs: links, positions, facet data unchanged byte-for-byte', () => {
+    const input = synthInput(64, 200);
+    const u8 = (x: Uint32Array | Float32Array | Uint16Array | Uint8Array) =>
+      new Uint8Array(x.buffer, x.byteOffset, x.byteLength);
+    const fnvBytes = (bts: Uint8Array) => {
+      let h = 0x811c9dc5;
+      for (let i = 0; i < bts.length; i++) {
+        h = (h ^ bts[i]!) >>> 0;
+        h = Math.imul(h, 0x01000193) >>> 0;
+      }
+      return h >>> 0;
+    };
+    const facetData = input.facets!['g']!.data;
+    const before = [
+      fnvBytes(u8(input.links)),
+      fnvBytes(u8(input.positions!)),
+      fnvBytes(u8(facetData)),
+    ];
+    buildGraph(input, { orderByFacet: 'g' });
+    const after = [
+      fnvBytes(u8(input.links)),
+      fnvBytes(u8(input.positions!)),
+      fnvBytes(u8(facetData)),
+    ];
+    expect(after).toEqual(before); // §4: stages compose; nothing mutates in place
   });
 });

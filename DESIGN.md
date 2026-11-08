@@ -55,13 +55,13 @@ contents do not), and the materials (TSL instead of raw GLSL, §6).
 ### 3.1 Graph: columns, never objects
 
 ```ts
-interface Graph {
-  n: number;
-  positions?: Float32Array;            // 3n, optional frozen layout
+interface Graph {                      // the COMPILED graph; buildGraph's input takes
+  n: number;                           // `positions?` and `labels?`
+  positions: Float32Array | null;      // 3n frozen layout, or null when none was given
   links: Uint32Array;                  // 2m node-index pairs
   columns: Record<string, NumericColumn>;      // degree, words, rank, …
   facets: Record<string, Facet>;       // categorical: { values: string[], data: Uint8/16/32Array }
-  labels?: LabelSource;                // i => string, lazy; never 10⁶ eager strings
+  labelOf: (i: number) => string;      // lazy, called on demand; never 10⁶ eager strings
 }
 ```
 

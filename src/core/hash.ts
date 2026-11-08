@@ -10,7 +10,12 @@
  */
 
 /** Uniform in [0, 1), a pure function of (i, salt). Integer-mix finalizer over a
- *  golden-ratio-salted product; different salts give independent streams. */
+ *  golden-ratio-salted product; different salts give independent streams.
+ *
+ *  `i` is treated as a 32-bit integer (the `^` applies ToInt32), so the valid index domain
+ *  is [0, 2^32) — indices beyond that alias mod 2^32. For §12-scale procedural sources the
+ *  chunk id must fold into `salt` and indices stay chunk-local; that is the designed
+ *  answer, not a larger hash. */
 export function hash(i: number, salt: number): number {
   let x = Math.imul(i ^ Math.imul(salt, 0x9e3779b1), 2654435761) >>> 0;
   x ^= x >>> 15;

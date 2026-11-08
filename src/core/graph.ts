@@ -20,13 +20,15 @@ function defaultLabel(i: number): string {
 
 /** Compile a GraphInput into the shape every downstream module reads.
  *
- *  - Validates link endpoints (< n), facet/column lengths (=== n), position length (=== 3n).
+ *  - Validates link endpoints (< n), facet/column lengths (=== n), facet codes (< the
+ *    facet's values table), position length (=== 3n).
  *  - Dedups directed links into unique undirected pairs, dropping self-links; pairs come out
- *    canonicalised as (lo, hi) in first-seen order.
+ *    canonicalised as (lo, hi) in ascending (lo, hi) order.
  *  - Computes a `degree` column over the deduped undirected links unless one was provided.
  *  - Orders links by worth (intra-group before inter, short before long) when positions
- *    exist, grouping by `opts.orderByFacet`; without positions there is no length to rank
- *    by and the deduped order stands.
+ *    or a group facet exist, grouping by `opts.orderByFacet`; without positions every
+ *    length ranks 0, so ordering degenerates to intra-before-inter. With neither positions
+ *    nor a facet the deduped order stands.
  *  - Builds the CSR from the ORDERED buffer, so edge indices match what gets drawn. */
 export function buildGraph(input: GraphInput, opts?: { orderByFacet?: string }): Graph {
   const n = input.n;
@@ -40,18 +42,21 @@ export function buildGraph(input: GraphInput, opts?: { orderByFacet?: string }):
     throw new Error(`buildGraph: links has odd length ${input.links.length}, expected 2m pairs`);
   }
 
-  /* ---- validate + dedup in one pass -------------------------------------------------
+  /* ---- validate + dedup, typed arrays only -------------------------------------------
+     NOT a Map<lo, Set<hi>>: that shape allocates up to n JS Set objects plus one entry per
+     link — measured at n=1e6, m=4e6 it alone cost 1304 ms and ~263 MB of transient heap,
+     a large bite out of the §9 boot budget and a literal §10.2 violation (no per-node JS
+     objects). Instead: canonicalise each pair to (lo, hi), counting-sort the pairs by lo
+     into CSR-style buckets (two linear passes over two Uint32Arrays), sort each bucket's
+     hi values in place (buckets are small — avg degree), then emit unique pairs in one
+     linear pass. No per-node or per-link JS object anywhere.
+
      The predecessor keyed its dedup set on `a * n + b`, which silently collapses distinct
-     pairs once n*n passes 2^53 (n ≈ 9.5e7) — Number can no longer represent every key. We
-     use a split key instead: a Map from the low endpoint to the Set of high endpoints. All
-     keys stay small exact integers at any n, and no per-link string is ever allocated (the
-     other safe option, `${a}:${b}` keys, pays a string per link). The structure is transient
-     — dropped before this function returns. */
+     pairs once n*n passes 2^53 (n ≈ 9.5e7); lo/hi stay exact at any n. NOTE: pairs come out
+     sorted by (lo, hi), not in first-seen order — the order is deterministic either way. */
   const links = input.links;
   const m0 = links.length >> 1;
-  const seen = new Map<number, Set<number>>();
-  const buf = new Uint32Array(m0 * 2); // upper bound; sliced tight below
-  let w = 0;
+  const start = new Uint32Array(n + 1); // start[lo + 1] counts pairs whose low end is lo
   for (let e = 0; e < m0; e++) {
     const a = links[e * 2]!;
     const b = links[e * 2 + 1]!;
@@ -59,17 +64,36 @@ export function buildGraph(input: GraphInput, opts?: { orderByFacet?: string }):
     if (b >= n) throw new Error(`buildGraph: link ${e} endpoint ${b} out of range (n = ${n})`);
     if (a === b) continue; // self-link: no geometry, no adjacency information
     const lo = a < b ? a : b;
-    const hi = a < b ? b : a;
-    let set = seen.get(lo);
-    if (set === undefined) {
-      set = new Set<number>();
-      seen.set(lo, set);
+    start[lo + 1] = start[lo + 1]! + 1;
+  }
+  for (let i = 0; i < n; i++) start[i + 1] = start[i + 1]! + start[i]!; // prefix sum: bucket starts
+  const total = n > 0 ? start[n]! : 0;
+  const his = new Uint32Array(total); // hi endpoints, bucketed by lo
+  const cur = start.slice(0, n); // write cursors; `start` itself must survive
+  for (let e = 0; e < m0; e++) {
+    const a = links[e * 2]!;
+    const b = links[e * 2 + 1]!;
+    if (a === b) continue;
+    const lo = a < b ? a : b;
+    const c = cur[lo]!;
+    his[c] = a < b ? b : a;
+    cur[lo] = c + 1;
+  }
+  const buf = new Uint32Array(total * 2); // upper bound; sliced tight below
+  let w = 0;
+  for (let lo = 0; lo < n; lo++) {
+    const s = start[lo]!;
+    const t = start[lo + 1]!;
+    if (t - s > 1) his.subarray(s, t).sort(); // numeric ascending; in place, bucket-local
+    let prev = -1;
+    for (let k = s; k < t; k++) {
+      const hi = his[k]!;
+      if (hi === prev) continue; // a->b and b->a (and repeats) are the same physical line
+      prev = hi;
+      buf[w] = lo;
+      buf[w + 1] = hi;
+      w += 2;
     }
-    if (set.has(hi)) continue; // a->b and b->a are the same physical line
-    set.add(hi);
-    buf[w] = lo;
-    buf[w + 1] = hi;
-    w += 2;
   }
   const deduped = w === buf.length ? buf : buf.slice(0, w);
   const m = w >> 1;
@@ -104,14 +128,27 @@ export function buildGraph(input: GraphInput, opts?: { orderByFacet?: string }):
       if (f.data.length !== n) {
         throw new Error(`buildGraph: facet "${key}" has ${f.data.length} values, expected n = ${n}`);
       }
+      // every code must index into the values table — an out-of-range code would surface
+      // later as `values[data[i]] === undefined` in whatever channel binds the facet:
+      // an invisible category instead of a boot-time error (silent, not loud).
+      const tableSize = f.values.length;
+      for (let i = 0; i < n; i++) {
+        if (f.data[i]! >= tableSize) {
+          throw new Error(
+            `buildGraph: facet "${key}" code ${f.data[i]} at node ${i} is out of range ` +
+              `(values table has ${tableSize} entries)`,
+          );
+        }
+      }
       facets[key] = { key, values: f.values, data: f.data };
     }
   }
 
   /* ---- rank, THEN adjacency ----------------------------------------------------------
-     orderLinks measures worth partly as length, so without a frozen layout there is nothing
-     to rank by and the deduped order stands. With positions, group by the requested facet
-     (intra-group links outrank inter-group ones) or by length alone. */
+     orderLinks ranks by the inter bit and by length. With positions, group by the requested
+     facet (intra-group links outrank inter-group ones) or by length alone. Without positions
+     the intra-before-inter half of the contract still applies — a facet alone orders the
+     buffer (every length ranks 0). Only with neither does the deduped order stand. */
   let group: ArrayLike<number> | null = null;
   if (opts?.orderByFacet !== undefined) {
     const f = facets[opts.orderByFacet];
@@ -120,7 +157,7 @@ export function buildGraph(input: GraphInput, opts?: { orderByFacet?: string }):
     }
     group = f.data;
   }
-  const ordered = positions ? orderLinks(n, deduped, group, positions) : deduped;
+  const ordered = positions || group ? orderLinks(n, deduped, group, positions ?? null) : deduped;
   const csr = buildCSR(n, ordered);
 
   return {
