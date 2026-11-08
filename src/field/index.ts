@@ -12,4 +12,16 @@ export {
   uniformSizes,
 } from './channels';
 export { facetPalette, hslToRgb, paintFacetColors, GOLDEN } from './palette';
+export {
+  createFocus,
+  BOOST_HOVER,
+  BOOST_NEAR,
+  BOOST_SELECT,
+  DIM_OTHERS,
+  FOCUS_REST,
+  LINK_DIM_ALPHA,
+  LINK_FOCUS_ALPHA,
+  LINK_HOVER_ALPHA,
+} from './focus';
+export type { Focus, FocusOpts } from './focus';
 export * from './constants';

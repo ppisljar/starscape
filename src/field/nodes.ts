@@ -6,8 +6,11 @@
  * What is ported at stage 3: the view-space billboard sized by the real projection (world
  * radius → projected CSS px → clamped → back to a world radius at this depth), the glyph
  * distance-field families, the pixel-unit halo with a solid body, the hot core, the fog, and
- * the cheap flat branch under FLAT_PX. What waits: hover/selection boost + per-node alpha
- * (stage 4), rim bubbles and sphere shading and the full theming (stage 8).
+ * the cheap flat branch under FLAT_PX. Stage 4 adds the predecessor's two focus channels:
+ * iAlpha (selection dim: 1 lit, dimOthers dimmed) and iBoost (hover/selection size emphasis —
+ * it scales the glyph AND its clamp bounds, so an emphasised node grows even when pinned at
+ * NODE_MIN_PX/NODE_MAX_PX, which is most of a distant field). What waits: rim bubbles, sphere
+ * shading and the full theming (stage 8).
  */
 
 import {
@@ -61,6 +64,10 @@ export interface NodeLayer {
   sizes: Float32Array;
   sizeAttr: InstancedBufferAttribute;
   shapeAttr: InstancedBufferAttribute;
+  /** Per-instance focus alpha (n) — written by the focus state on selection change. */
+  alphaAttr: InstancedBufferAttribute;
+  /** Per-instance hover/selection boost (n) — written by the focus state on hover change. */
+  boostAttr: InstancedBufferAttribute;
   uniforms: {
     /** HALF the viewport height, CSS px (one pixel unit — see constants.ts). */
     halfH: { value: number };
@@ -75,13 +82,16 @@ export interface NodeLayer {
 }
 
 /** Build the instanced node quad. `positions` is the frozen 3n layout (uploaded once);
- *  `colors`/`sizes`/`shapes` are per-instance channels the Field mutates in place. */
+ *  `colors`/`sizes`/`shapes`/`alphas`/`boosts` are per-instance channels the Field (and its
+ *  focus state) mutates in place. */
 export function buildNodeLayer(
   n: number,
   positions: Float32Array,
   colors: Float32Array,
   sizes: Float32Array,
   shapes: Float32Array,
+  alphas: Float32Array,
+  boosts: Float32Array,
   opts: { fov: number; heightCss: number; dRef: number; fogNear: number; fogFar: number },
 ): NodeLayer {
   /* ---- geometry: one unit quad, instanced n times. Per-instance data lives in instanced
@@ -99,10 +109,14 @@ export function buildNodeLayer(
   const colorAttr = new InstancedBufferAttribute(colors, 3);
   const sizeAttr = new InstancedBufferAttribute(sizes, 1);
   const shapeAttr = new InstancedBufferAttribute(shapes, 1);
+  const alphaAttr = new InstancedBufferAttribute(alphas, 1);
+  const boostAttr = new InstancedBufferAttribute(boosts, 1);
   geo.setAttribute('iPos', posAttr);
   geo.setAttribute('iColor', colorAttr);
   geo.setAttribute('iSize', sizeAttr);
   geo.setAttribute('iShape', shapeAttr);
+  geo.setAttribute('iAlpha', alphaAttr);
+  geo.setAttribute('iBoost', boostAttr);
 
   /* ---- uniforms. CSS pixels throughout; devicePixelRatio is the renderer's business, once. */
   const uHalfH = uniform(opts.heightCss / 2);
@@ -118,12 +132,16 @@ export function buildNodeLayer(
      view space by scaleNode, exactly the predecessor's `mv.xy += position.xy * (r * 2)`. */
   const iPos = attribute('iPos', 'vec3');
   const iSize = attribute('iSize', 'float');
+  const iBoost = attribute('iBoost', 'float');
   const centerView = modelViewMatrix.mul(vec4(iPos, 1.0));
   const depth = max(centerView.z.negate(), 0.001);
-  const rw = iSize.mul(NODE_SCALE);
+  /* Boost scales the world radius AND both clamp bounds (predecessor's NODE_VERT: `uMinPx *
+     iBoost`, `uMaxPx * iBoost`) — most of a distant field sits pinned at NODE_MIN_PX, where
+     scaling only the radius would make hover invisible exactly when it is most needed. */
+  const rw = iSize.mul(NODE_SCALE).mul(iBoost);
   const base = rw.mul(uHalfH).div(uTanHalf.mul(uDRef));
   const px = base.mul(pow(uDRef.div(depth), FALLOFF));
-  const pxc = clamp(px, NODE_MIN_PX, NODE_MAX_PX);
+  const pxc = clamp(px, iBoost.mul(NODE_MIN_PX), iBoost.mul(NODE_MAX_PX));
   const rWorld = pxc.mul(uTanHalf).mul(depth).div(uHalfH);
 
   /* Varyings: computed per vertex, constant across the quad (so interpolation is a no-op). */
@@ -133,6 +151,8 @@ export function buildNodeLayer(
   );
   const vColor = varying(vec3(attribute('iColor', 'vec3')));
   const vShape = varying(float(attribute('iShape', 'float')));
+  const vAlpha = varying(float(attribute('iAlpha', 'float')));
+  const vBoost = varying(float(iBoost));
 
   const material = new SpriteNodeMaterial({
     transparent: true,
@@ -157,7 +177,7 @@ export function buildNodeLayer(
          the halo is the expensive half of it. One flat colour, no smoothsteps, no form test. */
       const rr = length(p).mul(2.0);
       Discard(rr.greaterThan(1.0));
-      const aa = vFog;
+      const aa = vFog.mul(vAlpha);
       Discard(aa.lessThan(0.004));
       out.assign(vec4(vColor, aa));
     }).Else(() => {
@@ -199,14 +219,16 @@ export function buildNodeLayer(
       const body = smoothstep(float(BODY_R).sub(e), float(BODY_R).add(e), r).oneMinus();
       const hw = clamp(float(HALO_PX).div(max(vPx, 1.0)), e, max(1.0 - BODY_R, e));
       const halo = smoothstep(float(BODY_R), float(BODY_R).add(hw), r).oneMinus();
-      const a = body.add(halo.mul(HALO_GAIN).mul(body.oneMinus())).mul(vFog);
+      const a = body.add(halo.mul(HALO_GAIN).mul(body.oneMinus())).mul(vFog).mul(vAlpha);
       Discard(a.lessThan(0.004));
 
       /* A small bright centre, not the whole body — with a solid body, reusing `body` here
          would wash the entire glyph toward white. Fog attenuates alpha only; mixing colour
-         toward the ground as well dims twice (predecessor's measured mistake). */
+         toward the ground as well dims twice (predecessor's measured mistake). The boost
+         term (capped, predecessor's `min(vBoost, 1.6)`) burns a hovered/selected core
+         hotter, so emphasis reads in colour as well as size. */
       const hot = smoothstep(0.0, BODY_R * 0.5, r).oneMinus();
-      const c = mix(vColor, vec3(1.0), hot.mul(CORE_HOT));
+      const c = mix(vColor, vec3(1.0), hot.mul(CORE_HOT).mul(min(vBoost, 1.6)));
       out.assign(vec4(c, a));
     });
 
@@ -225,6 +247,8 @@ export function buildNodeLayer(
     sizes,
     sizeAttr,
     shapeAttr,
+    alphaAttr,
+    boostAttr,
     uniforms: { halfH: uHalfH, tanHalf: uTanHalf, dRef: uDRef, fogNear: uFogNear, fogFar: uFogFar },
     dispose() {
       geo.dispose();
