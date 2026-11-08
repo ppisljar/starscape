@@ -1,0 +1,29 @@
+{
+  "name": "starscape",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Graph visualization for very large graphs: a 3D field you fly through.",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "dev": "vite demo",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint .",
+    "test": "vitest run",
+    "build": "tsc -p tsconfig.build.json",
+    "check": "bash check.sh"
+  },
+  "peerDependencies": {
+    "three": ">=0.170.0"
+  },
+  "devDependencies": {
+    "eslint": "^9",
+    "three": "^0.187.0",
+    "typescript": "^5",
+    "typescript-eslint": "^8.72.1",
+    "vite": "^8.3.6",
+    "vitest": "^5.1.0"
+  }
+}
