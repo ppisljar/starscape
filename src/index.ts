@@ -1,8 +1,10 @@
 /** starscape — graph visualization for very large graphs. Further modules arrive in later
  *  stages; exported here: the stage-2 core data model (DESIGN.md §3.1), the stage-3 field
- *  renderer (§5 — two draw calls, TSL materials), and the stage-4 interaction base (§6 —
- *  cameras, picking, hover/selection focus). The synth corpus generator (`src/synth/`) is
- *  test/demo fuel, deliberately not part of this surface. */
+ *  renderer (§5 — two draw calls, TSL materials), the stage-4 interaction base (§6 —
+ *  cameras, picking, hover/selection focus), and the stage-5 placement engine (§3.3–3.4 —
+ *  the four knobs, their libraries, presets, the hierarchy compiler and the BFS pull).
+ *  The synth corpus generator (`src/synth/`) is test/demo fuel, deliberately not part of
+ *  this surface. */
 export const VERSION = '0.0.0';
 
 export { hash, gauss } from './core/hash';
@@ -64,3 +66,52 @@ export {
   TARGET_PER_CELL,
 } from './pick/grid';
 export type { Grid, NearestOptions, PickOptions, Vec3 } from './pick/grid';
+
+/* ---- stage 5: placement (§3.3) and the hierarchy compiler (§3.4) --------------------
+ * The knob libraries register themselves on import; re-exporting their names here is
+ * what makes `{ shape: 'ring', ordering: 'byFacet', density: 'gaussian' }` resolve the
+ * moment the package is imported. `scatters` exports no names, so it is imported for its
+ * registration side effect alone. */
+import './place/scatters';
+
+export { placeGroup } from './place/engine';
+export type {
+  Density,
+  Ordering,
+  Params,
+  PlaceInput,
+  PlacementSpec,
+  Scatter,
+  Shape,
+} from './place/types';
+export {
+  densityKeys,
+  getDensity,
+  getOrdering,
+  getScatter,
+  getShape,
+  orderingKeys,
+  registerDensity,
+  registerOrdering,
+  registerScatter,
+  registerShape,
+  scatterKeys,
+  shapeKeys,
+} from './place/registry';
+export { getPreset, preset, presetKeys, registerPreset } from './place/presets';
+export { dendriteTiers } from './place/shapes';
+export { byAdjacency, byColumn, byFacet, byHash } from './place/orderings';
+export { exponential, gaussian, mixture, powerLaw } from './place/densities';
+export { probitApprox } from './place/stat';
+
+export { compileHierarchy, MAX_LEVELS } from './place/hierarchy';
+export type {
+  CompiledHierarchy,
+  HierarchyOpts,
+  HierarchyStats,
+  LevelSpec,
+  PivotTable,
+  SpinSpec,
+} from './place/hierarchy';
+export { attachToAnchors, HOP_MAX } from './place/pull';
+export type { AnchorAttachment } from './place/pull';
