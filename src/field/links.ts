@@ -2,11 +2,24 @@
  * of them, with the budget as a draw range over the importance-ordered buffer (DESIGN.md §5).
  * Ported from vault-site-3d src/field.js (LINK_VERT / LINK_FRAG) into TSL.
  *
- * Endpoint positions are a STATIC COPY of the node position buffer, baked once at boot. That
- * is deliberate and temporary: the layout is frozen at stage 3, so there is nothing to
- * re-upload, ever. DESIGN.md §4's vertex pulling (links reading node positions from a shared
- * storage buffer/texture, so no link rewrite exists at all) arrives at stage 6 with the GPU
- * morph — not here.
+ * Stage 6 (DESIGN §4): the duplicated endpoint copies are GONE. Each vertex carries only the
+ * NODE INDICES it concerns — its own endpoint in `position.x`, the opposite endpoint in
+ * `position.y` — and pulls the actual coordinates from the shared position store through the
+ * same GpuTransform the node layer uses (storage buffers on WebGPU, DataTexture texelFetch on
+ * the WebGL2 fallback — the seam lives in ./stores). Morph, frame chains and spread all
+ * resolve in the vertex stage, so rotating or morphing the field re-uploads NO link bytes —
+ * the predecessor's one design flaw (SCALE.md "Rotation re-uploads the link buffer": 42 ms/f
+ * at 10⁵) is structurally impossible here, not merely avoided.
+ *
+ * Why indices ride in `position`: a BufferGeometry needs a 'position' attribute anyway (it
+ * is where every renderer reads the vertex count), so the two ids live there instead of
+ * paying for a parallel attribute. Float32 carries integers exactly to 2²⁴ — loudly past the
+ * §9 scale ceiling. The baked per-vertex length attribute is gone too: endpoints move under
+ * the morph, so the long-link fade measures the CURRENT base-space length (both endpoints
+ * are one extra pull away), times the spread — lengths scale with the field.
+ *
+ * Colours stay per-vertex RGBA exactly as before: the focus state owns every alpha slot and
+ * its O(degree) update-range discipline (see field.ts) is untouched by this rewrite.
  */
 
 import {
@@ -16,11 +29,15 @@ import {
   LineSegments,
   NormalBlending,
 } from 'three/webgpu';
+import type { Node } from 'three/webgpu';
 import {
   attribute,
   clamp,
+  int,
+  length,
   max,
   mix,
+  positionGeometry,
   positionView,
   uniform,
   varying,
@@ -29,6 +46,7 @@ import {
   Fn,
 } from 'three/tsl';
 import { LINK_LEN_FLOOR } from './constants';
+import type { GpuTransform } from './stores';
 
 export interface LinkLayer {
   lines: LineSegments;
@@ -47,48 +65,33 @@ export interface LinkLayer {
   dispose(): void;
 }
 
-/** Bake the batched line list: positions and lengths once (frozen layout), colours whenever
- *  the palette changes. `links` is the importance-ordered 2m buffer from buildGraph, so the
- *  draw-range budget keeps the best prefix by construction. */
+/** Build the batched line list. `links` is the importance-ordered 2m buffer from buildGraph
+ *  (so the draw-range budget keeps the best prefix by construction); `transform` is the
+ *  shared GPU transform both layers pull positions through. The ONLY geometry baked here is
+ *  the pair of node ids per vertex — written once, never rewritten. */
 export function buildLinkLayer(
   links: Uint32Array,
-  nodePositions: Float32Array,
+  transform: GpuTransform,
   opts: { fogNear: number; fogFar: number; lenSoft: number },
 ): LinkLayer {
   const m = links.length >> 1;
 
-  /* Positions and per-vertex lengths, baked exactly once — see the header comment for why a
-     static copy is correct at this stage. `lLen` is the edge's world length: cost and clutter
-     both track total edge PIXEL-length rather than edge count, so fading the long ones is the
-     single cheapest thing that makes a dense graph legible. Rotation never changes a length,
-     so baking is exact, not approximate. */
-  const lpos = new Float32Array(m * 6);
-  const llen = new Float32Array(m * 2);
+  /* Vertex v of edge e: x = its own node id, y = the opposite endpoint's id, z unused.
+     Baked exactly once — positions are pulled, so nothing here ever goes stale. */
+  const ids = new Float32Array(m * 6);
   for (let e = 0; e < m; e++) {
-    const a = links[e * 2]! * 3;
-    const b = links[e * 2 + 1]! * 3;
-    const ax = nodePositions[a]!,
-      ay = nodePositions[a + 1]!,
-      az = nodePositions[a + 2]!;
-    const bx = nodePositions[b]!,
-      by = nodePositions[b + 1]!,
-      bz = nodePositions[b + 2]!;
+    const a = links[e * 2]!;
+    const b = links[e * 2 + 1]!;
     const o = e * 6;
-    lpos[o] = ax;
-    lpos[o + 1] = ay;
-    lpos[o + 2] = az;
-    lpos[o + 3] = bx;
-    lpos[o + 4] = by;
-    lpos[o + 5] = bz;
-    const len = Math.hypot(ax - bx, ay - by, az - bz);
-    llen[e * 2] = len;
-    llen[e * 2 + 1] = len;
+    ids[o] = a;
+    ids[o + 1] = b;
+    ids[o + 3] = b;
+    ids[o + 4] = a;
   }
   const colors = new Float32Array(m * 8); // RGBA per endpoint — per-link alpha lives here
 
   const geo = new BufferGeometry();
-  geo.setAttribute('position', new BufferAttribute(lpos, 3));
-  geo.setAttribute('lLen', new BufferAttribute(llen, 1));
+  geo.setAttribute('position', new BufferAttribute(ids, 3));
   const colorAttr = new BufferAttribute(colors, 4);
   geo.setAttribute('lColor', colorAttr);
 
@@ -96,11 +99,23 @@ export function buildLinkLayer(
   const uFogFar = uniform(opts.fogFar);
   const uLenSoft = uniform(opts.lenSoft);
 
-  /* Vertex stage: long-link fade (baked length, a mix toward LINK_LEN_FLOOR) and fog from
-     view depth. Fragment: colour through, discard what would not be visible anyway. */
+  /* Vertex stage: pull both endpoints, place this one. The long-link fade reads the LIVE
+     base-space separation scaled by the spread uniform, so a spread field fades like the
+     longer field it visually is. The frame CHAIN is deliberately skipped for the
+     measurement (one rotate per vertex saved): for endpoints in the SAME frame the chain
+     is one shared rigid motion and the base length is exact; a link SPANNING two frames
+     oscillates in world length with the spin phase while this fade stays at the
+     compile-time separation — an accepted approximation of the §3.5 frame model, not an
+     invariant. Fog from view depth, which derives from positionNode automatically. */
+  const ownId = int(positionGeometry.x) as unknown as Node<'int'>;
+  const otherId = int(positionGeometry.y) as unknown as Node<'int'>;
+  const own = transform.worldOf(ownId);
+  const liveLen = length(transform.baseOf(ownId).sub(transform.baseOf(otherId))).mul(
+    transform.uniforms.spread as unknown as Node<'float'>,
+  );
+
   const lColor = varying(vec4(attribute('lColor', 'vec4')));
-  const lLen = attribute('lLen', 'float');
-  const lenFade = varying(mix(1.0, LINK_LEN_FLOOR, clamp(lLen.div(uLenSoft), 0.0, 1.0)));
+  const lenFade = varying(mix(1.0, LINK_LEN_FLOOR, clamp(liveLen.div(uLenSoft), 0.0, 1.0)));
   const vFog = varying(
     clamp(positionView.z.negate().sub(uFogNear).div(max(uFogFar.sub(uFogNear), 1.0)), 0.0, 1.0)
       .oneMinus(),
@@ -111,6 +126,7 @@ export function buildLinkLayer(
     depthWrite: false,
     blending: NormalBlending, // synced with the nodes by the Field — one ground setting
   });
+  material.positionNode = own;
   material.colorNode = Fn(() => {
     const a = lColor.w.mul(lenFade).mul(vFog);
     Discard(a.lessThan(0.003));

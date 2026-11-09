@@ -1,6 +1,24 @@
-/* The field module (roadmap stage 3): the two-draw-call static renderer and its pure parts. */
-export { createField } from './field';
+/* The field module (roadmap stage 3 + the stage-6 §4 transform pipeline): the two-draw-call
+ * renderer, its pure parts, and the GPU morph/frame-chain/spread machinery. */
+export { createField, MORPH_DURATION } from './field';
 export type { Field, FieldOpts, FieldStats } from './field';
+export {
+  CHAIN_CAP,
+  bakeMix,
+  centroidOf,
+  flattenAxis,
+  packChainIds,
+  packPivotUniforms,
+  spreadPoint,
+} from './morph';
+export {
+  createGpuTransform,
+  createPivotStore,
+  createPositionStore,
+  PIVOT_CAPACITY,
+  POS_TEX_WIDTH,
+} from './stores';
+export type { GpuTransform, PivotStore, PositionStore } from './stores';
 export {
   clampGlyphPx,
   fieldExtent,

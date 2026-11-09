@@ -14,8 +14,30 @@ export { orderLinks } from './core/linkOrder';
 export { buildGraph, neighbours, incident } from './core/graph';
 export type { Facet, Graph, GraphInput, NumericColumn } from './core/types';
 
-export { createField } from './field/field';
+export { createField, MORPH_DURATION } from './field/field';
 export type { Field, FieldOpts, FieldStats } from './field/field';
+export {
+  CHAIN_CAP,
+  bakeMix,
+  centroidOf,
+  flattenAxis,
+  packChainIds,
+  packPivotUniforms,
+  spreadPoint,
+} from './field/morph';
+export {
+  createGpuTransform,
+  createPivotStore,
+  createPositionStore,
+  PIVOT_CAPACITY,
+  POS_TEX_WIDTH,
+} from './field/stores';
+export type { GpuTransform, PivotStore, PositionStore } from './field/stores';
+export { createTweens, cubicInOut, linear, smoothstep as smoothstepEase } from './anim/tween';
+export type { Ease, TweenOptions, Tweens } from './anim/tween';
+export { createFrameSet, ANGLE_EPS, RIDE_DELTA_SIZE } from './anim/frames';
+export type { FrameSet, NumArray } from './anim/frames';
+export { fnv1a } from './core/fnv';
 export {
   clampGlyphPx,
   fieldExtent,

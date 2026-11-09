@@ -1,14 +1,42 @@
-/* createField — the static field renderer (DESIGN.md §5, roadmap stage 3).
+/* createField — the field renderer (DESIGN.md §5, stage 3; §4 transform pipeline, stage 6).
  *
  * Two primary draw calls whatever the corpus size: one instanced quad for all nodes, one
  * batched line list for all links. The returned objects attach to any three.js scene; the
  * caller owns renderer, scene and camera (the library never fetches, never owns the page).
+ *
+ * Stage 6 adds the §4 pipeline, evaluated per vertex on the GPU:
+ *
+ *     p = spread( chain( mix(A, B, t) ) )
+ *
+ *   - MORPH: A and B are two full position sets in a shared store (storage buffers on
+ *     WebGPU, DataTextures on the WebGL2 fallback — ./stores owns the seam); `t` is one
+ *     uniform driven by the tween system. `setTarget`/`setHierarchy` retarget with the
+ *     standard bake: current = mix(A,B,t_now) is written into A (CPU, once, on the event),
+ *     the store uploads ONCE, t resets to 0 and tweens to 1. No snap, by construction.
+ *   - FRAME CHAINS: each node carries one chain slot (morph.ts packChainIds — the chain
+ *     itself is composed per PIVOT by the FrameSet, frames.ts rule 1), and the shader
+ *     applies the composed transform as one quaternion+offset read from the pivot store.
+ *     Per-frame CPU is O(pivots): advance + one small texture upload. CPU rewrites of
+ *     node/link buffers during spin DO NOT EXIST in this design — the predecessor flaw
+ *     (SCALE.md "Rotation re-uploads the link buffer") is structurally closed.
+ *   - SPREAD: a uniform scale about the field centroid, in-shader. Spread back to 1.0 is
+ *     byte-exact on every CPU reference path (morph.ts spreadPoint). The centre itself
+ *     rides the morph tween (old target's centroid → new target's), so a retarget under
+ *     spread ≠ 1 keeps "no snap" true — an instant centre swap would displace everything
+ *     by (1−spread)·Δcentroid.
+ *   - PROJECTION (§3.6): '2d' is a second morph to a flattened target (one axis dropped
+ *     over the live arrangement, the 3D target kept pristine), tweened the same way.
+ *     Dimensionality is a destination, not a branch.
  *
  * No per-node JS objects anywhere (§10.2): every channel is a typed array written in place.
  */
 
 import { AdditiveBlending, NormalBlending, type Object3D } from 'three/webgpu';
 import type { Graph } from '../core/types';
+import { createTweens } from '../anim/tween';
+import { createFrameSet } from '../anim/frames';
+import type { FrameSet } from '../anim/frames';
+import type { CompiledHierarchy } from '../place/hierarchy';
 import {
   fieldExtent,
   linkDrawCount,
@@ -29,6 +57,11 @@ import { buildNodeLayer } from './nodes';
 import { buildLinkLayer } from './links';
 import { createFocus } from './focus';
 import type { FocusOpts } from './focus';
+import { CHAIN_CAP, bakeMix, centroidOf, flattenAxis, packChainIds, spreadPoint } from './morph';
+import { createGpuTransform, createPivotStore, createPositionStore } from './stores';
+
+/** Default morph/projection tween duration, seconds. */
+export const MORPH_DURATION = 0.9;
 
 export interface FieldOpts {
   /** Numeric column driving node size (rank-normalised). 'uniform' for equal dots.
@@ -51,6 +84,16 @@ export interface FieldOpts {
   linkBudget?: number;
   /** Focus levels (hover/selection alphas, dim level) — see focus.ts for each default. */
   focus?: FocusOpts;
+  /** Vertex-pull backend for the shared position store (stage 6): 'storage' only when the
+   *  renderer actually booted the WebGPU backend; 'texture' (the default) works on both
+   *  backends. See ./stores for the seam. */
+  pull?: 'storage' | 'texture';
+  /** Pivot-store slot capacity (frame-chain pivots + 1). Default stores.PIVOT_CAPACITY. */
+  pivotCapacity?: number;
+  /** Which axis the '2d' projection drops. Default 1 (y — flatten onto the ground plane). */
+  flatAxis?: 0 | 1 | 2;
+  /** Default morph/projection tween duration, seconds. Default MORPH_DURATION. */
+  morphDuration?: number;
 }
 
 export interface FieldStats {
@@ -60,6 +103,12 @@ export interface FieldStats {
   links: { drawn: number; total: number };
   sizeColumn: string;
   colorFacet: string | null;
+  /** Morph progress (§4): t and whether any tween (morph or spread) is still running. */
+  morph: { t: number; active: boolean };
+  projection: '2d' | '3d';
+  spread: number;
+  /** Frame-chain pivots currently installed (0 = no hierarchy). */
+  pivots: number;
 }
 
 export interface Field {
@@ -100,21 +149,79 @@ export interface Field {
   boostOf(i: number): number;
   stats(): FieldStats;
   /** The live extent the field was built from — fit the camera to this, never to a stored
-   *  number (§10.8). */
+   *  number (§10.8). After retargets, frame the TARGET: see targetExtent(). */
   extent: { centre: [number, number, number]; radius: number; diagonal: number };
   /** The background colour the default theme assumes (0x05070d on 'additive'). */
   background: number;
+
+  /* ---- stage 6: the §4 transform pipeline -------------------------------------------- */
+
+  /** Advance the animation clock by `dt` seconds: tweens (morph t, spread) and the frame
+   *  set. O(pivots) — the ONLY per-frame CPU this field performs, and zero when idle.
+   *  Returns true when anything moved (positions on screen changed this tick). */
+  update(dt: number): boolean;
+  /** Morph to a raw position set (3n). The standard retarget bake: the current blend is
+   *  written into A, the store uploads once, t resets and tweens to 1. Any installed
+   *  frame chains stay as they are — use setHierarchy to swap frames with the target. */
+  setTarget(positions: Float32Array, duration?: number): void;
+  /** Morph to a compiled hierarchy: its positions become the target; when any level
+   *  declares `spin` (chainDepth > 0) its pivots become the frame chains (fresh
+   *  FrameSet, identity until spun — declare `spin: { rate: 0 }` for a frame that
+   *  exists but idles, the hierarchy.ts escape hatch; with NO spin declared no FrameSet
+   *  installs, so a later rate write cannot spin a per-tick upload loop with zero
+   *  visual effect). `null` restores the graph's frozen layout with no frames. The
+   *  round trip is byte-exact on basePositions(). */
+  setHierarchy(h: CompiledHierarchy | null, duration?: number): void;
+  /** Projection (§3.6): '2d' morphs to the live target flattened along flatAxis; '3d'
+   *  morphs back to the pristine 3D target. Byte-exact round trip on basePositions(). */
+  setProjection(mode: '2d' | '3d', duration?: number): void;
+  /** Spread: uniform scale about the field centroid, in-shader. duration 0 (default)
+   *  sets it immediately; a duration tweens it. */
+  setSpread(k: number, duration?: number): void;
+  /** True when nothing is animating: no tween running, no frame moved last tick. The
+   *  moment to rebuild a pick grid (DESIGN §6: on morph completion, never per frame). */
+  settled(): boolean;
+  /** Current morph progress t ∈ [0, 1]. */
+  readonly morphT: number;
+  /** Current spread factor. */
+  readonly spread: number;
+  /** Current projection mode. */
+  readonly projection: '2d' | '3d';
+  /** The live FrameSet (null when no hierarchy is installed) — for telemetry
+   *  (frameOfPoint), camera rides (rideDelta) and CPU reference transforms. */
+  readonly frames: FrameSet | null;
+  /** Per-node chain pivot ids (−1 = world) — frames.transformPoint(chainIds[i], …) is the
+   *  CPU reference for what the shader does to node i. Read-only by contract. */
+  readonly chainIds: Int32Array;
+  /** The current BASE positions — mix(A, B, t) with exact endpoints (§4: a completed
+   *  round trip returns byte-identical coordinates, FNV-comparable). Allocates unless
+   *  `out` (3n) is given. */
+  basePositions(out?: Float32Array): Float32Array;
+  /** The current VIEW positions — base → chain → spread, the CPU mirror of the vertex
+   *  shader (via frames.transformPoint + morph.spreadPoint). O(n): call on events (grid
+   *  rebuilds), never per frame. */
+  viewPositions(out?: Float32Array): Float32Array;
+  /** The extent of the current TARGET (B), spread included — what a camera should frame
+   *  after a retarget (§10.8: the live extent, never a stored one). */
+  targetExtent(): { centre: [number, number, number]; radius: number; diagonal: number };
+  /** The spread centre the shader is using NOW (what its spread scales about): the
+   *  current target's centroid once a morph lands, and mix(previous, next) while one
+   *  runs — the centre MIGRATES with the tween so a retarget under spread ≠ 1 cannot
+   *  snap (§4). Needed to map a world point back to unspread space
+   *  (p′ = c + (p − c)/spread) for frameOfPoint telemetry. */
+  centroid(): [number, number, number];
+
   dispose(): void;
 }
 
 /** Build the two-draw-call field for a compiled Graph. The graph must carry a frozen layout —
- *  the placement engine that could synthesise one arrives at stage 5. */
+ *  it is the boot arrangement and what `setHierarchy(null)` restores. */
 export function createField(graph: Graph, opts: FieldOpts = {}): Field {
   const n = graph.n;
   const positions = graph.positions;
   if (!positions) {
     throw new Error(
-      'createField: graph has no positions — a frozen layout is required until the placement engine (stage 5) arrives',
+      'createField: graph has no positions — a frozen layout is required (compileHierarchy can make one)',
     );
   }
 
@@ -122,6 +229,8 @@ export function createField(graph: Graph, opts: FieldOpts = {}): Field {
   const heightCss = opts.heightCss ?? 800;
   const extent = fieldExtent(positions, n);
   const diagonal = extent.diagonal || 1;
+  const morphDuration = opts.morphDuration ?? MORPH_DURATION;
+  const flatAxis = opts.flatAxis ?? 1;
 
   /* ---- channels ---------------------------------------------------------------------- */
   let sizeColumn = opts.sizeColumn ?? (graph.columns['degree'] ? 'degree' : 'uniform');
@@ -136,8 +245,108 @@ export function createField(graph: Graph, opts: FieldOpts = {}): Field {
   const sizes = computeSizes(graph, sizeColumn, n);
   paintColors(graph, colorFacet, n, colors);
 
+  /* ---- stage 6 state: the §4 pipeline's CPU mirrors ----------------------------------- *
+   * baseA/baseB are the endpoint sets A and B; target3d is the PRISTINE 3D target the '2d'
+   * flatten derives from (stages compose, nothing mutates in place — §4). All retargets
+   * are events; nothing here is touched per frame. */
+  const baseA = new Float32Array(positions);
+  const baseB = new Float32Array(positions);
+  const target3d = new Float32Array(positions);
+  let chainIds: Int32Array = new Int32Array(n).fill(-1);
+  let frames: FrameSet | null = null;
+  let world0: Float32Array | null = null;
+  let pivotCount = 0;
+  let projection: '2d' | '3d' = '3d';
+
+  /* The spread centre rides the morph (§4 continuity): the shader's world is
+   * c + (chain(base) − c)·spread, so swapping c in one tick while spread ≠ 1 would
+   * displace every node by (1−s)·(c_new − c_old) — a snap the bake cannot prevent.
+   * Instead cA holds the centroid in effect when a retarget fires (the live value — the
+   * continuity anchor) and cB the new target's centroid; the live `centroid` is
+   * mix(cA, cB, t) with exact endpoints, driven by the same morph tween. */
+  const cA = centroidOf(baseB, n);
+  const cB: [number, number, number] = [cA[0], cA[1], cA[2]];
+  const centroid: [number, number, number] = [cA[0], cA[1], cA[2]];
+
+  const tweens = createTweens();
+  tweens.set('morph', 0);
+  tweens.set('spread', 1);
+
+  const posStore = createPositionStore(n, opts.pull ?? 'texture');
+  const pivStore = createPivotStore(opts.pivotCapacity);
+  const transform = createGpuTransform(posStore, pivStore);
+  /** centroid ← mix(cA, cB, v), exact at both endpoints, f32-rounded between (the GPU
+   *  uniform is f32 — the CPU mirror must agree with the shader on the centre). */
+  const mixCentroid = (v: number): void => {
+    if (v <= 0) {
+      centroid[0] = cA[0];
+      centroid[1] = cA[1];
+      centroid[2] = cA[2];
+    } else if (v >= 1) {
+      centroid[0] = cB[0];
+      centroid[1] = cB[1];
+      centroid[2] = cB[2];
+    } else {
+      centroid[0] = Math.fround(cA[0] + (cB[0] - cA[0]) * v);
+      centroid[1] = Math.fround(cA[1] + (cB[1] - cA[1]) * v);
+      centroid[2] = Math.fround(cA[2] + (cB[2] - cA[2]) * v);
+    }
+  };
+  tweens.onChange('morph', (v) => {
+    transform.uniforms.morphT.value = v;
+    mixCentroid(v);
+    syncCentroid();
+  });
+  tweens.onChange('spread', (v) => {
+    transform.uniforms.spread.value = v;
+  });
+  const syncCentroid = (): void => {
+    transform.uniforms.centroid.value.set(centroid[0], centroid[1], centroid[2]);
+  };
+  syncCentroid();
+  pivStore.sync(null, null);
+  posStore.upload(baseA, baseB, chainIds, n);
+
+  /* The retarget machinery. bakeBase folds the running morph into A (chain NOT included —
+     the chain stays live in the shader unless the frames themselves are being replaced,
+     in which case the parked chain displacement is baked in so the new identity frames
+     start exactly where the old ones left the field). */
+  const bakeBase = (): void => {
+    bakeMix(baseA, baseB, tweens.get('morph'));
+  };
+  const bakeChainIntoA = (): void => {
+    if (frames !== null && frames.displaced()) {
+      for (let i = 0; i < n; i++) {
+        frames.transformPoint(chainIds[i]!, baseA, baseA, i * 3, i * 3);
+      }
+    }
+  };
+  const finishRetarget = (duration: number): void => {
+    if (projection === '2d') {
+      const c3 = centroidOf(target3d, n);
+      flattenAxis(target3d, n, flatAxis, c3[flatAxis], baseB);
+    } else {
+      baseB.set(target3d);
+    }
+    // No snap, by construction — spread included: the spread centre HOLDS at its live
+    // value through the event (cA ← current centroid) and migrates to the new target's
+    // centroid (cB) with the morph tween. Writing cB to the uniform here instead would
+    // displace every node by (1−spread)·(cB − cA) in one tick whenever spread ≠ 1.
+    cA[0] = centroid[0];
+    cA[1] = centroid[1];
+    cA[2] = centroid[2];
+    const c = centroidOf(baseB, n);
+    cB[0] = c[0];
+    cB[1] = c[1];
+    cB[2] = c[2];
+    pivStore.sync(frames, world0); // O(pivots)
+    posStore.upload(baseA, baseB, chainIds, n); // the ONE upload of the retarget
+    tweens.set('morph', 0); // emits → centroid ← cA (already cA if t was 0: no emit needed)
+    tweens.to('morph', 1, { duration });
+  };
+
   /* ---- layers ------------------------------------------------------------------------ */
-  const link = buildLinkLayer(graph.links, positions, {
+  const link = buildLinkLayer(graph.links, transform, {
     fogNear: diagonal * FOG_NEAR * 0.8,
     fogFar: diagonal * FOG_FAR * 0.9,
     lenSoft: diagonal * LINK_LEN_SOFT,
@@ -164,7 +373,18 @@ export function createField(graph: Graph, opts: FieldOpts = {}): Field {
      same-frame interleaving uploads the union. Both backends consume and then clear
      `updateRanges` on upload. */
   const lc = link.colors;
-  let trackEdgeRanges = false;
+  /* Edge-upload tracking while a hover repaint runs. 'edges' mirrors every touched edge
+     into its own update range (small footprints); 'span' folds them into one min..max
+     window — the past-RANGE_CAP fallback, which keeps even a hub hover's transfer
+     bounded by the touched slots' extent instead of the whole buffer (§6: hover lights
+     the neighbourhood WITHOUT repainting the field — at 10⁶ links a full re-upload is
+     ~32 MB of bus traffic per pointermove, the exact cost this discipline exists to
+     remove). eMin/eMax accumulate in BOTH modes: they also answer "was any edge touched
+     at all", so a hover between isolated nodes never version-bumps the attribute with
+     zero ranges pending (which would upload everything). */
+  let edgeTrack: 'off' | 'edges' | 'span' = 'off';
+  let eMin = 0;
+  let eMax = -1;
   const focus = createFocus(
     n,
     graph.csr,
@@ -172,13 +392,18 @@ export function createField(graph: Graph, opts: FieldOpts = {}): Field {
     (e: number, alpha: number): void => {
       lc[e * 8 + 3] = alpha;
       lc[e * 8 + 7] = alpha;
-      if (trackEdgeRanges) link.colorAttr.addUpdateRange(e * 8 + 3, 5);
+      if (edgeTrack !== 'off') {
+        if (edgeTrack === 'edges') link.colorAttr.addUpdateRange(e * 8 + 3, 5);
+        if (e < eMin) eMin = e;
+        if (e > eMax) eMax = e;
+      }
     },
     { linkBase: LINK_BASE_ALPHA, ...opts.focus },
   );
 
   /** One range per touched buffer slot stays cheap for real degrees; past this many touched
-   *  edges a single full-buffer range costs less than thousands of tiny writeBuffer calls. */
+   *  edges the per-edge ranges would cost thousands of tiny writeBuffer calls, so the
+   *  repaint coalesces into ONE min..max span per buffer instead. */
   const RANGE_CAP = 1024;
 
   const csr = graph.csr;
@@ -191,12 +416,38 @@ export function createField(graph: Graph, opts: FieldOpts = {}): Field {
       node.boostAttr.addUpdateRange(csr.nbr[k]!, 1);
     }
   };
+  /** min..max node slot a hover move prev→next touches: both nodes, their CSR
+   *  neighbourhoods, and the selected node (setHover re-asserts its boost). The span
+   *  form of addBoostRanges, for the past-RANGE_CAP fallback. Writes [lo, hi] into
+   *  `boostLoHi`; hi < lo means nothing touched (cannot happen when the hover changed). */
+  const boostLoHi: [number, number] = [0, -1];
+  const boostSpan = (prev: number, next: number): void => {
+    let lo = n;
+    let hi = -1;
+    for (const j of [prev, next]) {
+      if (j < 0) continue;
+      if (j < lo) lo = j;
+      if (j > hi) hi = j;
+      for (let k = csr.off[j]!; k < csr.off[j + 1]!; k++) {
+        const nb = csr.nbr[k]!;
+        if (nb < lo) lo = nb;
+        if (nb > hi) hi = nb;
+      }
+    }
+    const sel = focus.select;
+    if (sel >= 0) {
+      if (sel < lo) lo = sel;
+      if (sel > hi) hi = sel;
+    }
+    boostLoHi[0] = lo;
+    boostLoHi[1] = hi;
+  };
   const fullRange = (attr: { clearUpdateRanges(): void; addUpdateRange(s: number, c: number): void }, len: number): void => {
     attr.clearUpdateRanges();
     if (len > 0) attr.addUpdateRange(0, len);
   };
 
-  const node = buildNodeLayer(n, positions, colors, sizes, shapes, focus.nodeAlpha, focus.nodeBoost, {
+  const node = buildNodeLayer(n, transform, colors, sizes, shapes, focus.nodeAlpha, focus.nodeBoost, {
     fov,
     heightCss,
     dRef: diagonal * D_REF_FRACTION,
@@ -232,6 +483,15 @@ export function createField(graph: Graph, opts: FieldOpts = {}): Field {
   };
   writeLinkColors();
   focus.repaint(); // seed every alpha slot (resting link alpha, nodes lit)
+
+  /** mix(A, B, t) with exact endpoints — shared by basePositions and viewPositions
+   *  (no `this`: the Field object must survive destructuring). */
+  const basePositionsInto = (out?: Float32Array): Float32Array => {
+    const dst = out ?? new Float32Array(n * 3);
+    dst.set(baseA);
+    bakeMix(dst, baseB, tweens.get('morph')); // exact at both endpoints (morph.ts)
+    return dst;
+  };
 
   const setBlend = (mode: 'additive' | 'normal'): void => {
     const blending = mode === 'additive' ? AdditiveBlending : NormalBlending;
@@ -276,24 +536,35 @@ export function createField(graph: Graph, opts: FieldOpts = {}): Field {
 
     setHover(i: number): boolean {
       const prev = focus.hover;
-      // Hover repaints O(degree) on the CPU; the ranges keep the GPU transfer O(degree)
-      // too. Past RANGE_CAP touched edges, one full-buffer range beats thousands of tiny
-      // writes — still expressed as a range, so same-frame interleavings stay a union.
+      // Hover repaints O(degree) on the CPU; the ranges keep the GPU transfer bounded
+      // too. Past RANGE_CAP touched edges, per-edge ranges give way to ONE coalesced
+      // min..max span per buffer — proportional to the hover footprint's extent, never
+      // the corpus (a full-buffer fallback here would re-pay the predecessor's hover
+      // cost on every hub under the cursor). Always ranges, never a bare version bump,
+      // so same-frame interleavings with sweeps stay a union.
       const small = degreeOf(prev) + degreeOf(i) <= RANGE_CAP;
-      trackEdgeRanges = small;
+      edgeTrack = small ? 'edges' : 'span';
+      eMin = totalLinks;
+      eMax = -1;
       const changed = focus.setHover(i);
-      trackEdgeRanges = false;
+      edgeTrack = 'off';
       if (changed) {
         if (small) {
           addBoostRanges(prev);
           addBoostRanges(i);
           if (focus.select >= 0) node.boostAttr.addUpdateRange(focus.select, 1);
         } else {
-          fullRange(link.colorAttr, lc.length);
-          fullRange(node.boostAttr, n);
+          if (eMax >= eMin) {
+            // slots eMin*8+3 .. eMax*8+7 inclusive — both alpha lanes of every touched edge
+            link.colorAttr.addUpdateRange(eMin * 8 + 3, (eMax - eMin) * 8 + 5);
+          }
+          boostSpan(prev, i);
+          if (boostLoHi[1] >= boostLoHi[0]) {
+            node.boostAttr.addUpdateRange(boostLoHi[0], boostLoHi[1] - boostLoHi[0] + 1);
+          }
         }
         node.boostAttr.needsUpdate = true;
-        link.colorAttr.needsUpdate = true;
+        if (eMax >= 0) link.colorAttr.needsUpdate = true;
       }
       return changed;
     },
@@ -345,12 +616,155 @@ export function createField(graph: Graph, opts: FieldOpts = {}): Field {
         links: { drawn, total: totalLinks },
         sizeColumn,
         colorFacet,
+        morph: { t: tweens.get('morph'), active: tweens.active() },
+        projection,
+        spread: tweens.get('spread'),
+        pivots: pivotCount,
+      };
+    },
+
+    /* ---- stage 6 ----------------------------------------------------------------------- */
+
+    update(dt: number): boolean {
+      const wasTweening = tweens.active();
+      tweens.update(dt);
+      let framesMoved = false;
+      if (frames !== null) {
+        framesMoved = frames.advance(dt); // O(pivots), free when idle (frames.ts rule 2)
+        if (framesMoved) pivStore.sync(frames, world0); // the only per-frame upload
+      }
+      return framesMoved || wasTweening || tweens.active();
+    },
+
+    setTarget(target: Float32Array, duration: number = morphDuration): void {
+      if (target.length !== n * 3) {
+        throw new Error(`setTarget: expected ${n * 3} floats, got ${target.length}`);
+      }
+      bakeBase(); // chain stays live — frames are not being replaced
+      target3d.set(target);
+      finishRetarget(duration);
+    },
+
+    setHierarchy(h: CompiledHierarchy | null, duration: number = morphDuration): void {
+      if (h !== null && h.positions.length !== n * 3) {
+        throw new Error(
+          `setHierarchy: hierarchy places ${h.positions.length / 3} nodes, graph has ${n}`,
+        );
+      }
+      bakeBase();
+      bakeChainIntoA(); // the OLD frames' parked displacement, folded in before they die
+      if (h !== null) {
+        target3d.set(h.positions);
+        chainIds = packChainIds(h.nodePivot, h.pivots.parent, h.pivots.level, h.chainDepth, CHAIN_CAP);
+        /* Frames install only when some level DECLARED spin (chainDepth > 0). With none
+           declared, packChainIds parked every node at −1 — a FrameSet could never move a
+           node, but its live `rate` channel would still accept writes (frames.ts: "a UI
+           spin toggle writes there"), costing an O(pivots) pivot-store upload every tick
+           and pinning settled() false for ZERO visual effect. Gating here makes that
+           trap unrepresentable: a level that wants its frames live later declares
+           `spin: { rate: 0 }` — the "frame exists but idle" form (hierarchy.ts SpinSpec). */
+        if (h.chainDepth > 0) {
+          frames = createFrameSet(h.pivots);
+          world0 = h.pivots.world;
+          pivotCount = h.pivots.count;
+        } else {
+          frames = null;
+          world0 = null;
+          pivotCount = 0;
+        }
+      } else {
+        target3d.set(positions); // the frozen boot layout, byte-for-byte
+        chainIds = new Int32Array(n).fill(-1);
+        frames = null;
+        world0 = null;
+        pivotCount = 0;
+      }
+      finishRetarget(duration);
+    },
+
+    setProjection(mode: '2d' | '3d', duration: number = morphDuration): void {
+      if (mode === projection) return;
+      bakeBase(); // frames stay live; only the target changes shape
+      projection = mode;
+      finishRetarget(duration);
+    },
+
+    setSpread(k: number, duration = 0): void {
+      if (!Number.isFinite(k) || k <= 0) {
+        throw new Error(`setSpread: spread must be finite and > 0, got ${k}`);
+      }
+      if (duration > 0) tweens.to('spread', k, { duration });
+      else tweens.set('spread', k);
+    },
+
+    settled(): boolean {
+      return !tweens.active() && !(frames?.activeThisTick() ?? false);
+    },
+
+    get morphT(): number {
+      return tweens.get('morph');
+    },
+
+    get spread(): number {
+      return tweens.get('spread');
+    },
+
+    get projection(): '2d' | '3d' {
+      return projection;
+    },
+
+    get frames(): FrameSet | null {
+      return frames;
+    },
+
+    get chainIds(): Int32Array {
+      return chainIds;
+    },
+
+    basePositions(out?: Float32Array): Float32Array {
+      return basePositionsInto(out);
+    },
+
+    viewPositions(out?: Float32Array): Float32Array {
+      const dst = basePositionsInto(out);
+      if (frames !== null && frames.displaced()) {
+        for (let i = 0; i < n; i++) {
+          frames.transformPoint(chainIds[i]!, dst, dst, i * 3, i * 3);
+        }
+      }
+      const s = tweens.get('spread');
+      if (s !== 1) {
+        for (let i = 0; i < n; i++) spreadPoint(dst, centroid, s, dst, i * 3, i * 3);
+      }
+      return dst;
+    },
+
+    centroid(): [number, number, number] {
+      return [centroid[0], centroid[1], centroid[2]];
+    },
+
+    targetExtent(): { centre: [number, number, number]; radius: number; diagonal: number } {
+      const e = fieldExtent(baseB, n);
+      const s = tweens.get('spread');
+      if (s === 1) return e;
+      // cB, not the live centroid: when the morph lands, the spread scales about the
+      // TARGET's centroid — that is the extent a camera framing the destination wants.
+      return {
+        centre: [
+          cB[0] + (e.centre[0] - cB[0]) * s,
+          cB[1] + (e.centre[1] - cB[1]) * s,
+          cB[2] + (e.centre[2] - cB[2]) * s,
+        ],
+        radius: e.radius * s,
+        diagonal: e.diagonal * s,
       };
     },
 
     dispose(): void {
       node.dispose();
       link.dispose();
+      posStore.dispose();
+      pivStore.dispose();
     },
   };
 }

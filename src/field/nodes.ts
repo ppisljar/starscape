@@ -11,6 +11,12 @@
  * it scales the glyph AND its clamp bounds, so an emphasised node grows even when pinned at
  * NODE_MIN_PX/NODE_MAX_PX, which is most of a distant field). What waits: rim bubbles, sphere
  * shading and the full theming (stage 8).
+ *
+ * Stage 6: the node POSITION is no longer an instanced attribute — it is pulled from the
+ * shared GpuTransform at `instanceIndex` (DESIGN §4): morph mix, frame chain and spread all
+ * happen right here in the vertex stage, so spinning or morphing the field re-uploads
+ * NOTHING node-shaped (the predecessor's recompose flaw, closed). The links pull from the
+ * same store, so the two layers cannot disagree about where a node is.
  */
 
 import {
@@ -21,12 +27,15 @@ import {
   NormalBlending,
   SpriteNodeMaterial,
 } from 'three/webgpu';
+import type { Node } from 'three/webgpu';
 import {
   Fn,
   If,
   attribute,
   clamp,
   float,
+  instanceIndex,
+  int,
   length,
   max,
   min,
@@ -42,6 +51,7 @@ import {
   vec4,
   Discard,
 } from 'three/tsl';
+import type { GpuTransform } from './stores';
 import {
   BODY_R,
   CORE_HOT,
@@ -81,12 +91,13 @@ export interface NodeLayer {
   dispose(): void;
 }
 
-/** Build the instanced node quad. `positions` is the frozen 3n layout (uploaded once);
+/** Build the instanced node quad. `transform` is the shared GPU transform the position is
+ *  pulled through at `instanceIndex` (stage 6 — no position attribute exists any more);
  *  `colors`/`sizes`/`shapes`/`alphas`/`boosts` are per-instance channels the Field (and its
  *  focus state) mutates in place. */
 export function buildNodeLayer(
   n: number,
-  positions: Float32Array,
+  transform: GpuTransform,
   colors: Float32Array,
   sizes: Float32Array,
   shapes: Float32Array,
@@ -105,13 +116,11 @@ export function buildNodeLayer(
   geo.setIndex([0, 1, 2, 0, 2, 3]);
   geo.instanceCount = n;
 
-  const posAttr = new InstancedBufferAttribute(positions, 3);
   const colorAttr = new InstancedBufferAttribute(colors, 3);
   const sizeAttr = new InstancedBufferAttribute(sizes, 1);
   const shapeAttr = new InstancedBufferAttribute(shapes, 1);
   const alphaAttr = new InstancedBufferAttribute(alphas, 1);
   const boostAttr = new InstancedBufferAttribute(boosts, 1);
-  geo.setAttribute('iPos', posAttr);
   geo.setAttribute('iColor', colorAttr);
   geo.setAttribute('iSize', sizeAttr);
   geo.setAttribute('iShape', shapeAttr);
@@ -129,11 +138,15 @@ export function buildNodeLayer(
      The clamp is done from the REAL projection, so it is exact rather than an approximation
      of itself. uFalloff bends the perspective about the fixed pivot uDRef (1 = true
      projection). SpriteNodeMaterial supplies the billboard: it offsets the quad corner in
-     view space by scaleNode, exactly the predecessor's `mv.xy += position.xy * (r * 2)`. */
-  const iPos = attribute('iPos', 'vec3');
+     view space by scaleNode, exactly the predecessor's `mv.xy += position.xy * (r * 2)`.
+
+     The position is PULLED through the shared transform at instanceIndex (§4): the same
+     node object feeds positionNode and the depth math, so the builder evaluates the morph +
+     chain + spread exactly once per vertex. */
+  const worldPos = transform.worldOf(int(instanceIndex) as unknown as Node<'int'>);
   const iSize = attribute('iSize', 'float');
   const iBoost = attribute('iBoost', 'float');
-  const centerView = modelViewMatrix.mul(vec4(iPos, 1.0));
+  const centerView = modelViewMatrix.mul(vec4(worldPos, 1.0));
   const depth = max(centerView.z.negate(), 0.001);
   /* Boost scales the world radius AND both clamp bounds (predecessor's NODE_VERT: `uMinPx *
      iBoost`, `uMaxPx * iBoost`) — most of a distant field sits pinned at NODE_MIN_PX, where
@@ -160,7 +173,7 @@ export function buildNodeLayer(
     depthTest: true,
     blending: NormalBlending, // the Field syncs blending with the links — one ground setting
   });
-  material.positionNode = iPos;
+  material.positionNode = worldPos;
   material.scaleNode = rWorld.mul(2.0);
 
   /* ---- fragment stage. The distance metric IS the shape: one length() plus a couple of
