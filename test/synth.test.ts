@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { generateSynth } from '../src/synth/generate';
+import { generateSynth, synthDefaults } from '../src/synth/generate';
 import { buildGraph } from '../src/core/graph';
 
 /* FNV-1a over raw bytes — the cheap way to assert "byte-identical", which is the actual
@@ -34,13 +34,16 @@ describe('generateSynth', () => {
     // A real golden, not two-runs-agree: the determinism test above would pass even if the
     // generator's bytes silently changed (reordered streams, new salts). This constant was
     // recorded from a run and pins the actual output forever (DESIGN.md §10.9).
+    // Re-recorded 2026-11-09 (was 4136852649): the universe now scales with n — constant
+    // density, counts and radii ~n^⅓ (module header) — instead of densifying a fixed
+    // ~2000-unit field, so geometry and the galaxy/system facets deliberately moved.
     const g = generateSynth({ n: 1000, seed: 42 });
     const pb = bytesOf(g.positions!);
     const lb = bytesOf(g.links);
     const cat = new Uint8Array(pb.length + lb.length);
     cat.set(pb, 0);
     cat.set(lb, pb.length);
-    expect(fnv1a(cat)).toBe(4136852649);
+    expect(fnv1a(cat)).toBe(225977393);
   });
 
   it('a different seed produces different bytes', () => {
@@ -80,12 +83,16 @@ describe('generateSynth', () => {
     }
     expect(facets['type']!.values).toHaveLength(7);
     expect(facets['era']!.values).toHaveLength(5);
-    expect(facets['galaxy']!.values).toHaveLength(12);
-    expect(facets['system']!.values).toHaveLength(12 * 7);
+    // cluster counts scale with n (defaults ~n^⅓, see synthDefaults): at 10⁴ that is 22/22
+    const { galaxies, systemsPerGalaxy } = synthDefaults(n);
+    expect(galaxies).toBe(22);
+    expect(systemsPerGalaxy).toBe(22);
+    expect(facets['galaxy']!.values).toHaveLength(galaxies);
+    expect(facets['system']!.values).toHaveLength(galaxies * systemsPerGalaxy);
     // the hierarchy is real: a node's system always nests inside its galaxy
     const gal = facets['galaxy']!.data;
     const sys = facets['system']!.data;
-    for (let i = 0; i < n; i++) expect((sys[i]! / 7) | 0).toBe(gal[i]!);
+    for (let i = 0; i < n; i++) expect((sys[i]! / systemsPerGalaxy) | 0).toBe(gal[i]!);
     // type and era are skewed, not uniform, and every value is actually used
     const eraCounts = new Uint32Array(5);
     for (let i = 0; i < n; i++) eraCounts[facets['era']!.data[i]!] = eraCounts[facets['era']!.data[i]!]! + 1;
@@ -109,6 +116,48 @@ describe('generateSynth', () => {
     expect(median).toBeLessThan(300);
     expect(max).toBeGreaterThan(median * 10); // the tail is the point
   });
+
+  /* ---- the universe scales with n (the 2026-11-09 defect fix: a fixed ~2000-unit field
+   * meant 10⁶ nodes just densified it). Constant density ⇒ the bounding-box diagonal grows
+   * as n^⅓: universeRadius = SPACING·PACK²·n^⅓ when no clamp binds (module header). */
+
+  function diagOf(p: Float32Array): number {
+    let minX = Infinity, minY = Infinity, minZ = Infinity;
+    let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
+    for (let i = 0; i < p.length; i += 3) {
+      const x = p[i]!, y = p[i + 1]!, z = p[i + 2]!;
+      if (x < minX) minX = x;
+      if (x > maxX) maxX = x;
+      if (y < minY) minY = y;
+      if (y > maxY) maxY = y;
+      if (z < minZ) minZ = z;
+      if (z > maxZ) maxZ = z;
+    }
+    return Math.hypot(maxX - minX, maxY - minY, maxZ - minZ);
+  }
+
+  it('diagonal grows as n^⅓: the 10⁶ field is ≈ (10⁶/10⁴)^⅓ ≈ 4.64× the 10⁴ field', () => {
+    const d4 = diagOf(generateSynth({ n: 10_000, seed: 42 }).positions!);
+    const d6 = diagOf(generateSynth({ n: 1_000_000, seed: 42 }).positions!);
+    const want = Math.cbrt(100); // ≈ 4.642
+    // measured 4.585 on record day — gaussian extreme-value tails and count rounding keep
+    // the measured ratio within a few percent of the exact n^⅓ law, never at it
+    expect(d6 / d4).toBeGreaterThan(want * 0.9);
+    expect(d6 / d4).toBeLessThan(want * 1.1);
+  }, 60_000);
+
+  it('density n/diagonal³ holds constant (within a band) across 10³/10⁴/10⁵', () => {
+    const densities: number[] = [];
+    for (const n of [1_000, 10_000, 100_000]) {
+      const d = diagOf(generateSynth({ n, seed: 42 }).positions!);
+      densities.push(n / (d * d * d));
+    }
+    // recorded 1.20e-10 / 1.25e-10 / 1.28e-10 — the band guards the CONSTANT-density claim
+    // (the old fixed field drifted 100× per decade of n), not any particular value
+    const lo = Math.min(...densities);
+    const hi = Math.max(...densities);
+    expect(hi / lo).toBeLessThan(1.5);
+  }, 60_000);
 
   it('n=100 smoke: well-formed output, and buildGraph round-trips it', () => {
     const input = generateSynth({ n: 100, seed: 7 });

@@ -22,32 +22,47 @@ session-scoped config keys) — nothing below was hand-tuned per run.
 
 | nodes | links drawn / total | boot | ms/frame | fps | jsFrameMs | draw calls | state |
 |---:|---:|---:|---:|---:|---:|---:|---|
-| 10⁴ | 39,022 / 39,022 | 0.31–0.38 s | 8.2 | 120–122 | 0.2–0.3 | 3 | frozen, dpr 2 |
-| 10⁴ | 39,022 / 39,022 | — | 8.1–8.3 | 120–123 | 0.3 | 3 | galaxies, **all spins on** |
-| 10⁵ | 199,516 / 399,032 | 0.52–0.67 s | 8.5–8.6 | 116–118 | 0.3 | 3 | frozen, dpr 2, half links |
-| 10⁵ | 199,516 / 399,032 | — | 32.7–33.0 | 30.3 | 0.1 | 3 | galaxies, all spins on |
-| 10⁶ | 159,963 / 3,999,065 | 1.76–1.82 s | 16.2–17.4 | 57–62 | 0.1 | 3 | frozen, dpr 1, 4% links, flat ≥ 9 px |
-| 10⁶ | 159,963 / 3,999,065 | — | 25.8–31.9 | **31–39** | 0.1–0.3 | 3 | galaxies, **all spins on** |
+| 10⁴ | 35,562 / 35,562 | 0.27–0.29 s | 8.3 | 120–122 | 0–0.1 | 3 | frozen, dpr 2 |
+| 10⁴ | 35,562 / 35,562 | — | 8.2–8.3 | 120–122 | 0.1 | 3 | galaxies, **all spins on** |
+| 10⁵ | 189,273 / 378,545 | 0.41–0.56 s | 8.3–8.4 | 119–120 | 0.1 | 3 | frozen, dpr 2, half links |
+| 10⁵ | 189,273 / 378,545 | — | 25.3–25.7 | 39 | 0.1 | 3 | galaxies, all spins on |
+| 10⁶ | 155,758 / 3,893,949 | 1.79–1.82 s | 15.0–15.2 | 66–67 | 0–0.1 | 3 | frozen, dpr 1, 4% links, flat ≥ 9 px |
+| 10⁶ | 155,758 / 3,893,949 | — | 24.7–24.8 | **40** | 0.1–0.2 | 3 | galaxies, **all spins on** |
 
 Every band above is min–max over at least two 90-frame windows, the 10⁶ rows over at least
 two independent warm reloads (the stage-9 gate re-measured every row; an earlier draft of the
-10⁶ frozen row said 21.6 ms / 46 fps from a mid-pass build and did not reproduce — the
-shipped code measures 16.2–17.4 ms over four reloads. Quote the band, never a draft).
+10⁶ frozen row said 21.6 ms / 46 fps from a mid-pass build and did not reproduce. Quote the
+band, never a draft).
+
+**2026-11-09 — corpora rescaled to constant density, synth rows re-measured.** The synth
+generator's fixed ~2000-unit field used to densify linearly with n; its defaults now grow
+the universe as n^⅓ (counts ≈ n^⅓ galaxies × n^⅓ systems × n^⅓ nodes, radii bottom-up per
+the hierarchy radius policy — `src/synth/generate.ts` header). Every row above was
+re-measured on the rescaled corpora at the same window/backend/method: the 10⁶ frozen row
+improved to 15.0–15.2 ms (links are shorter on screen relative to the wider field), the 10⁶
+spinning row to 24.7–24.8 ms / 40 fps, and the drawn/total link counts moved because the
+finer system partition skips more degenerate intra draws. The demo's non-frozen
+arrangements now group type→**galaxy** (was type→system): the system facet carries ~n^⅔
+values after the rescale (10,000 at 10⁶ — 7×10,000 pivots would overflow the pivot store
+and break §3.5's "pivots are hundreds"), while galaxies grow as ~n^⅓ (pivots 707 at 10⁶,
+161 at 10⁴). The subtraction and CPU-sink sections below were measured on the pre-rescale
+corpora; their structural conclusions (links are the bill, spins are free, O(pivots) holds)
+were spot-checked against the new rows and stand.
 
 Draw calls are 2 + the renderer's background pass (one fullscreen triangle — `info.render`
 shows 20,001 triangles at 10⁴ nodes). The §9 table holds on every row:
 
-- **10⁴ — vsync, boot < 0.5 s** ✓. 8.2 ms is the 120 Hz frame, with or without spins. The
-  0.2–0.3 ms of frame CPU is the ladder rig (DOM for ~20 live labels + the candidate sweep),
-  not the field — the `field` segment of the breakdown reads 0.0.
-- **10⁵ — vsync with budgets at defaults, boot < 1 s, CPU < 0.5 ms** ✓ (8.5 ms, 0.3 ms). The
-  galaxies+spins row is NOT vsync (33 ms): the spiral look draws longer lines than the frozen
-  gaussian blobs and the half-link budget is ~200 k segments of fill at dpr 2. Links off it is
-  8.3 ms again — the spins themselves cost nothing measurable.
+- **10⁴ — vsync, boot < 0.5 s** ✓. 8.2–8.3 ms is the 120 Hz frame, with or without spins.
+  The ≤ 0.1 ms of frame CPU is the ladder rig (label DOM + the candidate sweep), not the
+  field — the `field` segment of the breakdown reads 0.0.
+- **10⁵ — vsync with budgets at defaults, boot < 1 s, CPU < 0.5 ms** ✓ (8.3–8.4 ms, 0.1 ms).
+  The galaxies+spins row is NOT vsync (25–26 ms, 39 fps): the spiral look draws longer lines
+  than the frozen gaussian blobs and the half-link budget is ~190 k segments of fill at dpr 2.
+  Links off it was vsync again pre-rescale — the spins themselves cost nothing measurable.
 - **10⁶ — flyable ≥ 30 fps with budgets engaged and ALL spins on, boot < 3 s, CPU < 1 ms** ✓
-  (every 90-frame window medianed 31–39 fps — the spinning fill breathes, see below — at
-  0.1–0.3 ms frame CPU, 1.76–1.82 s boot of which ~0.7–0.9 s is synth generation + buildGraph).
-  p90 is 34–41 ms; the worst frame in a 90-frame window is 57–59 ms — that spike is the
+  (three 90-frame windows medianed 40 fps at 0.1–0.2 ms frame CPU, 1.79–1.82 s boot of which
+  ~0.7 s is synth generation + buildGraph).
+  p90 is 26–32 ms; the worst frame in a 90-frame window is 42–61 ms — that spike is the
   once-per-second pick-grid rebuild under spin (below), never the median.
 
 ## What costs the frame, by subtraction
@@ -78,9 +93,9 @@ phase, which is the only honest way to read them:
   discs spread systems into long on-screen lines; gaussian blobs keep them short. A fill
   number quoted without its arrangement is as wrong as one without its camera.
 - **Spins are free.** 10⁵ galaxies, links off: 8.3 ms vsync with both levels turning. At 10⁶
-  the `field` segment (frames.advance + pivot-store sync, 595 pivots) medians 0.0–0.1 ms —
-  §4's O(pivots) claim, confirmed. The sync-only-when-moved path needed no fixing: `advance`
-  already tests the per-tick delta.
+  the `field` segment (frames.advance + pivot-store sync, 707 pivots since the type→galaxy
+  regrouping — 595 before) medians 0.0–0.1 ms — §4's O(pivots) claim, confirmed. The
+  sync-only-when-moved path needed no fixing: `advance` already tests the per-tick delta.
 - **Flat glyphs buy ~1 ms at dpr 1** (they bought more for the predecessor at dpr 2, where
   node fill was double). Kept: the branch costs nothing and the halo it skips is unreadable
   under 9 px anyway.
@@ -176,7 +191,7 @@ localStorage keeping a toggle you forgot) all still apply, plus three new ones f
 - The synthetic corpus is MORE clustered than a real vault (~72% intra-system links), which
   flatters the link budget's "intra-group first" ordering. A flatter graph would spend the
   same budget on longer, less local links.
-- The 10⁵ galaxies look misses vsync (30 fps at dpr 2 with half links). The §9 10⁵ row is the
+- The 10⁵ galaxies look misses vsync (39 fps at dpr 2 with half links). The §9 10⁵ row is the
   boot state and holds; if the dense look at 10⁵ must be vsync too, the levers are the same
   two (links, dpr) and the notch table is one line to change.
 - Label membership at 10⁶ zoomed far out refreshes once per far-sweep generation (61 frames:
@@ -185,7 +200,8 @@ localStorage keeping a toggle you forgot) all still apply, plus three new ones f
   (they ride `refreshViewOf`).
 - **The galaxies look publishes NO labels at the 10⁴–10⁶ home framings, by design.** The
   spiral arrangement spreads the field wider than the frozen synth layout (extent radius
-  2,787 vs 1,677 at 10⁶), so at its refit home framing the largest glyph projects ~6 px —
+  102,014 vs 60,405 at 10⁶ on the constant-density corpora — the same ~1.7× ratio as the
+  pre-rescale 2,787 vs 1,677), so at its refit home framing the largest glyph projects ~6 px —
   under the namedPx 13 admission gate: a mote field, named 0 / far 0 / cand 0 in the
   overlay. The frozen home framing publishes named 20/34 · far 64/64 the whole time at every
   scale (verified at 10⁴/10⁵/10⁶ over repeated sweep generations), and flying in restores

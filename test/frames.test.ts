@@ -480,8 +480,11 @@ describe('determinism under a fixed dt sequence (§10.1)', () => {
     const one = run();
     expect(run()).toEqual(one);
     // recorded from a run and pinned (§10.9 style, like the stage-5 hierarchy goldens):
-    // a silent change to the frame maths fails here even if it stays self-consistent
-    expect(one).toEqual({ q: 706161765, c: 4101504357, a: 2732415901 });
+    // a silent change to the frame maths fails here even if it stays self-consistent.
+    // Re-recorded 2026-11-09 (was q 706161765, c 4101504357, a 2732415901): the synth
+    // constant-density rescale re-deals the galaxy/system facets (~n^⅓ counts), so the
+    // compiled pivot table this digests moved — the frame maths itself did not.
+    expect(one).toEqual({ q: 2700951938, c: 2433892124, a: 1476580600 });
   });
 
   it('a different dt sequence lands elsewhere (the pin is not vacuous)', () => {

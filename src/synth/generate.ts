@@ -14,6 +14,26 @@
  * Scale rule (§10.2–3): only typed arrays are allocated per node; the only strings live in the
  * facet value dictionaries, and labels are a single lazy closure. generateSynth(10⁶) is a few
  * linear passes and completes in seconds.
+ *
+ * THE UNIVERSE SCALES WITH n (defaults only — explicit SynthSpec counts still override).
+ * The first cut used a fixed ~2000-unit field, 12 fixed galaxies and fixed sigmas, so node
+ * density grew LINEARLY with n: 10⁶ nodes was not a bigger universe, just a denser one.
+ * Defaults now target constant spatial density, derived bottom-up the way
+ * src/place/hierarchy.ts sizes groups (radius = spacing × count^⅓, floored):
+ *
+ *   galaxies         = clamp(round(n^⅓), 8, 256)
+ *   systemsPerGalaxy = clamp(round(n^⅓), 4, 256)
+ *   nodesPerSystem   = n / (galaxies × systemsPerGalaxy)
+ *   systemRadius     = max(2·SPACING, SPACING · nodesPerSystem^⅓)
+ *   galaxyRadius     = max(2·systemRadius, PACK · systemRadius · systemsPerGalaxy^⅓)
+ *   universeRadius   = max(2·galaxyRadius, PACK · galaxyRadius · galaxies^⅓)
+ *
+ * A balanced three-level tree, each level ~n^⅓: 10⁶ ≈ 100×100×100, 10⁴ ≈ 22×22×21. When no
+ * clamp or floor binds, the per-level cube roots telescope: universeRadius =
+ * SPACING · PACK² · n^⅓ exactly, independent of how rounding split the levels — so the
+ * field's diagonal grows as n^⅓ and n/diagonal³ holds constant across 10³…10⁶ (both pinned
+ * in test/synth.test.ts). Sigmas are FRACTIONS of their level's radius, never absolute
+ * units, so cluster texture is scale-free too.
  */
 
 import { gauss, hash } from '../core/hash';
@@ -22,9 +42,10 @@ import type { GraphInput } from '../core/types';
 export interface SynthSpec {
   n: number;
   seed: number;
-  /** How many top-level clusters ("galaxies"). Default 12. */
+  /** How many top-level clusters ("galaxies"). Default ~n^⅓ clamped to [8, 256] — see
+   *  `synthDefaults` and the module header: counts grow with n so density does not. */
   galaxies?: number;
-  /** Sub-clusters per galaxy ("systems"). Default 7. */
+  /** Sub-clusters per galaxy ("systems"). Default ~n^⅓ clamped to [4, 256]. */
   systemsPerGalaxy?: number;
   /** Fraction of link draws made inside one system. Default 0.72 — the predecessor's measured
    *  mix, which SCALE.md notes is *more* clustered than a real vault (the honest direction for
@@ -38,13 +59,36 @@ export interface SynthSpec {
 const TYPE_VALUES = ['source', 'note', 'person', 'system', 'synthesis', 'project', 'other'];
 const ERA_VALUES = ['2023', '2024', '2025', '2026', '2027'];
 
-/* Nested gaussian clusters in a ~2000-unit field: galaxy centres spread on a sphere of this
- * radius, system centres gaussian about them, nodes gaussian about systems. */
-const GALAXY_RADIUS = 700;
-const SYSTEM_SIGMA = 260;
-const NODE_SIGMA = 90;
+/* Scale constants (module header: the constant-density derivation). SPACING is the
+ * characteristic node spacing — the vault's ~192-unit page spacing — the ONE density
+ * constant everything else multiplies; PACK keeps sibling clusters from overlapping badly
+ * when a level's children are packed into their parent. Sigmas are fractions of their
+ * level's radius (never absolute units, which is what made the old field densify). */
+const SPACING = 192;
+const PACK = 1.6;
+const GALAXIES_MIN = 8;
+const GALAXIES_MAX = 256;
+const SYSTEMS_MIN = 4;
+const SYSTEMS_MAX = 256;
+const NODE_SIGMA_FRAC = 0.5; // of systemRadius — ~95% of a system's nodes inside its radius
+const SYSTEM_SIGMA_FRAC = 0.4; // of galaxyRadius
 const LINKS_PER_NODE = 4;
 const GOLDEN_ANGLE = 2.399963229728653;
+
+function clampInt(v: number, lo: number, hi: number): number {
+  return v < lo ? lo : v > hi ? hi : v;
+}
+
+/** Default cluster counts for an n-node corpus: a balanced three-level tree, each level
+ *  ~n^⅓, clamped (module header). Exported so tests and consumers derive the structure
+ *  from the same formula the generator uses instead of hardcoding yesterday's defaults. */
+export function synthDefaults(n: number): { galaxies: number; systemsPerGalaxy: number } {
+  const side = Math.round(Math.cbrt(Math.max(n, 1)));
+  return {
+    galaxies: clampInt(side, GALAXIES_MIN, GALAXIES_MAX),
+    systemsPerGalaxy: clampInt(side, SYSTEMS_MIN, SYSTEMS_MAX),
+  };
+}
 
 /* Independent hash streams, all derived from spec.seed. Each constant below is a stream id;
  * mixing it with the seed through two odd multipliers gives decorrelated salts (same trick as
@@ -84,8 +128,8 @@ function skewedCDF(k: number): Float64Array {
   return cum;
 }
 
-/** Index of the first cumulative bucket at or above r. k is small (≤ dozens) — a linear scan
- *  beats anything cleverer and allocates nothing. */
+/** Index of the first cumulative bucket at or above r. k is small (≤ a few hundred) — a
+ *  linear scan beats anything cleverer and allocates nothing. */
 function pick(cum: Float64Array, r: number): number {
   const k = cum.length;
   for (let j = 0; j < k - 1; j++) if (r <= cum[j]!) return j;
@@ -103,8 +147,9 @@ function facetStore(n: number, k: number): Uint8Array | Uint16Array | Uint32Arra
 export function generateSynth(spec: SynthSpec): GraphInput {
   const n = spec.n;
   const seed = spec.seed | 0;
-  const galaxies = spec.galaxies ?? 12;
-  const perGalaxy = spec.systemsPerGalaxy ?? 7;
+  const defaults = synthDefaults(n);
+  const galaxies = spec.galaxies ?? defaults.galaxies;
+  const perGalaxy = spec.systemsPerGalaxy ?? defaults.systemsPerGalaxy;
   const intra = spec.intraLinkFraction ?? 0.72;
   if (!Number.isInteger(n) || n < 0) throw new Error(`generateSynth: n must be a non-negative integer, got ${n}`);
   if (!Number.isInteger(galaxies) || galaxies < 1) throw new Error(`generateSynth: galaxies must be >= 1, got ${galaxies}`);
@@ -112,6 +157,16 @@ export function generateSynth(spec: SynthSpec): GraphInput {
   if (!(intra >= 0 && intra <= 1)) throw new Error(`generateSynth: intraLinkFraction must be in [0,1], got ${intra}`);
 
   const systems = galaxies * perGalaxy;
+
+  /* ---- radii, bottom-up (the hierarchy radius policy — module header). Derived from the
+   * ACTUAL counts, so an explicit galaxies/systemsPerGalaxy override keeps constant density
+   * too: fewer clusters simply means bigger ones in a correspondingly bigger universe. */
+  const nodesPerSystem = Math.max(1, n / systems);
+  const systemRadius = Math.max(2 * SPACING, SPACING * Math.cbrt(nodesPerSystem));
+  const galaxyRadius = Math.max(2 * systemRadius, PACK * systemRadius * Math.cbrt(perGalaxy));
+  const universeRadius = Math.max(2 * galaxyRadius, PACK * galaxyRadius * Math.cbrt(galaxies));
+  const nodeSigma = NODE_SIGMA_FRAC * systemRadius;
+  const systemSigma = SYSTEM_SIGMA_FRAC * galaxyRadius;
 
   /* ---- facets. `type` and `era` are independent draws (their own streams); `galaxy` is its
    * own draw; `system` nests inside galaxy by construction (same node can never be in system
@@ -142,15 +197,16 @@ export function generateSynth(spec: SynthSpec): GraphInput {
   /* ---- centres. Galaxy centres on a Fibonacci sphere — m centres get m directions that are
    * GUARANTEED spread (a hash only gets that on average, and on a small m it routinely does
    * not — ported from arrange.js's spreadNormal rationale). System centres gaussian about
-   * their galaxy, nodes gaussian about their system: nested clusters in a ~2000-unit field. */
+   * their galaxy, nodes gaussian about their system: nested clusters in a universe whose
+   * radius grows as n^⅓ (module header), never a fixed-size field. */
   const galaxyCentre = new Float64Array(galaxies * 3);
   for (let g = 0; g < galaxies; g++) {
     const y = galaxies > 1 ? 1 - 2 * ((g + 0.5) / galaxies) : 0;
     const rr = Math.sqrt(Math.max(0, 1 - y * y));
     const th = g * GOLDEN_ANGLE;
-    galaxyCentre[g * 3] = Math.cos(th) * rr * GALAXY_RADIUS;
-    galaxyCentre[g * 3 + 1] = y * GALAXY_RADIUS;
-    galaxyCentre[g * 3 + 2] = Math.sin(th) * rr * GALAXY_RADIUS;
+    galaxyCentre[g * 3] = Math.cos(th) * rr * universeRadius;
+    galaxyCentre[g * 3 + 1] = y * universeRadius;
+    galaxyCentre[g * 3 + 2] = Math.sin(th) * rr * universeRadius;
   }
   const systemCentre = new Float64Array(systems * 3);
   const saltSysX = streamSalt(seed, S_SYS_X);
@@ -158,9 +214,9 @@ export function generateSynth(spec: SynthSpec): GraphInput {
   const saltSysZ = streamSalt(seed, S_SYS_Z);
   for (let s = 0; s < systems; s++) {
     const g = (s / perGalaxy) | 0;
-    systemCentre[s * 3] = galaxyCentre[g * 3]! + gauss(s, saltSysX) * SYSTEM_SIGMA;
-    systemCentre[s * 3 + 1] = galaxyCentre[g * 3 + 1]! + gauss(s, saltSysY) * SYSTEM_SIGMA;
-    systemCentre[s * 3 + 2] = galaxyCentre[g * 3 + 2]! + gauss(s, saltSysZ) * SYSTEM_SIGMA;
+    systemCentre[s * 3] = galaxyCentre[g * 3]! + gauss(s, saltSysX) * systemSigma;
+    systemCentre[s * 3 + 1] = galaxyCentre[g * 3 + 1]! + gauss(s, saltSysY) * systemSigma;
+    systemCentre[s * 3 + 2] = galaxyCentre[g * 3 + 2]! + gauss(s, saltSysZ) * systemSigma;
   }
 
   /* ---- positions: one pass, three gaussian draws per node about its system centre. */
@@ -171,9 +227,9 @@ export function generateSynth(spec: SynthSpec): GraphInput {
   for (let i = 0; i < n; i++) {
     const s3 = systemData[i]! * 3;
     const o = i * 3;
-    positions[o] = systemCentre[s3]! + gauss(i, saltX) * NODE_SIGMA;
-    positions[o + 1] = systemCentre[s3 + 1]! + gauss(i, saltY) * NODE_SIGMA;
-    positions[o + 2] = systemCentre[s3 + 2]! + gauss(i, saltZ) * NODE_SIGMA;
+    positions[o] = systemCentre[s3]! + gauss(i, saltX) * nodeSigma;
+    positions[o + 1] = systemCentre[s3 + 1]! + gauss(i, saltY) * nodeSigma;
+    positions[o + 2] = systemCentre[s3 + 2]! + gauss(i, saltZ) * nodeSigma;
   }
 
   /* ---- words: a heavy-tailed numeric column (log-normal — median ~120, a long right tail

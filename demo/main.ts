@@ -89,7 +89,11 @@ import { generateSynth } from '../src/synth/generate';
 const statsEl = document.getElementById('stats')!;
 const errorEl = document.getElementById('error')!;
 
-/** The four non-frozen arrangements: the 2-level type>system hierarchy with this leaf. */
+/** The four non-frozen arrangements: the 2-level type>galaxy hierarchy with this leaf.
+ *  `galaxy`, not `system`: since the synth generator's constant-density rescale the system
+ *  facet carries ~n^⅔ values (10,000 at 10⁶ — 7×10,000 pivots would overflow the pivot
+ *  store AND break §3.5's "rotation work is one quaternion per pivot, hundreds"), while
+ *  galaxies grow as ~n^⅓ (100 at 10⁶ → ~700 pivots). */
 const LEAVES: Record<string, LevelSpec['place']> = {
   galaxies: { preset: 'spiralGalaxy' },
   ring: { shape: 'ring', scatter: 'gaussian', params: { thickness: 0.06 } },
@@ -453,7 +457,7 @@ async function main(): Promise<void> {
       } else {
         levels = [
           { groupBy: 'type', place: { shape: 'shell' }, spin: { rate: 0 } },
-          { groupBy: 'system', place: { shape: 'cloud' }, spin: { rate: 0 } },
+          { groupBy: 'galaxy', place: { shape: 'cloud' }, spin: { rate: 0 } },
           { place: leaf },
         ];
       }

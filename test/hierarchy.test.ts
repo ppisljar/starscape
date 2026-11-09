@@ -24,8 +24,11 @@ import type { Graph } from '../src/core/types';
 /* ------------------------------------------------------------------ fixtures */
 
 /** THE corpus of the task spec: generateSynth({n:2000, seed:7}), compiled once. Facets:
- *  type (7 values), galaxy (12), system (84), era (5). */
+ *  type (7 values), galaxy (13), system (169), era (5) — galaxy/system counts come from the
+ *  generator's ~n^⅓ defaults (synthDefaults), not fixed constants, since the constant-density
+ *  rescale of 2026-11-09. */
 const SYNTH = buildGraph(generateSynth({ n: 2000, seed: 7 }));
+const GALAXY_VALUES = SYNTH.facets['galaxy']!.values.length; // 13 at n=2000
 
 /** A hand-sized graph: facet `g` with one block of nodes per entry of `sizes` (value k
  *  gets `sizes[k]` consecutive nodes), plus optional never-assigned extra values. No
@@ -152,17 +155,24 @@ const LEVELS_4: LevelSpec[] = [
 /* Re-recorded when the spiralGalaxy preset's geometry was deliberately fixed (stage-5
  * review: equal arms via the declared fold, radialPower 1, dead `bulge` dropped) —
  * positions/centre/world moved, every structural digest (parent/level/radius/axis/rate/
- * nodePivot) stayed, which is exactly the shape of a pure geometry change. */
+ * nodePivot) stayed, which is exactly the shape of a pure geometry change.
+ *
+ * Re-recorded again 2026-11-09 for the synth constant-density rescale (galaxies now ~n^⅓:
+ * the n=2000 corpus deals 13 galaxies where it dealt 12), which re-partitions every level
+ * below `type` — all nine digests moved. Old values: positions 276329203, centre 3197021762,
+ * world 3874786577, parent 3922889169, level 937075595, radius 1421081648, axis 1830356232,
+ * rate 345338110, nodePivot 1595266401. (GOLDEN_2 above partitions by `type` only — an
+ * independent hash stream the rescale does not touch — and deliberately did not move.) */
 const GOLDEN_4 = {
-  positions: 276329203,
-  centre: 3197021762,
-  world: 3874786577,
-  parent: 3922889169,
-  level: 937075595,
-  radius: 1421081648,
-  axis: 1830356232,
-  rate: 345338110,
-  nodePivot: 1595266401,
+  positions: 825973778,
+  centre: 414606039,
+  world: 749269809,
+  parent: 1783205304,
+  level: 993922690,
+  radius: 3590265682,
+  axis: 2208874264,
+  rate: 763836879,
+  nodePivot: 322497763,
 };
 
 describe('compileHierarchy: 4 levels over synth {n:2000, seed:7}', () => {
@@ -184,9 +194,10 @@ describe('compileHierarchy: 4 levels over synth {n:2000, seed:7}', () => {
     const c1 = comboSet(SYNTH, ['type']).size;
     const c2 = comboSet(SYNTH, ['type', 'galaxy']).size;
     const c3 = comboSet(SYNTH, ['type', 'galaxy', 'era']).size;
-    // potential children: 7 type values at the root, 12 galaxies per type group,
-    // 5 eras per (type, galaxy) group — minus what actually exists
-    const expected = (7 - c1) + (c1 * 12 - c2) + (c2 * 5 - c3);
+    // potential children: 7 type values at the root, GALAXY_VALUES (13 at n=2000, from the
+    // generator's ~n^⅓ default) per type group, 5 eras per (type, galaxy) group — minus
+    // what actually exists
+    const expected = (7 - c1) + (c1 * GALAXY_VALUES - c2) + (c2 * 5 - c3);
     expect(r.stats.emptyDropped).toBe(expected);
   });
 

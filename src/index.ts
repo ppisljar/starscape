@@ -180,5 +180,5 @@ export type { TonemapOp, TonemapRig } from './field/tonemap';
  * Deterministic 10²…10⁶-node corpora from (n, seed) alone — the demo's and the tests' fuel,
  * exported so an external consumer can exercise its own integration at sizes no real dataset
  * reaches (pairs with the ladder's makeSynthProvider above for page content). */
-export { generateSynth } from './synth/generate';
+export { generateSynth, synthDefaults } from './synth/generate';
 export type { SynthSpec } from './synth/generate';
