@@ -63,4 +63,32 @@ describe('package.json — the consumable surface (§8)', () => {
     expect(pkg.files).toContain('dist');
     expect(pkg.peerDependencies?.['three']).toBeDefined();
   });
+
+  /* The synth corpus generator is part of the surface: a consumer must be able to drive its
+   * own integration with the same deterministic corpora the demo and the tests run on. The
+   * build compiles src/index.ts verbatim into the root export's dist/index.js, so asserting
+   * on the src barrel asserts on what a user gets (same contract as srcOf above). */
+  it('exports the synth generator (generateSynth + makeSynthProvider) at the root', async () => {
+    const surface = (await import('../src/index')) as Record<string, unknown>;
+    expect(typeof surface['generateSynth'], 'generateSynth must be on the package surface').toBe(
+      'function',
+    );
+    expect(
+      typeof surface['makeSynthProvider'],
+      'makeSynthProvider must be on the package surface',
+    ).toBe('function');
+    // and it is the real generator: deterministic from (n, seed), facets and all
+    const gen = surface['generateSynth'] as (spec: { n: number; seed: number }) => {
+      n: number;
+      positions: Float32Array;
+      facets: Record<string, unknown>;
+    };
+    const a = gen({ n: 50, seed: 42 });
+    const b = gen({ n: 50, seed: 42 });
+    expect(a.n).toBe(50);
+    expect(Array.from(a.positions)).toEqual(Array.from(b.positions));
+    for (const key of ['type', 'galaxy', 'system', 'era']) {
+      expect(a.facets[key], `synth facet "${key}" must exist`).toBeDefined();
+    }
+  });
 });

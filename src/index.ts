@@ -3,8 +3,9 @@
  *  renderer (§5 — two draw calls, TSL materials), the stage-4 interaction base (§6 —
  *  cameras, picking, hover/selection focus), and the stage-5 placement engine (§3.3–3.4 —
  *  the four knobs, their libraries, presets, the hierarchy compiler and the BFS pull).
- *  The synth corpus generator (`src/synth/`) is test/demo fuel, deliberately not part of
- *  this surface. */
+ *  The synth corpus generator (`src/synth/`) IS part of this surface (below, with the
+ *  ladder's makeSynthProvider): consumers need the same deterministic 10²…10⁶ corpora the
+ *  demo and the tests run on to exercise an integration at sizes no real dataset reaches. */
 export const VERSION = '0.0.0';
 
 export { hash, gauss } from './core/hash';
@@ -174,3 +175,10 @@ export { VISUAL_PRESETS, VISUAL_PRESET_NAMES } from './theme/presets';
 export type { VisualPreset, VisualPresetName } from './theme/presets';
 export { createTonemap, tonemapRGB, EXPOSURE_DEFAULT, OP_INDEX, TONEMAP_OPS } from './field/tonemap';
 export type { TonemapOp, TonemapRig } from './field/tonemap';
+
+/* ---- the synth corpus generator (src/synth/) --------------------------------------------
+ * Deterministic 10²…10⁶-node corpora from (n, seed) alone — the demo's and the tests' fuel,
+ * exported so an external consumer can exercise its own integration at sizes no real dataset
+ * reaches (pairs with the ladder's makeSynthProvider above for page content). */
+export { generateSynth } from './synth/generate';
+export type { SynthSpec } from './synth/generate';
