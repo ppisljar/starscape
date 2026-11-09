@@ -27,8 +27,10 @@ import { Color, Matrix4, PerspectiveCamera, Scene, Vector3, WebGPURenderer } fro
 import type { BufferAttribute, InstancedBufferAttribute, LineSegments, Mesh } from 'three/webgpu';
 import {
   attachToAnchors,
+  bootQuality,
   buildGraph,
   buildGrid,
+  cellMaxOf,
   compileHierarchy,
   createConfigStore,
   createField,
@@ -120,6 +122,16 @@ async function main(): Promise<void> {
      are returned — surfaced on the debug handle, never console.warn'd by the library. */
   const store = createConfigStore({ storage: localStorageAdapter(), presets: VISUAL_PRESETS });
   const configWarnings = store.load();
+  /* Stage 9: the boot quality notch — the corpus picks the starting budgets, every load,
+     like a game detecting the hardware once at startup (quality.ts: the ported predecessor
+     policy, no feedback loop). Written INTO the session-scoped config keys, so the panel
+     shows what is actually drawn and the user overrides by dragging the same knobs; the
+     store never persists them (schema SESSION_KEYS), so a budget tuned for 10⁶ pages can
+     never silently survive into a 10³ session. */
+  const quality = bootQuality(n, window.devicePixelRatio || 1);
+  store.set('linkBudget', quality.linkFraction);
+  store.set('renderScale', quality.renderScale);
+  store.set('flatPx', quality.flatPx);
   const num = (k: string): number => store.get(k) as number;
   const str = (k: string): string => store.get(k) as string;
   const bool = (k: string): boolean => store.get(k) === true;
@@ -183,12 +195,37 @@ async function main(): Promise<void> {
   const viewBuf = new Float32Array(n * 3);
   viewBuf.set(positions);
   let grid = buildGrid(viewBuf, n);
-  let gridDrift = 0; // bound on how far any node may have walked since `grid` was built
+  /* Drift bookkeeping, stage 9: `driftTotal` is MONOTONE (never reset) so a structure pinned
+     to an older grid — the far candidate sweep below survives rebuilds — can widen by exactly
+     the drift since ITS grid was built; `gridDrift` (drift since the CURRENT grid) derives
+     from it. `lastRebuildMs` is telemetry: the rebuild is the one O(n) cost left on the
+     spinning path, and §10.7 says hidden costs are shown, not implied. */
+  let driftTotal = 0;
+  let gridDriftBase = 0;
+  let gridDrift = 0; // ≡ driftTotal − gridDriftBase, kept unrolled for the hot paths
   let gridCooldown = 0; // seconds until the next in-spin rebuild (the port's 250 ms limiter)
+  let lastRebuildMs = 0;
+  /* Per-cell max of the size channel — the far sweep's cell-level pruning bound (pick/grid
+     cellMaxOf). Follows the grid (rebuilds) AND the channel (applySizes): both events. */
+  let gridCellMax = cellMaxOf(grid, (i) => field.sizeOf(i));
+  let roomValid = false; // the roomAt cache below — invalidated by every rebuild
   const rebuildGrid = (): void => {
+    const r0 = performance.now();
     field.viewPositions(viewBuf);
     grid = buildGrid(viewBuf, n);
+    // Reuse the cellMax slab UNLESS the far sweep has it pinned (sweepCellMax below): a
+    // sweep mid-generation keeps pruning against ITS grid, and rewriting its bound array in
+    // place would silently mismatch bounds to cells. The guard costs one allocation per
+    // rebuild only while a sweep is actually in flight.
+    gridCellMax = cellMaxOf(
+      grid,
+      (i) => field.sizeOf(i),
+      gridCellMax === sweepCellMax ? undefined : gridCellMax,
+    );
+    gridDriftBase = driftTotal;
     gridDrift = 0;
+    roomValid = false;
+    lastRebuildMs = performance.now() - r0;
   };
 
   /* The CPU mirror of the shader's BASE endpoints (mix(A,B,t), parked), refreshed when a
@@ -201,7 +238,11 @@ async function main(): Promise<void> {
   baseBuf.set(positions);
   let morphing = false; // a retarget tween is rewriting the base endpoints right now
   let fieldSettledNow = true; // field.settled() this frame: frames parked, no field tween
-  let spinRateSum = 0; // Σ|rate| over the live spin levels — drives the drift bound
+  /* Worst-case node speed under the live spins, world units/s before spread — drives the
+     drift bound. Stage 9: from PIVOT RADII (|rate| × lever, summed down the chain), not
+     0.5 × diagonal: the old bound over-reported drift ~5× at 10⁶ (systems are small), and
+     every walk pays the widening. Set by applySpins. */
+  let spinDriftRate = 0;
   const spreadC: [number, number, number] = [0, 0, 0]; // live spread centre, synced per frame
   let spreadK = 1;
   const refreshViewOf = (i: number): void => {
@@ -231,11 +272,41 @@ async function main(): Promise<void> {
   let liveFov = DEFAULT_FOV;
 
   const roomPos = { x: 0, y: 0, z: 0 }; // one reusable probe — no per-frame allocation
+  /* roomAt, stage 9: CACHED by displacement. The flycam probes twice per frame (current
+     position + step destination) and nearestDistance costs ~0.35 ms per probe at 10⁶ from
+     the home framing — 0.7 ms of a 1 ms §9 frame-CPU budget for a number that cannot have
+     changed while the camera is parked. The cache returns a safe LOWER bound instead: the
+     nearest node can have approached by at most (probe displacement + node drift since the
+     walk), so cached − slack is correct for the flycam's damping whatever happened — and the
+     real walk is re-paid only once the slack passes half a cell. Parked on the home framing
+     the probe is free; flying fast re-pays it, which SCALE.md reports. Rebuilds invalidate
+     (roomValid, rebuildGrid above). */
+  let roomX = 0;
+  let roomY = 0;
+  let roomZ = 0;
+  let roomVal = Infinity;
+  let roomDriftAt = 0;
   const roomAt = (p: readonly [number, number, number]): number => {
+    if (roomValid) {
+      const dx = p[0] - roomX;
+      const dy = p[1] - roomY;
+      const dz = p[2] - roomZ;
+      const slack = Math.sqrt(dx * dx + dy * dy + dz * dz) + (driftTotal - roomDriftAt);
+      if (slack < grid.cellMax * 0.5) {
+        return roomVal === Infinity ? Infinity : Math.max(roomVal - slack, 0);
+      }
+    }
     roomPos.x = p[0];
     roomPos.y = p[1];
     roomPos.z = p[2];
-    return nearestDistance(grid, roomPos);
+    const d = nearestDistance(grid, roomPos, { drift: gridDrift });
+    roomX = p[0];
+    roomY = p[1];
+    roomZ = p[2];
+    roomVal = d;
+    roomDriftAt = driftTotal;
+    roomValid = true;
+    return d;
   };
   const softStop = (): number => radius * 0.02;
   const zoomRange = (): readonly [number, number] => [radius * 0.01, diagonal * 4];
@@ -331,23 +402,36 @@ async function main(): Promise<void> {
    *  In the frozen layout no frames exist, so the knob idles — exactly the schema's note. */
   const applySpins = (): void => {
     if (!hierarchy) {
-      spinRateSum = 0;
+      spinDriftRate = 0;
       return;
     }
     const override = num('levelSpin');
     const pv = hierarchy.pivots;
     const on = [ui.spin0.checked, ui.spin1.checked];
     const rates = [Number(ui.rate0.value) || 0, Number(ui.rate1.value) || 0];
+    /* ONE pass sets the live rates AND accumulates the drift bound. A node riding pivot p
+       moves at ≤ |rate_p| × (lever about p) ≤ |rate_p| × radius_p, and the levers of a
+       chain ADD — so Σ over levels of max(|rate| × radius) bounds every node's speed.
+       ×1.5 margin: scatter may place a member a little outside its group sphere. (Per-level
+       maxima, summed; the demo's hierarchies carry spin on at most L0/L1 + the override.) */
+    let d0 = 0;
+    let d1 = 0;
+    let dRest = 0;
     for (let p = 0; p < pv.count; p++) {
       const lv = pv.level[p]!;
       const base = lv <= 1 && on[lv] ? rates[lv]! : 0;
-      pv.rate[p] = override > 0 ? override : base;
+      const r = override > 0 ? override : base;
+      pv.rate[p] = r;
+      const speed = Math.abs(r) * pv.radius[p]!;
+      if (lv === 0) {
+        if (speed > d0) d0 = speed;
+      } else if (lv === 1) {
+        if (speed > d1) d1 = speed;
+      } else if (speed > dRest) {
+        dRest = speed;
+      }
     }
-    // the drift bound's rate: levels added, because a node can ride every frame in its chain
-    spinRateSum =
-      override > 0
-        ? override * hierarchy.chainDepth
-        : (on[0] ? Math.abs(rates[0]!) : 0) + (on[1] ? Math.abs(rates[1]!) : 0);
+    spinDriftRate = (d0 + d1 + dRest) * 1.5;
   };
 
   const applyArrangement = (): void => {
@@ -464,27 +548,40 @@ async function main(): Promise<void> {
   }
   const maxBoost = Math.max(BOOST_HOVER, BOOST_SELECT);
 
-  /* THE CANDIDATE RECIPE — a cheap pass over the pick grid, not a sweep of all n nodes:
-     1. Nothing beyond `reach` can matter. The ladder's own gate is projectedPx ≥ NAMED_PX,
-        and the largest glyph any node can draw is maxSizeWorld × NODE_SCALE × maxBoost — so
-        reach = standoffOf(thatRadius, NAMED_PX, fovPx), floored at the card distance
-        (CARD_SPACINGS × spacing × spread — the thresholds live in SPREAD world units, like
-        the positions). Both are DEPTH thresholds, and within the frustum margin depth can
-        undercut Euclidean range by up to √(1 + tanH² + tanV²), so the walk sphere widens
-        by that slack — plus the tracked grid drift while spins are live.
-     2. Walk only the PICK GRID cells whose boxes intersect the camera sphere of radius
-        `reach`. Flying close (where the ladder lives) this is a handful of cells; zoomed
-        far out it degrades to the whole grid, where the px gate then rejects almost
-        everything after a few multiplies. While the field spins, each resident is first
-        re-transformed through the live frame chain (refreshViewOf — written back into
-        viewBuf, so the overlay and the click target read the same fresh spot).
-     3. Per resident node: view-forward DEPTH (clip w ≡ −z_view — what the shader sizes by,
-        nodes.ts centerView.z.negate(), and what the predecessor fed sVirtual AND sCard;
-        Euclidean range over-measures off-axis nodes by 1/cosθ, ~30%+ at the frustum
-        corner), the px gate, then the frustum margin test (±1.25 / ±1.3 NDC, the
-        predecessor's margins) and the cursor pull.
-     4. The pinned node is appended even when the walk missed it — a pin outranks the
-        ladder, and pinning something that is not a candidate must still pin.
+  /* THE CANDIDATE RECIPE, stage-9 edition — bounded per frame HOWEVER big the corpus.
+     The stage-7 version walked every grid cell in reach each frame; at the §9 home framing
+     reach covers the whole field, so it was an O(n) sweep per frame — measured 67 ms at 10⁶,
+     all by itself two orders over the §9 frame-CPU budget. The fix splits the pass by what
+     actually needs per-frame freshness:
+
+     NEAR PASS (every frame, exact): cells within the CARD distance (dCard × frustum slack +
+     drift) of the camera. Cards, locks and the open page key off live DEPTH — a stale
+     distance would lag the open tier exactly where the ladder lives — and near the camera
+     this is a handful of cells whatever n is. Per node: view-forward depth (clip w ≡ −z_view,
+     what the shader sizes by), the px gate, the frustum margin test (±1.25/±1.3 NDC), the
+     cursor pull. While spinning, each resident is re-formed through the live frame chain
+     first (refreshViewOf — written back into viewBuf, so overlay and click target agree).
+
+     FAR SWEEP (incremental, SWEEP_CELLS_PER_FRAME cells a frame): the named band only needs
+     the best ~`keep` candidates by projected size, and label admission already carries dwell
+     hysteresis — so membership may lag a few hundred ms, exactly the staleness class of the
+     morph gap the stage-7 header accepted. One GENERATION sweeps the full reach box (the
+     stage-7 reach formula) keeping a bounded top-K-by-px selection; cells are pruned with the
+     per-cell max of the size channel (pick/grid cellMaxOf): a cell whose LARGEST node cannot
+     project over the admission floor at the cell's nearest possible depth is skipped whole.
+     The sweep pins ITS grid + cellMax + drift base, so a mid-generation rebuild (spins) never
+     restarts it — the widening just grows by the drift since the PINNED grid was built. On
+     completion the selection becomes the published FAR SET: node ids only, re-projected
+     FRESH every frame (≤ FAR_CAP nodes), so rank, cursor pull and distances are live — only
+     membership is a generation stale. A morph clears it (every position moved).
+
+     REFINEMENT vs stage 7 (deliberate, documented in SCALE.md): far admission is by RESTING
+     projected size — the cursor pull and the hover boost promote candidates within the
+     published set but no longer recruit from outside the top-K×2 band. At the framings where
+     that band is even oversubscribed (10⁵⁺ zoomed out, tens of thousands passing the px
+     gate), individual sub-band glyphs are pixels apart and unpointable anyway.
+
+     The pinned node is appended even when both passes missed it — a pin outranks the ladder.
      Columns are fixed scratch, grown geometrically, never allocated per frame (§10). */
   let candCap = 0;
   let candNode = new Uint32Array(0);
@@ -524,20 +621,220 @@ async function main(): Promise<void> {
     ladderCandidates.cursorPx = candCur;
   };
 
+  /* ---- far-sweep state (see THE CANDIDATE RECIPE above). All fixed scratch. ---- */
+  /** Hard ceiling on the published far set (and its selection heap). */
+  const FAR_CAP = 256;
+  /** Cells examined per frame — the sweep's whole per-frame budget is this many cheap cell
+   *  tests plus the members of the few that survive the pruning. 4096 ≈ a sixth of the 10⁵
+   *  grid (6-frame generations) and 1/61 of the 10⁶ grid (~1.5 s generations): measured, the
+   *  number where the slice stays under ~0.3 ms at 10⁵ (the §9 0.5 ms row leaves no room for
+   *  more) while label-set refresh stays comfortably inside the dwell hysteresis. */
+  const SWEEP_CELLS_PER_FRAME = 4096;
+  const heapNode = new Uint32Array(FAR_CAP);
+  const heapPx = new Float64Array(FAR_CAP);
+  let heapK = 0;
+  let heapLimit = FAR_CAP;
+  const farNode = new Uint32Array(FAR_CAP);
+  let farCount = 0;
+  let sweepActive = false;
+  let sweepGrid = grid; // the generation's PINNED grid (survives rebuilds mid-sweep)
+  let sweepCellMax = gridCellMax;
+  let sweepDriftBase = 0; // driftTotal when the pinned grid was built
+  let sweepReach = 0;
+  let sweepLoX = 0;
+  let sweepHiX = -1;
+  let sweepLoY = 0;
+  let sweepHiY = -1;
+  let sweepLoZ = 0;
+  let sweepHiZ = -1;
+  let sweepX = 0;
+  let sweepY = 0;
+  let sweepZ = 0;
+  let sweepCells = 0; // telemetry: cells in this generation's box / done so far
+  let sweepDone = 0;
+  let sweepGen = 0;
+  /** Which nodes THIS frame's near pass admitted — O(1) dedupe for the far merge. */
+  const nearStamp = new Uint32Array(n);
+  let nearEpoch = 0;
+
+  const heapSift = (j: number): void => {
+    // min-heap on px: root holds the admission floor once the selection is full
+    for (;;) {
+      const l = j * 2 + 1;
+      if (l >= heapK) return;
+      const r = l + 1;
+      const c = r < heapK && heapPx[r]! < heapPx[l]! ? r : l;
+      if (heapPx[c]! >= heapPx[j]!) return;
+      const tn = heapNode[j]!;
+      const tp = heapPx[j]!;
+      heapNode[j] = heapNode[c]!;
+      heapPx[j] = heapPx[c]!;
+      heapNode[c] = tn;
+      heapPx[c] = tp;
+      j = c;
+    }
+  };
+  const heapPush = (node: number, px: number): void => {
+    if (heapK < heapLimit) {
+      let j = heapK++;
+      heapNode[j] = node;
+      heapPx[j] = px;
+      while (j > 0) {
+        const p = (j - 1) >> 1;
+        if (heapPx[p]! <= heapPx[j]!) break;
+        const tn = heapNode[j]!;
+        const tp = heapPx[j]!;
+        heapNode[j] = heapNode[p]!;
+        heapPx[j] = heapPx[p]!;
+        heapNode[p] = tn;
+        heapPx[p] = tp;
+        j = p;
+      }
+    } else if (px > heapPx[0]!) {
+      heapNode[0] = node;
+      heapPx[0] = px;
+      heapSift(0);
+    }
+  };
+
+  /** Drop the far set and any sweep in flight — a morph moved every position, so a stale
+   *  membership would name the wrong places; the next gather starts a fresh generation. */
+  const resetSweep = (): void => {
+    sweepActive = false;
+    heapK = 0;
+    farCount = 0;
+  };
+
+  /** Advance the far sweep by one budget slice (see THE CANDIDATE RECIPE). */
+  function farSlice(fovPx: number, slack: number, dCard: number): void {
+    if (!sweepActive) {
+      // a new generation pins the CURRENT grid and derives its box from the live camera
+      sweepGrid = grid;
+      sweepCellMax = gridCellMax;
+      sweepDriftBase = gridDriftBase;
+      heapLimit = Math.min(FAR_CAP, Math.max(ladder.config.keep, ladder.config.earn) * 2);
+      heapK = 0;
+      sweepReach =
+        Math.max(
+          standoffOf(maxSizeWorld * NODE_SCALE * maxBoost, ladder.config.namedPx, fovPx),
+          dCard,
+        ) *
+          slack +
+        gridDrift;
+      const g = sweepGrid;
+      sweepLoX = Math.max(0, Math.floor((camera.position.x - sweepReach - g.minX) / g.cellX));
+      sweepHiX = Math.min(g.side - 1, Math.floor((camera.position.x + sweepReach - g.minX) / g.cellX));
+      sweepLoY = Math.max(0, Math.floor((camera.position.y - sweepReach - g.minY) / g.cellY));
+      sweepHiY = Math.min(g.side - 1, Math.floor((camera.position.y + sweepReach - g.minY) / g.cellY));
+      sweepLoZ = Math.max(0, Math.floor((camera.position.z - sweepReach - g.minZ) / g.cellZ));
+      sweepHiZ = Math.min(g.side - 1, Math.floor((camera.position.z + sweepReach - g.minZ) / g.cellZ));
+      sweepX = sweepLoX;
+      sweepY = sweepLoY;
+      sweepZ = sweepLoZ;
+      sweepCells =
+        Math.max(0, sweepHiX - sweepLoX + 1) *
+        Math.max(0, sweepHiY - sweepLoY + 1) *
+        Math.max(0, sweepHiZ - sweepLoZ + 1);
+      sweepDone = 0;
+      sweepActive = sweepCells > 0;
+      if (!sweepActive) {
+        farCount = 0;
+        return;
+      }
+    }
+    const g = sweepGrid;
+    const cm = sweepCellMax;
+    const live = !fieldSettledNow;
+    const driftW = driftTotal - sweepDriftBase; // nodes may sit this far from their old cells
+    const reachW = sweepReach + driftW;
+    const r2 = reachW * reachW;
+    const cx = camera.position.x;
+    const cy = camera.position.y;
+    const cz = camera.position.z;
+    const m = clipM.elements;
+    const namedPx = ladder.config.namedPx;
+    /* Best-case px factor: diameter × NODE_SCALE × fovPx over the cell's minimum VIEW DEPTH.
+       Depth (clip w) is linear over the cell box, so its exact minimum is one corner picked
+       by coefficient sign — the same number the per-node gate divides by, with no Euclidean
+       slack inflating the bound 1.6× (measured: the slack form passed ~3× the cells). */
+    const pxNum = 2 * NODE_SCALE * fovPx;
+    const m3 = m[3]!;
+    const m7 = m[7]!;
+    const m11 = m[11]!;
+    const m15 = m[15]!;
+    let budget = SWEEP_CELLS_PER_FRAME;
+    while (budget > 0) {
+      const z0 = g.minZ + sweepZ * g.cellZ;
+      const y0 = g.minY + sweepY * g.cellY;
+      const x0 = g.minX + sweepX * g.cellX;
+      const dz0 = cz < z0 ? z0 - cz : cz > z0 + g.cellZ ? cz - (z0 + g.cellZ) : 0;
+      const dy0 = cy < y0 ? y0 - cy : cy > y0 + g.cellY ? cy - (y0 + g.cellY) : 0;
+      const dx0 = cx < x0 ? x0 - cx : cx > x0 + g.cellX ? cx - (x0 + g.cellX) : 0;
+      const d2 = dx0 * dx0 + dy0 * dy0 + dz0 * dz0;
+      budget--;
+      sweepDone++;
+      if (d2 <= r2) {
+        const k = (sweepZ * g.side + sweepY) * g.side + sweepX;
+        // the admission floor: the px gate, raised to the selection's own minimum once full
+        const floor = heapK >= heapLimit && heapPx[0]! > namedPx ? heapPx[0]! : namedPx;
+        const depthMin =
+          (m3 >= 0 ? m3 * x0 : m3 * (x0 + g.cellX)) +
+          (m7 >= 0 ? m7 * y0 : m7 * (y0 + g.cellY)) +
+          (m11 >= 0 ? m11 * z0 : m11 * (z0 + g.cellZ)) +
+          m15;
+        const dMin = Math.max(depthMin - driftW, 1e-3);
+        if ((cm[k]! * pxNum) / dMin >= floor) {
+          const lo = g.start[k]!;
+          const hi = g.start[k + 1]!;
+          for (let q = lo; q < hi; q++) {
+            const i = g.order[q]!;
+            if (live) refreshViewOf(i);
+            const o = i * 3;
+            const wx = viewBuf[o]!;
+            const wy = viewBuf[o + 1]!;
+            const wz = viewBuf[o + 2]!;
+            const cw = m[3]! * wx + m[7]! * wy + m[11]! * wz + m[15]!;
+            if (cw <= 0) continue;
+            // RESTING size (boost excluded — see the recipe's refinement note)
+            const px = projectedPx(field.sizeOf(i) * NODE_SCALE, cw, fovPx);
+            if (px < namedPx || (heapK >= heapLimit && px <= heapPx[0]!)) continue;
+            const ndx = (m[0]! * wx + m[4]! * wy + m[8]! * wz + m[12]!) / cw;
+            const ndy = (m[1]! * wx + m[5]! * wy + m[9]! * wz + m[13]!) / cw;
+            if (ndx < -NDC_MARGIN_X || ndx > NDC_MARGIN_X || ndy < -NDC_MARGIN_Y || ndy > NDC_MARGIN_Y) {
+              continue;
+            }
+            heapPush(i, px);
+          }
+        }
+      }
+      // advance the cursor; past the box end the generation lands
+      if (++sweepX > sweepHiX) {
+        sweepX = sweepLoX;
+        if (++sweepY > sweepHiY) {
+          sweepY = sweepLoY;
+          if (++sweepZ > sweepHiZ) {
+            farNode.set(heapNode.subarray(0, heapK));
+            farCount = heapK;
+            sweepActive = false;
+            sweepGen++;
+            return;
+          }
+        }
+      }
+    }
+  }
+
   function gatherCandidates(): number {
+    nearEpoch++;
     const fovPx = fovPxOf(H, liveFov);
     const live = !fieldSettledNow; // spins/spread in flight: re-transform every resident
     const tanHalf = Math.tan((liveFov * Math.PI) / 360);
     const tV = tanHalf * NDC_MARGIN_Y;
     const tH = tanHalf * (W / H) * NDC_MARGIN_X;
     const slack = Math.sqrt(1 + tV * tV + tH * tH); // Euclidean ≤ depth × slack inside the margin
-    const reach =
-      Math.max(
-        standoffOf(maxSizeWorld * NODE_SCALE * maxBoost, ladder.config.namedPx, fovPx),
-        ladder.config.cardSpacings * spacing * field.spread,
-      ) *
-        slack +
-      gridDrift;
+    const dCard = ladder.config.cardSpacings * spacing * field.spread;
+    // the NEAR pass reaches the card distance only — the far sweep owns the rest (the recipe)
+    const reach = dCard * slack + gridDrift;
     const r2 = reach * reach;
     const cx = camera.position.x;
     const cy = camera.position.y;
@@ -613,12 +910,50 @@ async function main(): Promise<void> {
             candPx[k] = ppx;
             candDist[k] = dist;
             candCur[k] = cur;
+            nearStamp[i] = nearEpoch; // the far merge below must not re-admit this node
             if (isPin) sawPinned = true;
             k++;
           }
         }
       }
     }
+
+    /* ---- the far sweep: advance one slice, then merge the published set. Membership is
+       ≤ a generation stale; EVERYTHING ELSE is fresh — each far node is re-projected here
+       every frame (≤ FAR_CAP of them), so rank, cursor pull and distance are live. */
+    farSlice(fovPx, slack, dCard);
+    for (let f = 0; f < farCount; f++) {
+      const i = farNode[f]!;
+      if (nearStamp[i] === nearEpoch || i === pinnedNode) continue; // pin appended below
+      if (live) refreshViewOf(i);
+      const o = i * 3;
+      const wx = viewBuf[o]!;
+      const wy = viewBuf[o + 1]!;
+      const wz = viewBuf[o + 2]!;
+      const cw = m[3]! * wx + m[7]! * wy + m[11]! * wz + m[15]!;
+      if (cw <= 0) continue; // drifted behind the nose since admission
+      const ppx = projectedPx(field.sizeOf(i) * NODE_SCALE * field.boostOf(i), cw, fovPx);
+      if (ppx < ladder.config.namedPx) continue; // fell under the gate — re-earns next sweep
+      const ndx = (m[0]! * wx + m[4]! * wy + m[8]! * wz + m[12]!) / cw;
+      const ndy = (m[1]! * wx + m[5]! * wy + m[9]! * wz + m[13]!) / cw;
+      if (ndx < -NDC_MARGIN_X || ndx > NDC_MARGIN_X || ndy < -NDC_MARGIN_Y || ndy > NDC_MARGIN_Y) {
+        continue;
+      }
+      let cur = Infinity;
+      if (pointerActive) {
+        const sx = (ndx * 0.5 + 0.5) * W - px;
+        const sy = (-ndy * 0.5 + 0.5) * H - py;
+        cur = Math.hypot(sx, sy);
+      }
+      if (k >= candCap) growCand(k + 1);
+      candNode[k] = i;
+      candPx[k] = ppx;
+      candDist[k] = cw;
+      candCur[k] = cur;
+      nearStamp[i] = nearEpoch;
+      k++;
+    }
+
     if (pinnedNode >= 0 && !sawPinned) {
       // a pin outranks the walk: report its true depth so its card tier is honest
       if (live) refreshViewOf(pinnedNode);
@@ -774,9 +1109,10 @@ async function main(): Promise<void> {
    *
    *   NONE (yet) — the schema ships the knob (§7) but this library version bakes the
    *     constant into the TSL material at build time (field/nodes.ts, links.ts): nodeMinPx,
-   *     nodeMaxPx, falloff, bodyR, haloPx, haloGain, coreHot, flatPx, lenSoft, lenFloor.
+   *     nodeMaxPx, falloff, bodyR, haloPx, haloGain, coreHot, lenSoft, lenFloor.
    *     The §5 shader-hook tier is the seam they will route through; listed so the gap is
-   *     explicit, not silent (§10.4's spirit).
+   *     explicit, not silent (§10.4's spirit). flatPx graduated to LIVE at stage 9
+   *     (field.setFlatPx — the boot quality notch's LOD lever).
    * ======================================================================================= */
 
   const linkTotal = field.stats().links.total;
@@ -813,6 +1149,13 @@ async function main(): Promise<void> {
       if (s > maxSizeWorld) maxSizeWorld = s;
     }
     sizeAttr.needsUpdate = true;
+    // the far sweep prunes cells by their size maximum — the bound follows the channel
+    // (an event, never per frame; same pinned-slab guard as rebuildGrid)
+    gridCellMax = cellMaxOf(
+      grid,
+      (i) => field.sizeOf(i),
+      gridCellMax === sweepCellMax ? undefined : gridCellMax,
+    );
   };
 
   /* -- links take their endpoints' colours (field.ts rule) — after a demo-side node repaint
@@ -922,6 +1265,9 @@ async function main(): Promise<void> {
     renderer.setPixelRatio(window.devicePixelRatio * num('renderScale'));
     renderer.setSize(W, H);
   };
+  const applyFlatPx = (): void => {
+    field.setFlatPx(num('flatPx'));
+  };
 
   /** key → route. One entry per LIVE key; the boot and none lists close the enumeration so
    *  every schema key is accounted for here, by name. */
@@ -967,10 +1313,13 @@ async function main(): Promise<void> {
     easeLin: applyFlight,
     // perf
     renderScale: applyRenderScale,
+    flatPx: applyFlatPx,
   };
   /** Read once at createField (focus state) — persisted, applied on the next reload. */
   const BOOT_KEYS = ['linkBase', 'linkFocus', 'linkHover', 'linkDim', 'dimOthers'] as const;
-  /** Baked into the TSL materials — no seam in this library version (see the header). */
+  /** Baked into the TSL materials — no seam in this library version (see the header).
+   *  flatPx left this list at stage 9: it is a live uniform now (field.setFlatPx), the boot
+   *  quality notch's LOD lever. */
   const UNROUTED_KEYS = [
     'nodeMinPx',
     'nodeMaxPx',
@@ -979,7 +1328,6 @@ async function main(): Promise<void> {
     'haloPx',
     'haloGain',
     'coreHot',
-    'flatPx',
     'lenSoft',
     'lenFloor',
   ] as const;
@@ -1028,6 +1376,7 @@ async function main(): Promise<void> {
   let jsCursor = 0;
   let prevT = -1;
   let frame = 0;
+  let bootMs = 0; // navigationStart → first rendered frame (§9 boot; marked in the loop)
   let drawCalls = 0;
   let room = Infinity;
   let speed = 0;
@@ -1039,6 +1388,25 @@ async function main(): Promise<void> {
     if (k === 0) return 0;
     const copy = Array.from(buf.subarray(0, k)).sort((a, b) => a - b);
     return copy[k >> 1]!;
+  };
+
+  /* jsFrameMs by SEGMENT (measurement rig, not shipped behaviour): rolling 90-frame
+   * medians per phase of the update window, so "what costs the frame" is read off the
+   * handle instead of guessed. Four extra performance.now() calls per frame — noise
+   * next to the 0.1 ms clock resolution they share with jsFrameMs itself. */
+  const SEGS = ['cam', 'field', 'grid', 'pick', 'ladder'] as const;
+  const segBuf = new Float64Array(SEGS.length * 90);
+  let segFilled = 0;
+  let segCursor = 0;
+  const segMark = new Float64Array(SEGS.length + 1);
+  const jsBreakdown = (): Record<string, number> => {
+    const out: Record<string, number> = {};
+    const scratch = new Float64Array(90);
+    for (let s = 0; s < SEGS.length; s++) {
+      for (let k = 0; k < segFilled; k++) scratch[k] = segBuf[k * SEGS.length + s]!;
+      out[SEGS[s]!] = medianOf(scratch, segFilled);
+    }
+    return out;
   };
   const fpsMedian = (): number => {
     const ms = medianOf(intervals, filled);
@@ -1073,13 +1441,22 @@ async function main(): Promise<void> {
       `jsFrameMs ${jsFrameMs().toFixed(2)} · graph ${(tGraph - t0).toFixed(0)} ms · ` +
       `${backendName}/${pullMode} · cam ${camMode}\n` +
       `inside:${insideFrame()} · morph t ${s.morph.t.toFixed(2)} · spread ${s.spread.toFixed(2)} · ` +
-      `${s.projection} · pivots ${fmt(s.pivots)}${settledNow ? '' : ' · animating'}\n` +
+      `${s.projection} · pivots ${fmt(s.pivots)}` +
+      // The two boot-notch levers that drop RESOLUTION/DETAIL rather than content. §10.4's
+      // letter doesn't require a stats row (nothing is culled), but §10.7 does require the
+      // telemetry to show hidden states — a reader must be able to tell the field is
+      // rendering at half resolution without digging for __starscape.quality.
+      ` · render dpr ${renderer.getPixelRatio()} (scale ${num('renderScale')}) · ` +
+      `flat < ${num('flatPx')} px${settledNow ? '' : ' · animating'}\n` +
       `room ${Number.isFinite(room) ? room.toFixed(0) : '∞'} · speed ${speed.toFixed(0)}` +
       `${blocked ? ' (damped)' : ''} · ` +
       `hover: ${hov >= 0 ? graph.labelOf(hov) : '—'} · ` +
       `selected: ${sel >= 0 ? graph.labelOf(sel) : '—'}\n` +
-      // the ladder's budgets, reported not implied (§10.4) — named/cards/open counts
-      `ladder: cand ${lastCand} · named ${ladder.state.namedCount}/${ladder.config.namedCap} · ` +
+      // the ladder's budgets, reported not implied (§10.4) — named/cards/open counts, and
+      // the far sweep's generation state (a budget that lags content must say so too)
+      `ladder: cand ${lastCand} · far ${farCount}/${heapLimit}` +
+      `${sweepActive ? ` (sweep ${Math.round((100 * sweepDone) / Math.max(sweepCells, 1))}%)` : ''} · ` +
+      `named ${ladder.state.namedCount}/${ladder.config.namedCap} · ` +
       `cards ${ladder.state.cards.length}/${ladder.config.cards} · ` +
       `open ${ladder.state.open >= 0 ? graph.labelOf(ladder.state.open) : '—'}` +
       `${ladder.state.suspended ? ' · suspended' : ''}` +
@@ -1102,13 +1479,16 @@ async function main(): Promise<void> {
     prevT = t;
 
     const c0 = performance.now(); // jsFrameMs window opens: every per-frame CPU update
+    segMark[0] = c0;
     const telem = cam.update(dt);
     room = telem.room;
     speed = telem.speed;
     blocked = telem.blocked;
+    segMark[1] = performance.now();
 
     demoTweens.update(dt);
     field.update(dt); // tweens + frames: O(pivots), zero when idle (§4)
+    segMark[2] = performance.now();
 
     fieldSettledNow = field.settled();
     settledNow = fieldSettledNow && !demoTweens.active() && !(fly?.tweening ?? false);
@@ -1122,6 +1502,7 @@ async function main(): Promise<void> {
       // rebuild the index NOW if live spins will keep the settle edge from ever firing
       morphing = false;
       field.basePositions(baseBuf);
+      resetSweep(); // every position moved — a stale far set would name the wrong places
       if (!fieldSettledNow) {
         rebuildGrid();
         gridCooldown = 0.25;
@@ -1130,15 +1511,20 @@ async function main(): Promise<void> {
     /* Grid upkeep under spin (the port's ensureGrid, moved on-loop): rotation walks the
        drawn positions away from the snapshot the grid indexes, so the error is TRACKED —
        candidate reach and pickRay widen by gridDrift — and the index rebuilt lazily once
-       the drift passes a third of a cell, rate-limited so the O(n) pass stays off the
-       steady frame clock. */
+       the drift passes a full cell, rate-limited to once a second so the O(n) pass stays
+       off the steady frame clock. Stage 9 widened both (from cell/3 every 250 ms): the
+       rebuild measures ~68 ms at 10⁶, and at 4 Hz that was a visible hitch train — the
+       walks' drift-widening keeps every consumer CORRECT at any staleness, so the only
+       price of the longer leash is a few hundred extra near-cells visited per frame. */
     if (!morphing && (field.frames?.activeThisTick() ?? false)) {
-      gridDrift += spinRateSum * dt * diagonal * 0.5 * field.spread;
+      const dd = spinDriftRate * dt * field.spread;
+      driftTotal += dd;
+      gridDrift += dd;
     }
     gridCooldown = Math.max(0, gridCooldown - dt);
-    if (!morphing && gridCooldown === 0 && gridDrift > grid.cellMax * 0.34) {
+    if (!morphing && gridCooldown === 0 && gridDrift > grid.cellMax) {
       rebuildGrid();
-      gridCooldown = 0.25;
+      gridCooldown = 1.0;
     }
     if (!fieldSettledNow && !morphing) {
       // sync the spread mirror refreshViewOf composes with (one read per frame, not per node)
@@ -1148,6 +1534,7 @@ async function main(): Promise<void> {
       spreadC[2] = c[2];
       spreadK = field.spread;
     }
+    segMark[3] = performance.now();
 
     // Hover resolves against the latest cursor position, once per frame at most. A morph
     // suppresses it (positions and index genuinely disagree), and so does a camera tween
@@ -1157,6 +1544,7 @@ async function main(): Promise<void> {
       pickDue = false;
       hover(castAt(px, py));
     }
+    segMark[4] = performance.now();
 
     /* ---- the ladder tick (stage 7). Candidates are gathered every frame the BASE is
        parked — including during spins and spread tweens, where gatherCandidates re-forms
@@ -1192,9 +1580,24 @@ async function main(): Promise<void> {
     jsMs[jsCursor] = c1 - c0;
     jsCursor = (jsCursor + 1) % jsMs.length;
     if (jsFilled < jsMs.length) jsFilled++;
+    segMark[5] = c1;
+    for (let s = 0; s < SEGS.length; s++) {
+      segBuf[segCursor * SEGS.length + s] = segMark[s + 1]! - segMark[s]!;
+    }
+    segCursor = (segCursor + 1) % 90;
+    if (segFilled < 90) segFilled++;
 
     renderer.render(scene, camera);
     drawCalls = renderer.info.render.drawCalls;
+    if (frame === 0) {
+      /* §9 boot = navigationStart → first frame. performance.now() is relative to
+       * timeOrigin (navigationStart), so this one read IS the boot time; the mark makes
+       * it visible in the Performance panel too. First render submitted = first frame
+       * (SCALE.md methodology: never time renderer.render itself — this is a timestamp,
+       * not a duration around the call). */
+      bootMs = performance.now();
+      performance.mark('starscape:first-frame');
+    }
     if (frame % 30 === 0) updateOverlay();
     frame++;
     requestAnimationFrame(loop);
@@ -1217,6 +1620,90 @@ async function main(): Promise<void> {
     settled: (): boolean => settledNow,
     fpsMedian,
     jsFrameMs,
+    /* ---- the SCALE.md measurement rig (§9: assert the viewpoint, median of 90 rAF
+       intervals, never renderer.render). All three are demo-side instrumentation, not
+       library API. */
+    bootMs: (): number => bootMs,
+    jsBreakdown,
+    /** Far-sweep + grid-upkeep telemetry (§10.7: hidden costs shown, not implied). */
+    sweep: (): Record<string, number | boolean> => ({
+      gen: sweepGen,
+      active: sweepActive,
+      done: sweepDone,
+      cells: sweepCells,
+      far: farCount,
+      lastRebuildMs,
+      gridDrift,
+    }),
+    quality,
+    /** Camera distance to the live TARGET extent centre over the home-framing distance
+     *  (flyHome's own formula) — must read ~1.0 before any §9 number is recorded
+     *  (SCALE.md: every wrong number was a moved viewpoint). */
+    homeRatio: (): number => {
+      const e = field.targetExtent();
+      const d = Math.hypot(
+        camera.position.x - e.centre[0],
+        camera.position.y - e.centre[1],
+        camera.position.z - e.centre[2],
+      );
+      const home =
+        (Math.max(e.radius, radius * 0.05) / Math.tan((liveFov * Math.PI) / 360)) * HOME_MARGIN;
+      return d / home;
+    },
+    /** A FRESH median-of-`frames` rAF-interval window (the rolling overlay buffer keeps
+     *  old state; a measurement wants only the state being measured). Resolves with the
+     *  medians plus the context that makes the number honest: spins, dpr, budgets. */
+    measure: (
+      frames = 90,
+    ): Promise<{
+      msMedian: number;
+      msP90: number;
+      msWorst: number;
+      fps: number;
+      jsMedian: number;
+      drawCalls: number;
+      dpr: number;
+      homeRatio: number;
+      spinning: boolean;
+      linksDrawn: number;
+      linksTotal: number;
+    }> =>
+      new Promise((resolve) => {
+        const buf = new Float64Array(frames);
+        let k = -1; // first callback only primes prev
+        let prev = 0;
+        const tick = (t: number): void => {
+          if (k >= 0) buf[k] = t - prev;
+          prev = t;
+          k++;
+          if (k < frames) {
+            requestAnimationFrame(tick);
+            return;
+          }
+          const sorted = Array.from(buf).sort((a, b) => a - b);
+          const ms = sorted[frames >> 1]!;
+          const p90 = sorted[Math.min(frames - 1, Math.floor(frames * 0.9))]!;
+          const worst = sorted[frames - 1]!;
+          const s = field.stats();
+          const handle = (window as unknown as Record<string, Record<string, () => number>>)[
+            '__starscape'
+          ]!;
+          resolve({
+            msMedian: ms,
+            msP90: p90, // stalls (grid rebuilds under spin) live here, not in the median
+            msWorst: worst,
+            fps: ms > 0 ? 1000 / ms : 0,
+            jsMedian: jsFrameMs(), // the rolling buffer — full of steady state by now
+            drawCalls,
+            dpr: renderer.getPixelRatio(),
+            homeRatio: handle['homeRatio']!(),
+            spinning: field.frames?.activeThisTick() ?? false,
+            linksDrawn: s.links.drawn,
+            linksTotal: s.links.total,
+          });
+        };
+        requestAnimationFrame(tick);
+      }),
     setArrangement: (name: string): void => {
       ui.arrangement.value = name;
       applyArrangement();

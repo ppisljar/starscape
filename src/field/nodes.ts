@@ -88,6 +88,11 @@ export interface NodeLayer {
     dRef: { value: number };
     fogNear: { value: number };
     fogFar: { value: number };
+    /** Flat-glyph threshold, CSS px: under this projected radius the fragment takes the
+     *  cheap no-halo branch. Live (stage 9): the boot quality notch raises it with corpus
+     *  size — the px clamp pins a distant field at NODE_MIN_PX (2.2), ABOVE the shipped
+     *  FLAT_PX of 2, so without the lift the LOD branch never fires at all. */
+    flatPx: { value: number };
   };
   dispose(): void;
 }
@@ -143,6 +148,7 @@ export function buildNodeLayer(
   const uDRef = uniform(opts.dRef);
   const uFogNear = uniform(opts.fogNear);
   const uFogFar = uniform(opts.fogFar);
+  const uFlatPx = uniform(FLAT_PX);
 
   /* ---- vertex stage: world radius → projected px → clamp → world radius at this depth.
      The clamp is done from the REAL projection, so it is exact rather than an approximation
@@ -195,7 +201,7 @@ export function buildNodeLayer(
 
     const out = vec4(0.0).toVar();
 
-    If(vPx.lessThan(FLAT_PX), () => {
+    If(vPx.lessThan(uFlatPx), () => {
       /* LOD, the cheapest available: under a couple of px every glyph is the same blob and
          the halo is the expensive half of it. One flat colour, no smoothsteps, no form test. */
       const rr = length(p).mul(2.0);
@@ -274,7 +280,14 @@ export function buildNodeLayer(
     shapeAttr,
     alphaAttr,
     boostAttr,
-    uniforms: { halfH: uHalfH, tanHalf: uTanHalf, dRef: uDRef, fogNear: uFogNear, fogFar: uFogFar },
+    uniforms: {
+      halfH: uHalfH,
+      tanHalf: uTanHalf,
+      dRef: uDRef,
+      fogNear: uFogNear,
+      fogFar: uFogFar,
+      flatPx: uFlatPx,
+    },
     dispose() {
       geo.dispose();
       material.dispose();

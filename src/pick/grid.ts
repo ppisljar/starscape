@@ -176,6 +176,31 @@ export function pxToWorld(px: number, t: number, tanHalf: number, halfH: number)
   return (px * tanHalf * t) / halfH;
 }
 
+/** Per-cell maximum of a per-node channel (stage 9): one float per cell, from one O(n) pass
+ *  over the CSR cells. The ladder's candidate sweep prunes whole cells with it — a cell whose
+ *  LARGEST node cannot project over the admission floor at the cell's nearest possible depth
+ *  holds no candidate at all, so its members are never touched. Rebuild it whenever the grid
+ *  is rebuilt or the channel is rewritten (both events, never per frame). Reuses `out` when
+ *  it is at least nCells long (rebuilds under spin must not allocate a fresh megabyte each
+ *  time); empty cells read 0. */
+export function cellMaxOf(
+  grid: Grid,
+  valueOf: (i: number) => number,
+  out?: Float32Array,
+): Float32Array {
+  const res = out !== undefined && out.length >= grid.nCells ? out : new Float32Array(grid.nCells);
+  for (let k = 0; k < grid.nCells; k++) {
+    let mx = 0;
+    const hi = grid.start[k + 1]!;
+    for (let q = grid.start[k]!; q < hi; q++) {
+      const v = valueOf(grid.order[q]!);
+      if (v > mx) mx = v;
+    }
+    res[k] = mx;
+  }
+  return res;
+}
+
 export interface PickOptions {
   /** tan(fovY / 2) of the active camera — same projection the vertex shader uses. */
   tanHalf: number;

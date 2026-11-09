@@ -145,6 +145,11 @@ export interface Field {
   resize(heightCss: number): void;
   /** Report a camera fov change (degrees). */
   setFov(fov: number): void;
+  /** Flat-glyph threshold, CSS px (stage 9 LOD): glyphs projected under this draw the cheap
+   *  no-halo branch. The px clamp pins a distant field at NODE_MIN_PX, so the boot quality
+   *  notch (quality.ts) must lift this OVER the clamp floor before the branch fires at all.
+   *  A simplification, not a cull — nothing is dropped, so no stats row (§10.4). */
+  setFlatPx(px: number): void;
   /** Hover node i (-1 clears): lights it, its CSR neighbourhood and its incident links.
    *  Repaints only the hovered degree — never the whole colour buffer (DESIGN.md §6).
    *  Returns true when the state actually changed. */
@@ -657,6 +662,13 @@ export function createField(graph: Graph, opts: FieldOpts = {}): Field {
 
     setFov(f: number): void {
       node.uniforms.tanHalf.value = Math.tan((f * Math.PI) / 360);
+    },
+
+    setFlatPx(px: number): void {
+      if (!Number.isFinite(px) || px < 0) {
+        throw new Error(`setFlatPx: threshold must be finite and >= 0, got ${px}`);
+      }
+      node.uniforms.flatPx.value = px;
     },
 
     stats(): FieldStats {

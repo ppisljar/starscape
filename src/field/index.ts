@@ -29,6 +29,8 @@ export {
   sizesFromColumn,
   uniformSizes,
 } from './channels';
+export { bootQuality, RENDER_SCALE_FLOOR } from './quality';
+export type { BootQuality } from './quality';
 export { facetPalette, hslToRgb, paintFacetColors, GOLDEN } from './palette';
 export {
   createFocus,

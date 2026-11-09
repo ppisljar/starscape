@@ -48,6 +48,8 @@ export {
   sizesFromColumn,
   uniformSizes,
 } from './field/channels';
+export { bootQuality, RENDER_SCALE_FLOOR } from './field/quality';
+export type { BootQuality } from './field/quality';
 export { facetPalette, hslToRgb, paintFacetColors, GOLDEN } from './field/palette';
 export {
   createFocus,
@@ -81,6 +83,7 @@ export type {
 
 export {
   buildGrid,
+  cellMaxOf,
   nearestDistance,
   pickRay,
   pxToWorld,

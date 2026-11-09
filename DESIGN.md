@@ -257,7 +257,10 @@ time `renderer.render()` directly; `gl.finish()` does not block in Chrome.
 
 The 10⁶ row is the one the predecessor fails today (fill-bound at ~20 fps, and CPU-bound the
 moment anything rotates); §5's GPU-side transform chain and the link/node budgets are the
-design response, and this table is how we know they worked.
+design response, and this table is how we know they worked. *(Stage 9, 2026-11-09: measured
+green on all three rows — 10⁶ at 31–39 fps / ≤ 0.3 ms frame CPU with all spins on and the
+boot budgets engaged. The numbers, the levers and the methodology warnings live in
+`SCALE.md`.)*
 
 ## 10. House rules (inherited, non-negotiable)
 
