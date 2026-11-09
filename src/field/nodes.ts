@@ -52,6 +52,7 @@ import {
   Discard,
 } from 'three/tsl';
 import type { GpuTransform } from './stores';
+import type { TonemapRig } from './tonemap';
 import {
   BODY_R,
   CORE_HOT,
@@ -103,7 +104,16 @@ export function buildNodeLayer(
   shapes: Float32Array,
   alphas: Float32Array,
   boosts: Float32Array,
-  opts: { fov: number; heightCss: number; dRef: number; fogNear: number; fogFar: number },
+  opts: {
+    fov: number;
+    heightCss: number;
+    dRef: number;
+    fogNear: number;
+    fogFar: number;
+    /** The shared highlight roll-off rig (stage 8, ./tonemap) — same instance as the links,
+     *  so the two draw calls can never roll off differently. */
+    tonemap: TonemapRig;
+  },
 ): NodeLayer {
   /* ---- geometry: one unit quad, instanced n times. Per-instance data lives in instanced
      attributes on the geometry — the step mode both backends read off the attribute class. */
@@ -245,7 +255,9 @@ export function buildNodeLayer(
       out.assign(vec4(c, a));
     });
 
-    return out;
+    /* Stage 8 (§7): the highlight roll-off, in-fragment behind one selectable uniform —
+       identity when the op uniform is 0, so 'none' is the stage-6 pipeline untouched. */
+    return vec4(opts.tonemap.apply(out.xyz as unknown as Node<'vec3'>), out.w);
   })();
 
   const mesh = new Mesh(geo, material);

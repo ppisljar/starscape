@@ -30,7 +30,7 @@
 
 import { MathUtils, Matrix4, Quaternion, Vector3 } from 'three';
 import { DEFAULT_FOV } from '../field/constants';
-import { DRAG_SLOP } from './types';
+import { DRAG_SLOP, HOME_MARGIN } from './types';
 import type {
   CameraController, CameraTelemetry, ControlSurface, Extent,
   KeyEventLike, PointerEventLike, RigCamera, WheelEventLike,
@@ -345,7 +345,7 @@ export function createFlycam(camera: RigCamera, cfg: FlycamConfig, opts: FlycamO
     const [lo, hi] = zoomRange();
     // Frame the bounding sphere vertically, with a small margin so the rim is not on the edge.
     const dist = MathUtils.clamp(
-      (extent.radius / Math.tan((fov * Math.PI) / 360)) * 1.1, lo, hi);
+      (extent.radius / Math.tan((fov * Math.PI) / 360)) * HOME_MARGIN, lo, hi);
     target.copy(c);
     OFF.subVectors(camera.position, c);
     if (OFF.lengthSq() < 1e-10) OFF.set(0, 0, 1); else OFF.normalize();

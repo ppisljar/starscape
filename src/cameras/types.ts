@@ -84,6 +84,13 @@ export interface WheelEventLike {
  *  once. */
 export const DRAG_SLOP = 5;
 
+/** home()'s framing margin: the camera stands off radius / tan(fov/2) × this, so the
+ *  extent's rim is not on the viewport edge. Exported once (§10) and shared by the flycam,
+ *  the orbit cam and any host flight that frames an extent the way home() does (the demo's
+ *  flyHome) — three literal copies of 1.1 was three chances for "frame the field" to mean
+ *  three different framings. */
+export const HOME_MARGIN = 1.1;
+
 /** What every camera controller provides. Concrete controllers extend this with their own
  *  verbs (the flycam's goTo/level/rescale, …); consumers that only need "a camera" code
  *  against this. */

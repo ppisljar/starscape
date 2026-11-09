@@ -76,6 +76,11 @@ export const LINK_LEN_FLOOR = 0.1;
 /** The dark ground the default theme assumes (one of DESIGN.md §5's theme basics). */
 export const BG_DARK = 0x05070d;
 
+/** The light ground (the config schema's `background: 'light'`; paper's "ink on paper").
+ *  Shipped beside BG_DARK so the named light-ground looks mean the same paper in every
+ *  host (§7) — a host-invented ground made the same preset render differently per app. */
+export const BG_LIGHT = 0xf2efe7;
+
 /** Default vertical field of view, degrees. */
 export const DEFAULT_FOV = 55;
 

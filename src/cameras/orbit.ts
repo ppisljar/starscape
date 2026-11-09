@@ -12,7 +12,7 @@
 
 import { MathUtils, Matrix4, Quaternion, Vector3 } from 'three';
 import { DEFAULT_FOV } from '../field/constants';
-import { DRAG_SLOP } from './types';
+import { DRAG_SLOP, HOME_MARGIN } from './types';
 import type {
   CameraController, CameraTelemetry, ControlSurface, Extent,
   PointerEventLike, RigCamera, WheelEventLike,
@@ -88,7 +88,7 @@ export function createOrbitCam(
     const fov = typeof camera.fov === 'number' ? camera.fov : DEFAULT_FOV;
     const [lo, hi] = zoomRange();
     const dist = MathUtils.clamp(
-      (extent.radius / Math.tan((fov * Math.PI) / 360)) * 1.1, lo, hi);
+      (extent.radius / Math.tan((fov * Math.PI) / 360)) * HOME_MARGIN, lo, hi);
     target.copy(C);
     OFF.subVectors(camera.position, C);
     if (OFF.lengthSq() < 1e-10) OFF.set(0, 0, 1); else OFF.normalize();

@@ -44,6 +44,10 @@ import {
   uniformSizes,
 } from './channels';
 import { facetPalette, paintFacetColors } from './palette';
+import { createTonemap, OP_INDEX } from './tonemap';
+import type { TonemapOp } from './tonemap';
+import { DEFAULT_RAMP, rampColors } from '../theme/palettes';
+import type { RampLike } from '../theme/palettes';
 import {
   BG_DARK,
   DEFAULT_FOV,
@@ -103,6 +107,11 @@ export interface FieldStats {
   links: { drawn: number; total: number };
   sizeColumn: string;
   colorFacet: string | null;
+  /** The numeric column colour is bound to (setColorColumn), or null when a facet drives it —
+   *  exactly one of colorFacet / colorColumn is non-null. */
+  colorColumn: string | null;
+  /** The live highlight roll-off: operator name + pre-curve exposure (stage 8, ./tonemap). */
+  tonemap: { op: TonemapOp; exposure: number };
   /** Morph progress (§4): t and whether any tween (morph or spread) is still running. */
   morph: { t: number; active: boolean };
   projection: '2d' | '3d';
@@ -120,6 +129,14 @@ export interface Field {
   setLinkBudget(k: number): number;
   /** Re-bind node colour to a facet; links take their endpoints' colours with it. */
   setColorFacet(key: string): void;
+  /** Re-bind node colour to a numeric column through a ramp (stage 8, §7): rank-normalised
+   *  percentile → ramp colour — the same rank machinery the size channel uses, for the same
+   *  reason (a linear map leaves a heavy-tailed column on the ramp's floor). Links take
+   *  their endpoints' colours with it. Default ramp DEFAULT_RAMP (theme/palettes). */
+  setColorColumn(key: string, ramp?: RampLike): void;
+  /** Select the highlight roll-off operator for BOTH layers ('none' bypasses — the raw
+   *  pipeline, exposure included) and optionally the pre-curve exposure (stage 8, §7). */
+  setTonemap(op: TonemapOp, exposure?: number): void;
   /** Re-bind node size to a numeric column ('uniform' for equal dots). */
   setSizeColumn(key: string): void;
   /** One blending setting for both layers (see FieldOpts.blend). */
@@ -240,10 +257,17 @@ export function createField(graph: Graph, opts: FieldOpts = {}): Field {
     throw new Error(`createField: colorFacet "${colorFacet}" names no facet`);
   }
 
+  let colorColumn: string | null = null; // set by setColorColumn; exclusive with colorFacet
   const colors = new Float32Array(n * 3);
   const shapes = new Float32Array(n); // all discs at stage 3; shapeBy binding arrives later
   const sizes = computeSizes(graph, sizeColumn, n);
   paintColors(graph, colorFacet, n, colors);
+
+  /* Stage 8: the shared highlight roll-off rig — ONE op/exposure uniform pair spliced into
+     both layers' fragment stages (./tonemap). Off (op 0) by default: the bypass is the
+     stage-6 pipeline untouched. */
+  const tonemap = createTonemap();
+  let tonemapOp: TonemapOp = 'none';
 
   /* ---- stage 6 state: the §4 pipeline's CPU mirrors ----------------------------------- *
    * baseA/baseB are the endpoint sets A and B; target3d is the PRISTINE 3D target the '2d'
@@ -350,6 +374,7 @@ export function createField(graph: Graph, opts: FieldOpts = {}): Field {
     fogNear: diagonal * FOG_NEAR * 0.8,
     fogFar: diagonal * FOG_FAR * 0.9,
     lenSoft: diagonal * LINK_LEN_SOFT,
+    tonemap,
   });
 
   /* The focus state (hover/select — focus.ts). It owns the iAlpha/iBoost node channels and
@@ -453,6 +478,7 @@ export function createField(graph: Graph, opts: FieldOpts = {}): Field {
     dRef: diagonal * D_REF_FRACTION,
     fogNear: diagonal * FOG_NEAR,
     fogFar: diagonal * FOG_FAR,
+    tonemap,
   });
 
   const totalLinks = graph.links.length >> 1;
@@ -518,9 +544,32 @@ export function createField(graph: Graph, opts: FieldOpts = {}): Field {
     setColorFacet(key: string): void {
       if (!graph.facets[key]) throw new Error(`setColorFacet: "${key}" names no facet`);
       colorFacet = key;
+      colorColumn = null;
       paintColors(graph, colorFacet, n, colors);
       node.colorAttr.needsUpdate = true;
       writeLinkColors();
+    },
+
+    setColorColumn(key: string, ramp: RampLike = DEFAULT_RAMP): void {
+      const col = graph.columns[key];
+      if (!col) throw new Error(`setColorColumn: "${key}" names no numeric column`);
+      colorColumn = key;
+      colorFacet = null;
+      rampColors(col.data, n, ramp, colors); // rank-normalised — the sizeOf rank machinery
+      node.colorAttr.needsUpdate = true;
+      writeLinkColors();
+    },
+
+    setTonemap(op: TonemapOp, exposure?: number): void {
+      if (!(op in OP_INDEX)) throw new Error(`setTonemap: "${op}" names no operator`);
+      tonemapOp = op;
+      tonemap.uniforms.op.value = OP_INDEX[op];
+      if (exposure !== undefined) {
+        if (!Number.isFinite(exposure) || exposure <= 0) {
+          throw new Error(`setTonemap: exposure must be finite and > 0, got ${exposure}`);
+        }
+        tonemap.uniforms.exposure.value = exposure;
+      }
     },
 
     setSizeColumn(key: string): void {
@@ -616,6 +665,8 @@ export function createField(graph: Graph, opts: FieldOpts = {}): Field {
         links: { drawn, total: totalLinks },
         sizeColumn,
         colorFacet,
+        colorColumn,
+        tonemap: { op: tonemapOp, exposure: tonemap.uniforms.exposure.value },
         morph: { t: tweens.get('morph'), active: tweens.active() },
         projection,
         spread: tweens.get('spread'),

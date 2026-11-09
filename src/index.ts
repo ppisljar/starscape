@@ -67,7 +67,7 @@ export { createFlycam, FLYCAM_DEFAULTS } from './cameras/flycam';
 export type { Flycam, FlycamConfig, FlycamOptions } from './cameras/flycam';
 export { createOrbitCam, ORBIT_DEFAULTS } from './cameras/orbit';
 export type { OrbitCam, OrbitConfig, OrbitOptions } from './cameras/orbit';
-export { DRAG_SLOP } from './cameras/types';
+export { DRAG_SLOP, HOME_MARGIN } from './cameras/types';
 export type {
   CameraController,
   CameraTelemetry,
@@ -144,3 +144,30 @@ export type { AnchorAttachment } from './place/pull';
  * namespaced by convention (NAMED_*, CARD_*, LOCK_*, OVERLAY_*, ss-* classes) and collide
  * with nothing above. */
 export * from './ladder/index';
+
+/* ---- stage 8: config schema + panel + palettes + presets/looks (§7) ----------------------
+ * The panel barrel (src/panel/index.ts, the §8 `/panel` subpath) carries the panel AND the
+ * config engine it renders (schema rows, DEFAULTS, the persisting store) — re-exported whole.
+ * One renaming happens there: the schema's palette OPTION LIST ships as PALETTE_OPTIONS, so
+ * the theme module's PALETTES (the categorical colour DATA) keeps the canonical name below. */
+export * from './panel/index';
+
+export {
+  DEFAULT_RAMP,
+  PALETTES,
+  PALETTE_NAMES,
+  RAMPS,
+  RAMP_NAMES,
+  UNIFORM_RGB,
+  VAULT_LAYER_NAMES,
+  facetColors,
+  namedPaletteBuffer,
+  paletteBuffer,
+  rampAt,
+  rampColors,
+} from './theme/palettes';
+export type { Palette, PaletteName, RGB, RampLike, RampName, RampStops } from './theme/palettes';
+export { VISUAL_PRESETS, VISUAL_PRESET_NAMES } from './theme/presets';
+export type { VisualPreset, VisualPresetName } from './theme/presets';
+export { createTonemap, tonemapRGB, EXPOSURE_DEFAULT, OP_INDEX, TONEMAP_OPS } from './field/tonemap';
+export type { TonemapOp, TonemapRig } from './field/tonemap';

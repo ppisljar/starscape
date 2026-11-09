@@ -47,6 +47,7 @@ import {
 } from 'three/tsl';
 import { LINK_LEN_FLOOR } from './constants';
 import type { GpuTransform } from './stores';
+import type { TonemapRig } from './tonemap';
 
 export interface LinkLayer {
   lines: LineSegments;
@@ -72,7 +73,14 @@ export interface LinkLayer {
 export function buildLinkLayer(
   links: Uint32Array,
   transform: GpuTransform,
-  opts: { fogNear: number; fogFar: number; lenSoft: number },
+  opts: {
+    fogNear: number;
+    fogFar: number;
+    lenSoft: number;
+    /** The shared highlight roll-off rig (stage 8, ./tonemap) — same instance as the nodes,
+     *  so the two draw calls can never roll off differently. */
+    tonemap: TonemapRig;
+  },
 ): LinkLayer {
   const m = links.length >> 1;
 
@@ -130,7 +138,8 @@ export function buildLinkLayer(
   material.colorNode = Fn(() => {
     const a = lColor.w.mul(lenFade).mul(vFog);
     Discard(a.lessThan(0.003));
-    return vec4(lColor.xyz, a);
+    // Stage 8 (§7): the shared highlight roll-off — identity when the op uniform is 0.
+    return vec4(opts.tonemap.apply(lColor.xyz as unknown as Node<'vec3'>), a);
   })();
 
   const lines = new LineSegments(geo, material);

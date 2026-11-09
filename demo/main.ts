@@ -24,45 +24,63 @@
  */
 
 import { Color, Matrix4, PerspectiveCamera, Scene, Vector3, WebGPURenderer } from 'three/webgpu';
+import type { BufferAttribute, InstancedBufferAttribute, LineSegments, Mesh } from 'three/webgpu';
 import {
   attachToAnchors,
   buildGraph,
   buildGrid,
   compileHierarchy,
+  createConfigStore,
   createField,
   createFlycam,
   createLadder,
   createOrbitCam,
   createOverlay,
+  createPanel,
   createTweens,
+  facetPalette,
   fnv1a,
   fovPxOf,
+  injectPanelStyles,
   injectStyles,
+  localStorageAdapter,
   makeSynthProvider,
   nearestDistance,
+  paintFacetColors,
+  paletteBuffer,
   pickRay,
   projectedPx,
+  sizesFromColumn,
   standoffOf,
+  uniformSizes,
+  BG_LIGHT,
   BOOST_HOVER,
   BOOST_SELECT,
-  CARD_SPACINGS,
   DEFAULT_FOV,
   D_REF_FRACTION,
   FALLOFF,
   FLYCAM_DEFAULTS,
-  NAMED_PX,
+  HOME_MARGIN,
   NODE_MAX_PX,
   NODE_MIN_PX,
   NODE_SCALE,
   ORBIT_DEFAULTS,
+  PALETTES,
+  UNIFORM_RGB,
+  VISUAL_PRESETS,
 } from '../src/index';
 import type {
   CameraController,
   CompiledHierarchy,
+  ConfigValue,
   Flycam,
+  FlycamConfig,
   LadderCandidates,
   LadderView,
   LevelSpec,
+  PaletteName,
+  RampName,
+  TonemapOp,
 } from '../src/index';
 import { generateSynth } from '../src/synth/generate';
 
@@ -77,6 +95,13 @@ const LEAVES: Record<string, LevelSpec['place']> = {
   random: { shape: 'cloud' },
 };
 
+/** The candidate pass's frustum margins, in NDC (the predecessor's ±1.25 / ±1.3). ONE copy:
+ *  the reach slack in gatherCandidates is DERIVED from these, so widening the gate widens the
+ *  grid-walk sphere with it — two literal copies meant a gate change silently under-sized the
+ *  walk and labels popped in late at the frustum edge (§10: constants exported once). */
+const NDC_MARGIN_X = 1.25;
+const NDC_MARGIN_Y = 1.3;
+
 async function main(): Promise<void> {
   const params = new URLSearchParams(location.search);
   const n = Math.max(1, Number(params.get('n') ?? 10000) | 0);
@@ -88,6 +113,16 @@ async function main(): Promise<void> {
   const input = generateSynth({ n, seed });
   const graph = buildGraph(input, { orderByFacet: 'system' });
   const tGraph = performance.now();
+
+  /* ---- stage 8: the config store. Loaded BEFORE the field exists, because the boot-routed
+     keys (blend, size channel, the focus alphas) are read at createField(). Only touched keys
+     were persisted (store rules), the presets are the six theme looks, and the load warnings
+     are returned — surfaced on the debug handle, never console.warn'd by the library. */
+  const store = createConfigStore({ storage: localStorageAdapter(), presets: VISUAL_PRESETS });
+  const configWarnings = store.load();
+  const num = (k: string): number => store.get(k) as number;
+  const str = (k: string): string => store.get(k) as string;
+  const bool = (k: string): boolean => store.get(k) === true;
 
   /* ---- renderer. The ONE place devicePixelRatio is handled; everything the field reasons
      about stays in CSS px. WebGPURenderer falls back to WebGL2 automatically when WebGPU is
@@ -109,13 +144,33 @@ async function main(): Promise<void> {
   const field = createField(graph, {
     heightCss: window.innerHeight,
     fov: DEFAULT_FOV,
-    blend: params.get('blend') === 'additive' ? 'additive' : 'normal',
+    blend: str('blend') === 'additive' ? 'additive' : 'normal',
+    sizeColumn: str('sizeChannel') === 'uniform' ? 'uniform' : 'degree',
     pull: pullMode,
+    /* BOOT-routed keys (see the routing table below): the focus alphas are baked into the
+       focus state at creation — a live change persists and lands on the next reload. */
+    focus: {
+      linkBase: num('linkBase'),
+      dimOthers: num('dimOthers'),
+      linkHover: num('linkHover'),
+      linkFocus: num('linkFocus'),
+      linkDim: num('linkDim'),
+    },
   });
 
   const scene = new Scene();
   scene.background = new Color(field.background);
   for (const o of field.objects) scene.add(o);
+
+  /* The per-instance channel buffers, reached through the PUBLIC three.js objects
+     (field.objects is [links, nodes] — field.ts). The iSize/iColor arrays ARE the field's own
+     channel buffers (field.sizeOf reads the same Float32Array), so a demo rewrite keeps the
+     shader, the picker and the ladder agreeing about every node — the one-pixel-unit rule. */
+  const linkLines = field.objects[0] as LineSegments;
+  const nodeMesh = field.objects[1] as Mesh;
+  const sizeAttr = nodeMesh.geometry.getAttribute('iSize') as InstancedBufferAttribute;
+  const colorAttr = nodeMesh.geometry.getAttribute('iColor') as InstancedBufferAttribute;
+  const linkColorAttr = linkLines.geometry.getAttribute('lColor') as BufferAttribute;
 
   const positions = graph.positions!;
   const fnvFrozen = fnv1a(positions); // the §4 round-trip pin: basePositions must return here
@@ -185,11 +240,14 @@ async function main(): Promise<void> {
   const softStop = (): number => radius * 0.02;
   const zoomRange = (): readonly [number, number] => [radius * 0.01, diagonal * 4];
 
+  /* The flycam reads its config object LIVE every frame (flycam.ts: "so a panel can mutate
+     the object") — the flight group of the routing table writes into this one reference. */
+  const flyCfg: FlycamConfig = { ...FLYCAM_DEFAULTS };
   let fly: Flycam | null = null;
   let cam: CameraController;
   if (camMode === 'fly') {
-    fly = createFlycam(camera, { ...FLYCAM_DEFAULTS }, { roomAt, softStop, zoomRange });
-    fly.spin = true; // the idle turntable — ambience, suppressed while you fly or drag
+    fly = createFlycam(camera, flyCfg, { roomAt, softStop, zoomRange });
+    fly.spin = bool('cameraDrift'); // the idle turntable is a config knob now (motion group)
     cam = fly;
   } else {
     cam = createOrbitCam(camera, { ...ORBIT_DEFAULTS }, { zoomRange });
@@ -209,11 +267,13 @@ async function main(): Promise<void> {
   });
 
   /** Fly the camera to frame the current TARGET extent — the cameras-module home() framing
-   *  (radius / tan(fov/2) with the same 1.1 margin), tweened via goTo on the flycam. */
+   *  (radius / tan(fov/2) × HOME_MARGIN, the cameras' own exported constant), tweened via
+   *  goTo on the flycam. */
   const flyHome = (fovDeg: number): void => {
     const e = field.targetExtent();
     const c = new Vector3(e.centre[0], e.centre[1], e.centre[2]);
-    const dist = (Math.max(e.radius, radius * 0.05) / Math.tan((fovDeg * Math.PI) / 360)) * 1.1;
+    const dist =
+      (Math.max(e.radius, radius * 0.05) / Math.tan((fovDeg * Math.PI) / 360)) * HOME_MARGIN;
     if (fly) fly.goTo(c, dist, 900);
     else cam.home({ center: e.centre, radius: e.radius });
   };
@@ -225,8 +285,6 @@ async function main(): Promise<void> {
     rate0: document.getElementById('rate0') as HTMLInputElement,
     spin1: document.getElementById('spin1') as HTMLInputElement,
     rate1: document.getElementById('rate1') as HTMLInputElement,
-    spread: document.getElementById('spread') as HTMLInputElement,
-    spreadVal: document.getElementById('spreadVal') as HTMLSpanElement,
     proj: document.getElementById('proj') as HTMLSelectElement,
     pull: document.getElementById('pull') as HTMLInputElement,
   };
@@ -267,21 +325,29 @@ async function main(): Promise<void> {
   };
 
   /** Write the live spin toggles into the pivot table — the FrameSet reads `rate` fresh
-   *  every advance (frames.ts), so no recompile: a parked frame resumes from its angle. */
+   *  every advance (frames.ts), so no recompile: a parked frame resumes from its angle.
+   *  The config's `levelSpin` knob OVERRIDES when > 0: every pivot at every level turns at
+   *  that one rate (the schema ships one knob; per-level rates stay the ARRANGE panel's).
+   *  In the frozen layout no frames exist, so the knob idles — exactly the schema's note. */
   const applySpins = (): void => {
     if (!hierarchy) {
       spinRateSum = 0;
       return;
     }
+    const override = num('levelSpin');
     const pv = hierarchy.pivots;
     const on = [ui.spin0.checked, ui.spin1.checked];
     const rates = [Number(ui.rate0.value) || 0, Number(ui.rate1.value) || 0];
     for (let p = 0; p < pv.count; p++) {
       const lv = pv.level[p]!;
-      pv.rate[p] = lv <= 1 && on[lv] ? rates[lv]! : 0;
+      const base = lv <= 1 && on[lv] ? rates[lv]! : 0;
+      pv.rate[p] = override > 0 ? override : base;
     }
-    // the drift bound's rate: both levels added, because a node can ride both frames
-    spinRateSum = (on[0] ? Math.abs(rates[0]!) : 0) + (on[1] ? Math.abs(rates[1]!) : 0);
+    // the drift bound's rate: levels added, because a node can ride every frame in its chain
+    spinRateSum =
+      override > 0
+        ? override * hierarchy.chainDepth
+        : (on[0] ? Math.abs(rates[0]!) : 0) + (on[1] ? Math.abs(rates[1]!) : 0);
   };
 
   const applyArrangement = (): void => {
@@ -331,26 +397,55 @@ async function main(): Promise<void> {
   ui.rate0.addEventListener('change', applySpins);
   ui.rate1.addEventListener('change', applySpins);
   ui.proj.addEventListener('change', applyProjection);
-  ui.spread.addEventListener('input', () => {
-    const v = Number(ui.spread.value);
-    ui.spreadVal.textContent = v.toFixed(2);
-    field.setSpread(v, 0.15); // a short tween — lands EXACTLY on the slider value
-  });
+  // spread moved into the tuning panel's `motion` group (stage 8) — one knob, one owner
 
   /* ---- stage 7: the zoom ladder + DOM overlay (DESIGN §6) ----------------------------
      The machine is pure (src/ladder/ladder.ts) — the demo's job is the candidate pass, the
      cursor, the pin (= the existing select state) and the per-frame overlay call. */
   injectStyles();
   const provider = makeSynthProvider(graph);
-  const ladder = createLadder();
-  const ladderOverlay = createOverlay({
-    container: document.getElementById('ladder')!,
-    provider,
-    // the pin affordance reuses the existing select-clear, exactly like Escape below
-    onUnpin: (): void => {
-      if (field.setSelect(-1)) updateOverlay();
-    },
+  const ladderRoot = document.getElementById('ladder')!;
+  // the pin affordance reuses the existing select-clear, exactly like Escape below
+  const onUnpin = (): void => {
+    if (field.setSelect(-1)) updateOverlay();
+  };
+  /** Every ladder tunable, from the config (ladder group of the routing table). The threshold
+   *  and band keys are ALSO mutated live on ladder.config; this builder serves the rebuild
+   *  keys — namedCap/cards size fixed buffers and lockW/lockH freeze the overlay rect at
+   *  creation, so those four recreate the machine + overlay (an event, never per frame). */
+  const ladderOptsFromCfg = (): Parameters<typeof createLadder>[0] => ({
+    namedPx: num('namedPx'),
+    earn: num('labelEarn'),
+    keep: num('labelKeep'),
+    dwellMs: num('labelDwell'),
+    namedCap: num('labelCap'),
+    cardSpacings: num('tierCard'),
+    lockSpacings: num('tierLock'),
+    openSpacings: num('tierOpen'),
+    cards: num('maxCards'),
+    lockW: num('lockW'),
+    lockH: num('lockH'),
+    cardRadiusSpacings: num('cardRadius'),
   });
+  let ladder = createLadder(ladderOptsFromCfg());
+  let ladderOverlay = createOverlay({
+    container: ladderRoot,
+    provider,
+    lockW: num('lockW'),
+    lockH: num('lockH'),
+    onUnpin,
+  });
+  const rebuildLadder = (): void => {
+    ladderOverlay.dispose(); // unmounts every live label/card — the old rule's leftovers
+    ladder = createLadder(ladderOptsFromCfg());
+    ladderOverlay = createOverlay({
+      container: ladderRoot,
+      provider,
+      lockW: num('lockW'),
+      lockH: num('lockH'),
+      onUnpin,
+    });
+  };
 
   // pointer state the ladder consumes (written by the pointermove wiring below)
   let pointerActive = false;
@@ -360,8 +455,8 @@ async function main(): Promise<void> {
   const camInv = new Matrix4();
   const clipM = new Matrix4();
 
-  // the largest size-channel radius in the corpus — the candidate reach bound (static:
-  // this demo never rebinds the size column). A loop, never a spread (§10.3).
+  // the largest size-channel radius in the corpus — the candidate reach bound. Maintained by
+  // applySizes() (the nodes group rebinds the channel live). A loop, never a spread (§10.3).
   let maxSizeWorld = 0;
   for (let i = 0; i < n; i++) {
     const s = field.sizeOf(i);
@@ -433,13 +528,13 @@ async function main(): Promise<void> {
     const fovPx = fovPxOf(H, liveFov);
     const live = !fieldSettledNow; // spins/spread in flight: re-transform every resident
     const tanHalf = Math.tan((liveFov * Math.PI) / 360);
-    const tV = tanHalf * 1.3;
-    const tH = tanHalf * (W / H) * 1.25;
+    const tV = tanHalf * NDC_MARGIN_Y;
+    const tH = tanHalf * (W / H) * NDC_MARGIN_X;
     const slack = Math.sqrt(1 + tV * tV + tH * tH); // Euclidean ≤ depth × slack inside the margin
     const reach =
       Math.max(
-        standoffOf(maxSizeWorld * NODE_SCALE * maxBoost, NAMED_PX, fovPx),
-        CARD_SPACINGS * spacing * field.spread,
+        standoffOf(maxSizeWorld * NODE_SCALE * maxBoost, ladder.config.namedPx, fovPx),
+        ladder.config.cardSpacings * spacing * field.spread,
       ) *
         slack +
       gridDrift;
@@ -495,12 +590,18 @@ async function main(): Promise<void> {
               dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
             }
             const ppx = projectedPx(field.sizeOf(i) * NODE_SCALE * field.boostOf(i), dist, fovPx);
-            if (ppx < NAMED_PX && !isPin) continue; // a mote and nothing more
+            if (ppx < ladder.config.namedPx && !isPin) continue; // a mote and nothing more
             let cur = Infinity;
             if (cw > 0) {
               const ndx = (m[0]! * wx + m[4]! * wy + m[8]! * wz + m[12]!) / cw;
               const ndy = (m[1]! * wx + m[5]! * wy + m[9]! * wz + m[13]!) / cw;
-              if ((ndx < -1.25 || ndx > 1.25 || ndy < -1.3 || ndy > 1.3) && !isPin) continue;
+              if (
+                (ndx < -NDC_MARGIN_X || ndx > NDC_MARGIN_X ||
+                  ndy < -NDC_MARGIN_Y || ndy > NDC_MARGIN_Y) &&
+                !isPin
+              ) {
+                continue;
+              }
               if (pointerActive) {
                 const sx = (ndx * 0.5 + 0.5) * W - px;
                 const sy = (-ndy * 0.5 + 0.5) * H - py;
@@ -636,7 +737,7 @@ async function main(): Promise<void> {
         if (!fieldSettledNow && !morphing) refreshViewOf(was);
         const o = was * 3;
         const p = new Vector3(viewBuf[o]!, viewBuf[o + 1]!, viewBuf[o + 2]!);
-        const dCard = CARD_SPACINGS * spacing * field.spread;
+        const dCard = ladder.config.cardSpacings * spacing * field.spread;
         if (camera.position.distanceTo(p) < dCard * 1.05) fly.goTo(p, dCard * 1.7, 800);
       }
     }
@@ -650,6 +751,270 @@ async function main(): Promise<void> {
     camera.updateProjectionMatrix();
     field.resize(H); // CSS px — the shared pixel unit
   });
+
+  /* =========================================================================================
+   * THE ROUTING TABLE (stage 8) — the ONE place a config key meets its subsystem.
+   *
+   * The panel knows no key's meaning (it renders schema rows); the store knows no subsystem
+   * (it validates and persists); every key's effect is decided HERE, once. Three kinds:
+   *
+   *   LIVE — takes effect the tick you drag. Routes: a field setter (blend, tonemap,
+   *     exposure, link budget, colour column, spread), a channel-buffer rewrite through the
+   *     public objects (node sizes, facet/uniform colours — the iSize/iColor arrays are the
+   *     field's own buffers, so picker and ladder follow for free), a ladder.config write
+   *     (thresholds and the label band are read fresh every update), a ladder REBUILD for
+   *     the four keys that size fixed buffers or freeze the overlay rect (labelCap,
+   *     maxCards, lockW, lockH — an event, never per frame), a flycam-config write (read
+   *     live every frame by design), the pivot-table rate write (levelSpin), the scene
+   *     ground, or the renderer's pixel ratio (renderScale).
+   *
+   *   BOOT — read once at createField(): the five focus alphas (linkBase, linkFocus,
+   *     linkHover, linkDim, dimOthers) are baked into the focus state. The knob validates,
+   *     persists and exports like any other; a change lands on the next reload.
+   *
+   *   NONE (yet) — the schema ships the knob (§7) but this library version bakes the
+   *     constant into the TSL material at build time (field/nodes.ts, links.ts): nodeMinPx,
+   *     nodeMaxPx, falloff, bodyR, haloPx, haloGain, coreHot, flatPx, lenSoft, lenFloor.
+   *     The §5 shader-hook tier is the seam they will route through; listed so the gap is
+   *     explicit, not silent (§10.4's spirit).
+   * ======================================================================================= */
+
+  const linkTotal = field.stats().links.total;
+  const colorFacetKey = Object.keys(graph.facets)[0]!; // the field's own default facet
+  /* The uniform hue and the light ground are LIBRARY data now (theme/palettes UNIFORM_RGB,
+     field/constants BG_LIGHT): the shipped 'blueprint' and 'paper' presets lean on them, so
+     a host inventing its own values made the same named look render differently per app. */
+
+  /* -- nodes: size channel × contrast curve × scale, folded into the iSize buffer. The
+     shader's radius is iSize × NODE_SCALE (baked), so writing channel × (nodeScale /
+     NODE_SCALE) draws channel × nodeScale exactly — and field.sizeOf (same array) keeps the
+     picker, the candidate walk and the ladder on the drawn disc. The channel buffer is
+     cached so dragging `nodeScale` rescales without re-ranking the column. */
+  const sizeBuf = sizeAttr.array as Float32Array;
+  let sizeChannelKey = '';
+  let sizeCurveVal = NaN;
+  let baseSizes: Float32Array = new Float32Array(0);
+  const applySizes = (): void => {
+    const channel = str('sizeChannel');
+    const curve = num('sizeCurve');
+    if (channel !== sizeChannelKey || curve !== sizeCurveVal) {
+      baseSizes =
+        channel === 'uniform'
+          ? uniformSizes(n)
+          : sizesFromColumn(graph.columns['degree']!.data, n, curve);
+      sizeChannelKey = channel;
+      sizeCurveVal = curve;
+    }
+    const k = num('nodeScale') / NODE_SCALE;
+    maxSizeWorld = 0;
+    for (let i = 0; i < n; i++) {
+      const s = baseSizes[i]! * k;
+      sizeBuf[i] = s;
+      if (s > maxSizeWorld) maxSizeWorld = s;
+    }
+    sizeAttr.needsUpdate = true;
+  };
+
+  /* -- links take their endpoints' colours (field.ts rule) — after a demo-side node repaint
+     the RGB lanes are rewritten the same way. RGB ONLY: every alpha slot belongs to the
+     focus state, and a sweep is ONE whole-buffer range (never a bare version bump — the
+     field's own upload discipline). */
+  const rewriteLinkRGB = (): void => {
+    const colors = colorAttr.array as Float32Array;
+    const lc = linkColorAttr.array as Float32Array;
+    const ls = graph.links;
+    const m = ls.length >> 1;
+    for (let e = 0; e < m; e++) {
+      const a = ls[e * 2]! * 3;
+      const b = ls[e * 2 + 1]! * 3;
+      const o = e * 8;
+      lc[o] = colors[a]!;
+      lc[o + 1] = colors[a + 1]!;
+      lc[o + 2] = colors[a + 2]!;
+      lc[o + 4] = colors[b]!;
+      lc[o + 5] = colors[b + 1]!;
+      lc[o + 6] = colors[b + 2]!;
+    }
+    linkColorAttr.clearUpdateRanges();
+    linkColorAttr.addUpdateRange(0, lc.length);
+    linkColorAttr.needsUpdate = true;
+  };
+
+  /* -- colour: three modes, one writer. 'column' goes through the library (setColorColumn
+     rank-normalises degree through the ramp and recolours the links itself); 'facet' binds
+     the demo's facet through the chosen palette (golden = the generator, names = theme
+     data); 'uniform' is one flat hue. */
+  const applyColors = (): void => {
+    const mode = str('colorMode');
+    if (mode === 'column') {
+      field.setColorColumn('degree', str('ramp') as RampName);
+      return;
+    }
+    const colors = colorAttr.array as Float32Array;
+    if (mode === 'uniform') {
+      for (let i = 0; i < n; i++) {
+        colors[i * 3] = UNIFORM_RGB[0];
+        colors[i * 3 + 1] = UNIFORM_RGB[1];
+        colors[i * 3 + 2] = UNIFORM_RGB[2];
+      }
+    } else {
+      const facet = graph.facets[colorFacetKey]!;
+      const name = str('palette');
+      const pal =
+        name === 'golden'
+          ? facetPalette(facet.values.length)
+          : paletteBuffer(PALETTES[name as PaletteName], facet.values.length);
+      paintFacetColors(facet.data, n, pal, colors);
+    }
+    colorAttr.needsUpdate = true;
+    rewriteLinkRGB();
+  };
+
+  /* -- the ground. The scene owns the background (the field only ships its default), and the
+     chrome follows the ground — a light field under dark-ground labels is not a theme, it is
+     unreadable (the predecessor's paintGround). Blending is its OWN key: the §5 rule
+     "blending follows the ground" is the presets' job, enforced by the theme tests. */
+  const applyGround = (): void => {
+    const light = str('background') === 'light';
+    scene.background = new Color(light ? BG_LIGHT : field.background);
+    document.body.classList.toggle('light', light);
+  };
+
+  /* -- the ladder's live keys: thresholds and the label band are read fresh every
+     ladder.update, so mutating the resolved config routes them with no rebuild. The keep
+     band re-applies createLadder's clamp (keep ≥ earn — hysteresis cannot be negative). */
+  const applyLadderCfg = (): void => {
+    const c = ladder.config;
+    c.namedPx = num('namedPx');
+    c.earn = num('labelEarn');
+    c.keep = Math.max(num('labelKeep'), c.earn);
+    c.dwellMs = num('labelDwell');
+    c.cardSpacings = num('tierCard');
+    c.lockSpacings = num('tierLock');
+    c.openSpacings = num('tierOpen');
+    c.cardRadiusSpacings = num('cardRadius');
+  };
+
+  /* -- flight: the flycam reads flyCfg live every frame; the orbit cam has its own defaults
+     and no knobs here (?cam=orbit is a diagnostics mode). */
+  const applyFlight = (): void => {
+    flyCfg.speedK = num('speedK');
+    flyCfg.mouseSens = num('mouseSens');
+    flyCfg.turnRate = num('turnRate');
+    flyCfg.easeLin = num('easeLin');
+    flyCfg.spinRate = num('driftRate');
+    if (fly) fly.spin = bool('cameraDrift');
+  };
+
+  const applyBlend = (): void => {
+    field.setBlend(str('blend') === 'additive' ? 'additive' : 'normal');
+  };
+  const applyTonemap = (): void => {
+    field.setTonemap(str('tonemap') as TonemapOp, num('exposure'));
+  };
+  const applyBudget = (): void => {
+    field.setLinkBudget(Math.round(num('linkBudget') * linkTotal));
+  };
+  const applySpread = (): void => {
+    field.setSpread(num('spread'), 0.15); // a short tween — lands EXACTLY on the slider value
+  };
+  const applyRenderScale = (): void => {
+    renderer.setPixelRatio(window.devicePixelRatio * num('renderScale'));
+    renderer.setSize(W, H);
+  };
+
+  /** key → route. One entry per LIVE key; the boot and none lists close the enumeration so
+   *  every schema key is accounted for here, by name. */
+  const ROUTE: Record<string, () => void> = {
+    // ladder (live config writes)
+    tierCard: applyLadderCfg,
+    tierLock: applyLadderCfg,
+    tierOpen: applyLadderCfg,
+    cardRadius: applyLadderCfg,
+    // ladder (rebuild: fixed buffers / frozen overlay rect)
+    maxCards: rebuildLadder,
+    lockW: rebuildLadder,
+    lockH: rebuildLadder,
+    labelCap: rebuildLadder,
+    // the label band
+    namedPx: applyLadderCfg,
+    labelEarn: applyLadderCfg,
+    labelKeep: applyLadderCfg,
+    labelDwell: applyLadderCfg,
+    // nodes
+    sizeChannel: applySizes,
+    nodeScale: applySizes,
+    sizeCurve: applySizes,
+    // colour and ground
+    colorMode: applyColors,
+    palette: applyColors,
+    ramp: applyColors,
+    background: applyGround,
+    blend: applyBlend,
+    tonemap: applyTonemap,
+    exposure: applyTonemap,
+    // links
+    linkBudget: applyBudget,
+    // motion
+    spread: applySpread,
+    cameraDrift: applyFlight,
+    driftRate: applyFlight,
+    levelSpin: applySpins,
+    // flight
+    speedK: applyFlight,
+    mouseSens: applyFlight,
+    turnRate: applyFlight,
+    easeLin: applyFlight,
+    // perf
+    renderScale: applyRenderScale,
+  };
+  /** Read once at createField (focus state) — persisted, applied on the next reload. */
+  const BOOT_KEYS = ['linkBase', 'linkFocus', 'linkHover', 'linkDim', 'dimOthers'] as const;
+  /** Baked into the TSL materials — no seam in this library version (see the header). */
+  const UNROUTED_KEYS = [
+    'nodeMinPx',
+    'nodeMaxPx',
+    'falloff',
+    'bodyR',
+    'haloPx',
+    'haloGain',
+    'coreHot',
+    'flatPx',
+    'lenSoft',
+    'lenFloor',
+  ] as const;
+
+  const routeKey = (key: string): void => {
+    const route = ROUTE[key];
+    if (route) route();
+    updateOverlay();
+  };
+  /** The '*' path: a preset, reset or import may have moved every key — re-apply each route
+   *  exactly once (the table maps many keys onto few appliers, so dedupe by function). */
+  const applyAll = (): void => {
+    rebuildLadder();
+    const seen = new Set<() => void>([rebuildLadder]);
+    for (const key of Object.keys(ROUTE)) {
+      const route = ROUTE[key]!;
+      if (seen.has(route)) continue;
+      seen.add(route);
+      route();
+    }
+    updateOverlay();
+  };
+
+  /* ---- the tuning panel (stage 8): generated from the schema, live on drag, ~ toggles.
+     onChange routes ONE key; onBulk (preset pick / reset / paste) re-applies the table. */
+  injectPanelStyles();
+  const panel = createPanel({
+    store,
+    onChange: routeKey,
+    onBulk: (): void => applyAll(),
+    inertKeys: UNROUTED_KEYS, // greyed in the panel: a live-looking dead knob reads as a bug
+  });
+  document.body.appendChild(panel.el);
+  document.getElementById('tune')?.addEventListener('click', () => panel.toggle());
+  // the boot applyAll() runs below, after the stats state it reports into exists
 
   /* ---- live stats: rAF-interval median over 90 frames (SCALE.md's measurement) PLUS
      jsFrameMs — the per-frame CPU around the update calls (cameras, tweens, frames, pick),
@@ -718,8 +1083,11 @@ async function main(): Promise<void> {
       `cards ${ladder.state.cards.length}/${ladder.config.cards} · ` +
       `open ${ladder.state.open >= 0 ? graph.labelOf(ladder.state.open) : '—'}` +
       `${ladder.state.suspended ? ' · suspended' : ''}` +
-      `${field.select >= 0 ? ' · pinned' : ''}`;
+      `${field.select >= 0 ? ' · pinned' : ''}` +
+      ` · look ${store.preset}`;
   }
+
+  applyAll(); // boot: the loaded config (defaults ⊕ persisted diff) reaches every subsystem
 
   const loop = (t: number): void => {
     let dt = 0;
@@ -858,9 +1226,13 @@ async function main(): Promise<void> {
       applyProjection();
     },
     setSpread: (v: number): void => {
-      ui.spread.value = String(v);
-      ui.spreadVal.textContent = v.toFixed(2);
-      field.setSpread(v, 0.15);
+      // spread is a config key now — the panel, the store and the field stay in agreement
+      if (store.set('spread', v)) {
+        panel.markCustom();
+        store.save();
+        routeKey('spread');
+        panel.sync();
+      }
     },
     setSpin: (level: 0 | 1, on: boolean, rate?: number): void => {
       (level === 0 ? ui.spin0 : ui.spin1).checked = on;
@@ -876,9 +1248,43 @@ async function main(): Promise<void> {
     // threshold (2.2), 1.5 grows the box, 1.0 locks it, 0.4 opens the body (0.45), all the
     // ladder's own units (spread included, like the thresholds), so a headless check can
     // walk the tiers deterministically.
-    ladder,
-    overlay: ladderOverlay,
+    // live getters — the stage-8 rebuild keys (labelCap/maxCards/lockW/lockH) swap both
+    get ladder() {
+      return ladder;
+    },
+    get overlay() {
+      return ladderOverlay;
+    },
     provider,
+    /* stage 8: the config store, the panel, the routing table's '*' path, and a setter that
+       walks the full user path (validate → touch → persist → route → panel sync) so a
+       headless check drives config exactly as a slider would. */
+    store,
+    panel,
+    configWarnings,
+    applyAll,
+    // the routing table's full enumeration, inspectable: live keys route, boot keys land on
+    // the next reload (createField focus opts), unrouted keys await the §5 shader-hook seam
+    routes: {
+      live: Object.keys(ROUTE),
+      boot: BOOT_KEYS,
+      unrouted: UNROUTED_KEYS,
+    },
+    setConfig: (key: string, value: ConfigValue): boolean => {
+      if (!store.set(key, value)) return false;
+      panel.markCustom();
+      store.save();
+      routeKey(key);
+      panel.sync();
+      return true;
+    },
+    applyLook: (name: string): boolean => {
+      if (!store.applyLook(name)) return false;
+      store.save();
+      panel.sync();
+      applyAll();
+      return true;
+    },
     ladderState: (): string =>
       JSON.stringify({
         cand: lastCand,
