@@ -11,13 +11,19 @@
  * room, damping, budgets, morph t, inside-frame, jsFrameMs (§10.7); cameras fly to the
  * LIVE target extent, never a stored one (§10.8).
  *
- * Picking under motion (DESIGN §6): the grid is rebuilt on SETTLE (morph completed, spin
- * stopped, camera tween done) — never per frame. While anything is in flight the hover
- * pick is suppressed; the drawn positions and the grid would disagree, and a wrong answer
- * is worse than none. Selection targets read the same settled view snapshot.
+ * Picking and the ladder under motion (DESIGN §6): the grid is rebuilt on SETTLE — never
+ * per frame — and, while spins keep the field from ever settling, lazily on a drift
+ * budget (the predecessor's ensureGrid: the error is TRACKED, walks widen by it, and the
+ * O(n) rebuild is rate-limited off the steady frame clock). A MORPH suppresses picking
+ * and the candidate pass outright (base positions are mid-flight; the dwell hysteresis
+ * absorbs the 0.9 s gap), but a SPINNING field stays fully alive: every resident node the
+ * candidate walk visits is re-transformed through the live frame chain (O(1) per node,
+ * frames.transformPoint — §4's "per-frame CPU is O(pivots + active), never O(n)"), so
+ * labels, cards, open and select all work with all spins on — §9's 10⁶ acceptance row is
+ * measured in exactly that state.
  */
 
-import { Color, PerspectiveCamera, Scene, Vector3, WebGPURenderer } from 'three/webgpu';
+import { Color, Matrix4, PerspectiveCamera, Scene, Vector3, WebGPURenderer } from 'three/webgpu';
 import {
   attachToAnchors,
   buildGraph,
@@ -25,21 +31,39 @@ import {
   compileHierarchy,
   createField,
   createFlycam,
+  createLadder,
   createOrbitCam,
+  createOverlay,
   createTweens,
   fnv1a,
+  fovPxOf,
+  injectStyles,
+  makeSynthProvider,
   nearestDistance,
   pickRay,
+  projectedPx,
+  standoffOf,
+  BOOST_HOVER,
+  BOOST_SELECT,
+  CARD_SPACINGS,
   DEFAULT_FOV,
   D_REF_FRACTION,
   FALLOFF,
   FLYCAM_DEFAULTS,
+  NAMED_PX,
   NODE_MAX_PX,
   NODE_MIN_PX,
   NODE_SCALE,
   ORBIT_DEFAULTS,
 } from '../src/index';
-import type { CameraController, CompiledHierarchy, Flycam, LevelSpec } from '../src/index';
+import type {
+  CameraController,
+  CompiledHierarchy,
+  Flycam,
+  LadderCandidates,
+  LadderView,
+  LevelSpec,
+} from '../src/index';
 import { generateSynth } from '../src/synth/generate';
 
 const statsEl = document.getElementById('stats')!;
@@ -98,14 +122,48 @@ async function main(): Promise<void> {
   const { centre, radius, diagonal } = field.extent;
   const dRef = diagonal * D_REF_FRACTION; // the same falloff pivot the node shader uses
 
-  /* ---- picking: ONE grid per field, over the SETTLED view snapshot (rebuilt on settle,
-     never per frame — see the header). */
+  /* ---- picking: ONE grid per field, over the view snapshot — rebuilt on settle, on a
+     morph landing, and lazily under spin once the tracked drift passes a third of a cell
+     (see the header). */
   const viewBuf = new Float32Array(n * 3);
   viewBuf.set(positions);
   let grid = buildGrid(viewBuf, n);
+  let gridDrift = 0; // bound on how far any node may have walked since `grid` was built
+  let gridCooldown = 0; // seconds until the next in-spin rebuild (the port's 250 ms limiter)
   const rebuildGrid = (): void => {
     field.viewPositions(viewBuf);
     grid = buildGrid(viewBuf, n);
+    gridDrift = 0;
+  };
+
+  /* The CPU mirror of the shader's BASE endpoints (mix(A,B,t), parked), refreshed when a
+     morph lands. refreshViewOf() composes the live frame chain + spread on top of it for
+     ONE node — exactly the vertex-shader arithmetic — so the ladder, the overlay and the
+     orbit target can follow a SPINNING field with O(active) work, never O(n) (§4; the
+     predecessor recomposed all n on the CPU every spinning frame, the flaw this design
+     removes). Valid whenever no morph is rewriting the base. */
+  const baseBuf = new Float32Array(n * 3);
+  baseBuf.set(positions);
+  let morphing = false; // a retarget tween is rewriting the base endpoints right now
+  let fieldSettledNow = true; // field.settled() this frame: frames parked, no field tween
+  let spinRateSum = 0; // Σ|rate| over the live spin levels — drives the drift bound
+  const spreadC: [number, number, number] = [0, 0, 0]; // live spread centre, synced per frame
+  let spreadK = 1;
+  const refreshViewOf = (i: number): void => {
+    const o = i * 3;
+    const f = field.frames;
+    if (f !== null) {
+      f.transformPoint(field.chainIds[i]!, baseBuf, viewBuf, o, o);
+    } else {
+      viewBuf[o] = baseBuf[o]!;
+      viewBuf[o + 1] = baseBuf[o + 1]!;
+      viewBuf[o + 2] = baseBuf[o + 2]!;
+    }
+    if (spreadK !== 1) {
+      viewBuf[o] = spreadC[0] + (viewBuf[o]! - spreadC[0]) * spreadK;
+      viewBuf[o + 1] = spreadC[1] + (viewBuf[o + 1]! - spreadC[1]) * spreadK;
+      viewBuf[o + 2] = spreadC[2] + (viewBuf[o + 2]! - spreadC[2]) * spreadK;
+    }
   };
 
   /* ---- cameras. Flycam by default (?cam=orbit for the simple one). */
@@ -211,7 +269,10 @@ async function main(): Promise<void> {
   /** Write the live spin toggles into the pivot table — the FrameSet reads `rate` fresh
    *  every advance (frames.ts), so no recompile: a parked frame resumes from its angle. */
   const applySpins = (): void => {
-    if (!hierarchy) return;
+    if (!hierarchy) {
+      spinRateSum = 0;
+      return;
+    }
     const pv = hierarchy.pivots;
     const on = [ui.spin0.checked, ui.spin1.checked];
     const rates = [Number(ui.rate0.value) || 0, Number(ui.rate1.value) || 0];
@@ -219,13 +280,17 @@ async function main(): Promise<void> {
       const lv = pv.level[p]!;
       pv.rate[p] = lv <= 1 && on[lv] ? rates[lv]! : 0;
     }
+    // the drift bound's rate: both levels added, because a node can ride both frames
+    spinRateSum = (on[0] ? Math.abs(rates[0]!) : 0) + (on[1] ? Math.abs(rates[1]!) : 0);
   };
 
   const applyArrangement = (): void => {
     const name = ui.arrangement.value;
+    morphing = true; // every branch below retargets — the base is in flight until t = 1
     if (name === 'frozen') {
       hierarchy = null;
       field.setHierarchy(null);
+      applySpins(); // spinRateSum → 0: no frames exist in the frozen layout
     } else {
       const leaf = LEAVES[name]!;
       let levels: LevelSpec[];
@@ -252,6 +317,7 @@ async function main(): Promise<void> {
 
   const applyProjection = (): void => {
     const mode = ui.proj.value === '2d' ? '2d' : '3d';
+    if (mode !== field.projection) morphing = true; // setProjection no-ops on a same-mode call
     field.setProjection(mode);
     const fovTarget = mode === '2d' ? 30 : DEFAULT_FOV; // narrow lens flattens the read
     demoTweens.to('fov', fovTarget, { duration: 0.9 });
@@ -270,6 +336,218 @@ async function main(): Promise<void> {
     ui.spreadVal.textContent = v.toFixed(2);
     field.setSpread(v, 0.15); // a short tween — lands EXACTLY on the slider value
   });
+
+  /* ---- stage 7: the zoom ladder + DOM overlay (DESIGN §6) ----------------------------
+     The machine is pure (src/ladder/ladder.ts) — the demo's job is the candidate pass, the
+     cursor, the pin (= the existing select state) and the per-frame overlay call. */
+  injectStyles();
+  const provider = makeSynthProvider(graph);
+  const ladder = createLadder();
+  const ladderOverlay = createOverlay({
+    container: document.getElementById('ladder')!,
+    provider,
+    // the pin affordance reuses the existing select-clear, exactly like Escape below
+    onUnpin: (): void => {
+      if (field.setSelect(-1)) updateOverlay();
+    },
+  });
+
+  // pointer state the ladder consumes (written by the pointermove wiring below)
+  let pointerActive = false;
+  let cursorMoved = false;
+
+  // the one clip matrix (projection × worldInverse) the candidate pass and the overlay share
+  const camInv = new Matrix4();
+  const clipM = new Matrix4();
+
+  // the largest size-channel radius in the corpus — the candidate reach bound (static:
+  // this demo never rebinds the size column). A loop, never a spread (§10.3).
+  let maxSizeWorld = 0;
+  for (let i = 0; i < n; i++) {
+    const s = field.sizeOf(i);
+    if (s > maxSizeWorld) maxSizeWorld = s;
+  }
+  const maxBoost = Math.max(BOOST_HOVER, BOOST_SELECT);
+
+  /* THE CANDIDATE RECIPE — a cheap pass over the pick grid, not a sweep of all n nodes:
+     1. Nothing beyond `reach` can matter. The ladder's own gate is projectedPx ≥ NAMED_PX,
+        and the largest glyph any node can draw is maxSizeWorld × NODE_SCALE × maxBoost — so
+        reach = standoffOf(thatRadius, NAMED_PX, fovPx), floored at the card distance
+        (CARD_SPACINGS × spacing × spread — the thresholds live in SPREAD world units, like
+        the positions). Both are DEPTH thresholds, and within the frustum margin depth can
+        undercut Euclidean range by up to √(1 + tanH² + tanV²), so the walk sphere widens
+        by that slack — plus the tracked grid drift while spins are live.
+     2. Walk only the PICK GRID cells whose boxes intersect the camera sphere of radius
+        `reach`. Flying close (where the ladder lives) this is a handful of cells; zoomed
+        far out it degrades to the whole grid, where the px gate then rejects almost
+        everything after a few multiplies. While the field spins, each resident is first
+        re-transformed through the live frame chain (refreshViewOf — written back into
+        viewBuf, so the overlay and the click target read the same fresh spot).
+     3. Per resident node: view-forward DEPTH (clip w ≡ −z_view — what the shader sizes by,
+        nodes.ts centerView.z.negate(), and what the predecessor fed sVirtual AND sCard;
+        Euclidean range over-measures off-axis nodes by 1/cosθ, ~30%+ at the frustum
+        corner), the px gate, then the frustum margin test (±1.25 / ±1.3 NDC, the
+        predecessor's margins) and the cursor pull.
+     4. The pinned node is appended even when the walk missed it — a pin outranks the
+        ladder, and pinning something that is not a candidate must still pin.
+     Columns are fixed scratch, grown geometrically, never allocated per frame (§10). */
+  let candCap = 0;
+  let candNode = new Uint32Array(0);
+  let candPx = new Float64Array(0);
+  let candDist = new Float64Array(0);
+  let candCur = new Float64Array(0);
+  const ladderCandidates: LadderCandidates = {
+    count: 0,
+    node: candNode,
+    projectedPx: candPx,
+    distance: candDist,
+    cursorPx: candCur,
+  };
+  const ladderView: LadderView = {
+    candidates: ladderCandidates,
+    spacing,
+    pinned: -1,
+    cursorMoved: false,
+  };
+  const growCand = (min: number): void => {
+    candCap = Math.max(256, candCap * 2, min);
+    const nn = new Uint32Array(candCap);
+    nn.set(candNode);
+    candNode = nn;
+    const np = new Float64Array(candCap);
+    np.set(candPx);
+    candPx = np;
+    const nd = new Float64Array(candCap);
+    nd.set(candDist);
+    candDist = nd;
+    const nc = new Float64Array(candCap);
+    nc.set(candCur);
+    candCur = nc;
+    ladderCandidates.node = candNode;
+    ladderCandidates.projectedPx = candPx;
+    ladderCandidates.distance = candDist;
+    ladderCandidates.cursorPx = candCur;
+  };
+
+  function gatherCandidates(): number {
+    const fovPx = fovPxOf(H, liveFov);
+    const live = !fieldSettledNow; // spins/spread in flight: re-transform every resident
+    const tanHalf = Math.tan((liveFov * Math.PI) / 360);
+    const tV = tanHalf * 1.3;
+    const tH = tanHalf * (W / H) * 1.25;
+    const slack = Math.sqrt(1 + tV * tV + tH * tH); // Euclidean ≤ depth × slack inside the margin
+    const reach =
+      Math.max(
+        standoffOf(maxSizeWorld * NODE_SCALE * maxBoost, NAMED_PX, fovPx),
+        CARD_SPACINGS * spacing * field.spread,
+      ) *
+        slack +
+      gridDrift;
+    const r2 = reach * reach;
+    const cx = camera.position.x;
+    const cy = camera.position.y;
+    const cz = camera.position.z;
+    const m = clipM.elements;
+    const pinnedNode = field.select;
+    const g = grid;
+    const loX = Math.max(0, Math.floor((cx - reach - g.minX) / g.cellX));
+    const hiX = Math.min(g.side - 1, Math.floor((cx + reach - g.minX) / g.cellX));
+    const loY = Math.max(0, Math.floor((cy - reach - g.minY) / g.cellY));
+    const hiY = Math.min(g.side - 1, Math.floor((cy + reach - g.minY) / g.cellY));
+    const loZ = Math.max(0, Math.floor((cz - reach - g.minZ) / g.cellZ));
+    const hiZ = Math.min(g.side - 1, Math.floor((cz + reach - g.minZ) / g.cellZ));
+    let k = 0;
+    let sawPinned = false;
+    for (let iz = loZ; iz <= hiZ; iz++) {
+      const z0 = g.minZ + iz * g.cellZ;
+      const dz0 = cz < z0 ? z0 - cz : cz > z0 + g.cellZ ? cz - (z0 + g.cellZ) : 0;
+      for (let iy = loY; iy <= hiY; iy++) {
+        const y0 = g.minY + iy * g.cellY;
+        const dy0 = cy < y0 ? y0 - cy : cy > y0 + g.cellY ? cy - (y0 + g.cellY) : 0;
+        if (dy0 * dy0 + dz0 * dz0 > r2) continue;
+        for (let ix = loX; ix <= hiX; ix++) {
+          const x0 = g.minX + ix * g.cellX;
+          const dx0 = cx < x0 ? x0 - cx : cx > x0 + g.cellX ? cx - (x0 + g.cellX) : 0;
+          if (dx0 * dx0 + dy0 * dy0 + dz0 * dz0 > r2) continue; // cell box outside the sphere
+          const cell = (iz * g.side + iy) * g.side + ix;
+          const lo = g.start[cell]!;
+          const hi = g.start[cell + 1]!;
+          for (let q = lo; q < hi; q++) {
+            const i = g.order[q]!;
+            const o = i * 3;
+            if (live) refreshViewOf(i); // follow the spin BEFORE gating — and the overlay
+            //                             and click target read this same refreshed slot
+            const wx = viewBuf[o]!;
+            const wy = viewBuf[o + 1]!;
+            const wz = viewBuf[o + 2]!;
+            const isPin = i === pinnedNode;
+            // view-forward depth: clip w ≡ −z_view for a standard perspective matrix —
+            // the same divisor the node shader sizes by (one pixel unit, §5)
+            const cw = m[3]! * wx + m[7]! * wy + m[11]! * wz + m[15]!;
+            if (cw <= 0 && !isPin) continue; // behind the nose
+            let dist = cw;
+            if (cw <= 0) {
+              // a pinned node behind the camera: any positive stand-in — the pin path
+              // bypasses every distance gate, this only keeps the column sane
+              const dx = wx - cx;
+              const dy = wy - cy;
+              const dz = wz - cz;
+              dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
+            }
+            const ppx = projectedPx(field.sizeOf(i) * NODE_SCALE * field.boostOf(i), dist, fovPx);
+            if (ppx < NAMED_PX && !isPin) continue; // a mote and nothing more
+            let cur = Infinity;
+            if (cw > 0) {
+              const ndx = (m[0]! * wx + m[4]! * wy + m[8]! * wz + m[12]!) / cw;
+              const ndy = (m[1]! * wx + m[5]! * wy + m[9]! * wz + m[13]!) / cw;
+              if ((ndx < -1.25 || ndx > 1.25 || ndy < -1.3 || ndy > 1.3) && !isPin) continue;
+              if (pointerActive) {
+                const sx = (ndx * 0.5 + 0.5) * W - px;
+                const sy = (-ndy * 0.5 + 0.5) * H - py;
+                cur = Math.hypot(sx, sy);
+              }
+            }
+            if (k >= candCap) growCand(k + 1);
+            candNode[k] = i;
+            candPx[k] = ppx;
+            candDist[k] = dist;
+            candCur[k] = cur;
+            if (isPin) sawPinned = true;
+            k++;
+          }
+        }
+      }
+    }
+    if (pinnedNode >= 0 && !sawPinned) {
+      // a pin outranks the walk: report its true depth so its card tier is honest
+      if (live) refreshViewOf(pinnedNode);
+      const o = pinnedNode * 3;
+      const wx = viewBuf[o]!;
+      const wy = viewBuf[o + 1]!;
+      const wz = viewBuf[o + 2]!;
+      const cw = m[3]! * wx + m[7]! * wy + m[11]! * wz + m[15]!;
+      const dx = wx - cx;
+      const dy = wy - cy;
+      const dz = wz - cz;
+      if (k >= candCap) growCand(k + 1);
+      candNode[k] = pinnedNode;
+      candPx[k] = 0; // the ladder's pin path bypasses the px gate anyway
+      candDist[k] = cw > 0 ? cw : Math.sqrt(dx * dx + dy * dy + dz * dz);
+      candCur[k] = Infinity;
+      k++;
+    }
+    return k;
+  }
+
+  // the overlay's per-frame view: stable references, fields refreshed in the loop
+  const overlayView = {
+    matrix: clipM.elements,
+    positions: viewBuf,
+    width: window.innerWidth,
+    height: window.innerHeight,
+    pinned: -1,
+  };
+  let lastCand = 0;
 
   /* ---- hover: cast at most once per frame, from the latest cursor position, and only
      while the view is settled (the grid is only valid then — see the header). */
@@ -297,7 +575,9 @@ async function main(): Promise<void> {
       dRef,
       sizeOf: (i: number): number => field.sizeOf(i),
       boostOf: (i: number): number => field.boostOf(i),
-      drift: 0, // the grid is rebuilt on settle; picks are suppressed in flight
+      // widened while spinning: the grid's positions lag the drawn ones by at most this
+      // (the port's gridDrift trade — a wider walk beats a click that does nothing)
+      drift: gridDrift,
     });
   }
 
@@ -309,9 +589,12 @@ async function main(): Promise<void> {
     px = ev.clientX;
     py = ev.clientY;
     pickDue = true;
+    pointerActive = true; // attention follows the cursor (ladder scoring)
+    cursorMoved = true; // and a real move is what clears a retreat()'s suspension
   });
   canvas.addEventListener('pointerleave', (): void => {
     pickDue = false;
+    pointerActive = false;
     hover(-1);
   });
 
@@ -323,13 +606,14 @@ async function main(): Promise<void> {
     (ev: PointerEvent): void => {
       const wasClick = cam.consumeClick(ev);
       if (!wasClick || ev.target !== canvas) return;
-      if (!settledNow) return; // the grid is stale mid-flight; a wrong select is worse than none
+      if (morphing) return; // base positions are mid-retarget; a wrong select is worse than none
       const i = castAt(ev.clientX, ev.clientY); // THIS event's coordinate, never the last move's
       field.setSelect(i);
       if (i >= 0) {
         // The node becomes the orbit pivot — the camera stays put (keepRadius false), so a
-        // click re-aims what dragging turns around without jumping the view. viewBuf is the
-        // settled view snapshot — where the node is DRAWN, not its frozen coordinate.
+        // click re-aims what dragging turns around without jumping the view. viewBuf holds
+        // where the node is DRAWN — refreshed through the live frame chain while spinning.
+        if (!fieldSettledNow) refreshViewOf(i);
         cam.setTarget(new Vector3(viewBuf[i * 3]!, viewBuf[i * 3 + 1]!, viewBuf[i * 3 + 2]!), false);
       }
       updateOverlay();
@@ -339,7 +623,22 @@ async function main(): Promise<void> {
 
   window.addEventListener('keydown', (ev: KeyboardEvent): void => {
     if (ev.key === 'Escape') {
+      // Escape = close + retreat + unpin (the port's deselect-from-close-up, main.js
+      // ~189): close the open slot, suspend auto-open, clear the selection (the pin is
+      // the select state) — and fly the CAMERA back past the card threshold so the open
+      // page shrinks into the point it came from. Without the flight the locked card
+      // keeps filling the screen, and the next cursor move (which clears the suspension
+      // — that is user intent) would reopen the very page Escape just closed.
+      const was = ladder.state.open >= 0 ? ladder.state.open : field.select;
+      ladder.retreat();
       if (field.setSelect(-1)) updateOverlay();
+      if (fly && was >= 0) {
+        if (!fieldSettledNow && !morphing) refreshViewOf(was);
+        const o = was * 3;
+        const p = new Vector3(viewBuf[o]!, viewBuf[o + 1]!, viewBuf[o + 2]!);
+        const dCard = CARD_SPACINGS * spacing * field.spread;
+        if (camera.position.distanceTo(p) < dCard * 1.05) fly.goTo(p, dCard * 1.7, 800);
+      }
     }
   });
 
@@ -413,7 +712,13 @@ async function main(): Promise<void> {
       `room ${Number.isFinite(room) ? room.toFixed(0) : '∞'} · speed ${speed.toFixed(0)}` +
       `${blocked ? ' (damped)' : ''} · ` +
       `hover: ${hov >= 0 ? graph.labelOf(hov) : '—'} · ` +
-      `selected: ${sel >= 0 ? graph.labelOf(sel) : '—'}`;
+      `selected: ${sel >= 0 ? graph.labelOf(sel) : '—'}\n` +
+      // the ladder's budgets, reported not implied (§10.4) — named/cards/open counts
+      `ladder: cand ${lastCand} · named ${ladder.state.namedCount}/${ladder.config.namedCap} · ` +
+      `cards ${ladder.state.cards.length}/${ladder.config.cards} · ` +
+      `open ${ladder.state.open >= 0 ? graph.labelOf(ladder.state.open) : '—'}` +
+      `${ladder.state.suspended ? ' · suspended' : ''}` +
+      `${field.select >= 0 ? ' · pinned' : ''}`;
   }
 
   const loop = (t: number): void => {
@@ -437,20 +742,84 @@ async function main(): Promise<void> {
     demoTweens.update(dt);
     field.update(dt); // tweens + frames: O(pivots), zero when idle (§4)
 
-    settledNow = field.settled() && !demoTweens.active() && !(fly?.tweening ?? false);
+    fieldSettledNow = field.settled();
+    settledNow = fieldSettledNow && !demoTweens.active() && !(fly?.tweening ?? false);
     if (settledNow && !wasSettled) {
       rebuildGrid(); // on settle — never per frame (DESIGN §6)
       updateOverlay();
     }
     wasSettled = settledNow;
+    if (morphing && field.morphT >= 1) {
+      // the retarget landed: the base endpoints are parked — refresh the CPU mirror, and
+      // rebuild the index NOW if live spins will keep the settle edge from ever firing
+      morphing = false;
+      field.basePositions(baseBuf);
+      if (!fieldSettledNow) {
+        rebuildGrid();
+        gridCooldown = 0.25;
+      }
+    }
+    /* Grid upkeep under spin (the port's ensureGrid, moved on-loop): rotation walks the
+       drawn positions away from the snapshot the grid indexes, so the error is TRACKED —
+       candidate reach and pickRay widen by gridDrift — and the index rebuilt lazily once
+       the drift passes a third of a cell, rate-limited so the O(n) pass stays off the
+       steady frame clock. */
+    if (!morphing && (field.frames?.activeThisTick() ?? false)) {
+      gridDrift += spinRateSum * dt * diagonal * 0.5 * field.spread;
+    }
+    gridCooldown = Math.max(0, gridCooldown - dt);
+    if (!morphing && gridCooldown === 0 && gridDrift > grid.cellMax * 0.34) {
+      rebuildGrid();
+      gridCooldown = 0.25;
+    }
+    if (!fieldSettledNow && !morphing) {
+      // sync the spread mirror refreshViewOf composes with (one read per frame, not per node)
+      const c = field.centroid();
+      spreadC[0] = c[0];
+      spreadC[1] = c[1];
+      spreadC[2] = c[2];
+      spreadK = field.spread;
+    }
 
-    // Hover resolves against the latest cursor position, once per frame at most — and only
-    // while settled (grid validity; also not mid-tween, when the ray sweeps nodes nobody
-    // is pointing at).
-    if (pickDue && settledNow) {
+    // Hover resolves against the latest cursor position, once per frame at most. A morph
+    // suppresses it (positions and index genuinely disagree), and so does a camera tween
+    // (the ray would sweep nodes nobody is pointing at); a SPINNING field picks fine —
+    // the ladder's nodes are written back fresh and the walk widens by the drift.
+    if (pickDue && !morphing && !(fly?.tweening ?? false)) {
       pickDue = false;
       hover(castAt(px, py));
     }
+
+    /* ---- the ladder tick (stage 7). Candidates are gathered every frame the BASE is
+       parked — including during spins and spread tweens, where gatherCandidates re-forms
+       each resident through the live frame chain (refreshViewOf): the ladder must live
+       exactly when you fly toward a rotating page, and §9's 10⁶ acceptance row is "all
+       spins on". Only a MORPH skips the pass (mid-retarget the positions and the index
+       disagree) — the dwell hysteresis absorbs that 0.9 s gap. The clip matrix is rebuilt
+       here, not read from the renderer — the camera moved this frame. */
+    camera.updateMatrixWorld();
+    camInv.copy(camera.matrixWorld).invert();
+    clipM.multiplyMatrices(camera.projectionMatrix, camInv);
+    ladderView.pinned = field.select; // the pin IS the select state
+    ladderView.cursorMoved = cursorMoved;
+    ladderView.spacing = spacing * field.spread; // the tier thresholds are spacing-denominated
+    //   and candidate depths live in SPREAD world units — the unit must follow the slider
+    //   (the port recomputed sp = spacing × spreadK on every config change)
+    cursorMoved = false;
+    lastCand = morphing ? 0 : gatherCandidates();
+    ladderCandidates.count = lastCand;
+    const ladderState = ladder.update(dt, ladderView);
+    if (!fieldSettledNow && !morphing) {
+      // glue every mounted label/card to the spot the shader draws THIS frame — including
+      // ones riding out their drop grace, which the candidate walk no longer visits
+      for (let j = 0; j < ladderState.namedCount; j++) refreshViewOf(ladderState.named[j]!);
+      for (const slot of ladderState.cards) refreshViewOf(slot.node);
+    }
+    overlayView.width = W;
+    overlayView.height = H;
+    overlayView.pinned = field.select;
+    ladderOverlay.update(ladderState, overlayView);
+
     const c1 = performance.now(); // jsFrameMs window closes BEFORE render
     jsMs[jsCursor] = c1 - c0;
     jsCursor = (jsCursor + 1) % jsMs.length;
@@ -501,6 +870,31 @@ async function main(): Promise<void> {
     setPull: (on: boolean): void => {
       ui.pull.checked = on;
       applyArrangement();
+    },
+    // stage 7: the ladder, the overlay and a tier-walking helper. flyToNode(i, s) stands
+    // off s page-spacings from node i's DRAWN position — s 2.4 approaches past the card
+    // threshold (2.2), 1.5 grows the box, 1.0 locks it, 0.4 opens the body (0.45), all the
+    // ladder's own units (spread included, like the thresholds), so a headless check can
+    // walk the tiers deterministically.
+    ladder,
+    overlay: ladderOverlay,
+    provider,
+    ladderState: (): string =>
+      JSON.stringify({
+        cand: lastCand,
+        named: ladder.state.namedCount,
+        cards: ladder.state.cards.map((c) => ({ node: c.node, tier: c.tier, growT: c.growT })),
+        open: ladder.state.open,
+        suspended: ladder.state.suspended,
+        pinned: field.select,
+      }),
+    flyToNode: (i: number, spacings = 0.4, ms = 900): void => {
+      if (!fly) return;
+      cursorMoved = true; // a deliberate goto is user intent — it clears a retreat's
+      //                     suspension, exactly as the port's flyTo re-enabled auto-open
+      if (!fieldSettledNow && !morphing) refreshViewOf(i);
+      const t = new Vector3(viewBuf[i * 3]!, viewBuf[i * 3 + 1]!, viewBuf[i * 3 + 2]!);
+      fly.goTo(t, Math.max(spacings * spacing * field.spread, 0.01), ms);
     },
     // §9: "viewpoint asserted (never trusted)". The idle turntable keeps the camera
     // orbiting, so an fps A/B measured over it compares two different fills — baseline

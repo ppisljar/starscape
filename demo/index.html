@@ -4,85 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>starscape demo — the field</title>
-    <style>
-      html,
-      body {
-        margin: 0;
-        height: 100%;
-        overflow: hidden;
-        background: #05070d; /* BG_DARK — the dark ground the additive theme assumes */
-        color: #cdd6e4;
-        font: 13px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
-      }
-      canvas {
-        display: block;
-      }
-      #stats {
-        position: fixed;
-        left: 10px;
-        bottom: 8px;
-        opacity: 0.85;
-        pointer-events: none;
-        white-space: pre;
-        text-shadow: 0 1px 2px #000;
-      }
-      #error {
-        position: fixed;
-        inset: auto 10px 40px 10px;
-        color: #ff7b72;
-        white-space: pre-wrap;
-        display: none;
-      }
-      #panel {
-        position: fixed;
-        top: 10px;
-        right: 10px;
-        width: 240px;
-        padding: 10px 12px;
-        background: rgba(10, 14, 24, 0.88);
-        border: 1px solid #27314a;
-        border-radius: 6px;
-        display: grid;
-        gap: 6px;
-        user-select: none;
-      }
-      #panel h3 {
-        margin: 0 0 2px;
-        font-size: 12px;
-        letter-spacing: 0.12em;
-        color: #8fa4c8;
-      }
-      #panel label {
-        display: flex;
-        align-items: center;
-        gap: 6px;
-        justify-content: space-between;
-        white-space: nowrap;
-      }
-      #panel select,
-      #panel input[type='number'] {
-        background: #0d1322;
-        color: #cdd6e4;
-        border: 1px solid #27314a;
-        border-radius: 3px;
-        font: inherit;
-        padding: 1px 4px;
-      }
-      #panel select {
-        flex: 1;
-      }
-      #panel input[type='number'] {
-        width: 58px;
-      }
-      #panel input[type='range'] {
-        flex: 1;
-      }
-      #panel .row {
-        display: flex;
-        align-items: center;
-        gap: 6px;
-      }
-    </style>
+    <link rel="stylesheet" href="./demo.css" />
   </head>
   <body>
     <div id="panel">
@@ -119,6 +41,8 @@
       </label>
       <label><span><input type="checkbox" id="pull" /> pull (bloom on type anchors)</span></label>
     </div>
+    <!-- the zoom-ladder overlay root: positioned over the canvas, owned by createOverlay -->
+    <div id="ladder"></div>
     <div id="stats">booting…</div>
     <div id="error"></div>
     <script type="module" src="./main.ts"></script>

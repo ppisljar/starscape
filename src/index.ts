@@ -137,3 +137,10 @@ export type {
 } from './place/hierarchy';
 export { attachToAnchors, HOP_MAX } from './place/pull';
 export type { AnchorAttachment } from './place/pull';
+
+/* ---- stage 7: the zoom ladder (§6) — the pure machine, its constants, the content
+ * contract (ContentProvider + makeSynthProvider) and the DOM overlay. One barrel
+ * (src/ladder/index.ts, the §8 `/ladder` subpath), re-exported whole: the ladder names are
+ * namespaced by convention (NAMED_*, CARD_*, LOCK_*, OVERLAY_*, ss-* classes) and collide
+ * with nothing above. */
+export * from './ladder/index';
