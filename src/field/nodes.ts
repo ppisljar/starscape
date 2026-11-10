@@ -65,6 +65,18 @@ import {
   NODE_SCALE,
 } from './constants';
 
+/** The seven glyph families the node fragment shader renders, in `iShape` index order
+ *  (0 = disc … 6 = bar) — the select chain in `material.colorNode` below IS this list. A
+ *  facet's value index maps into it through Field.setShapeFacet. All seven are cheap distance
+ *  fields with no texture fetch, but they only READ as distinct shapes at a decent projected
+ *  size: a 2 px disc and a 2 px diamond are the same blob (the flat-LOD branch even collapses
+ *  them on purpose), so shape-by-facet wants a larger node size / lower density to be legible. */
+export const NODE_SHAPES = ['disc', 'square', 'diamond', 'ring', 'cross', 'discCross', 'bar'] as const;
+/** One of the seven glyph family names (NODE_SHAPES[k]). */
+export type NodeShape = (typeof NODE_SHAPES)[number];
+/** How many glyph families `iShape` selects between — the clamp/wrap modulus for setShapeFacet. */
+export const SHAPE_COUNT = NODE_SHAPES.length;
+
 export interface NodeLayer {
   mesh: Mesh;
   material: SpriteNodeMaterial;

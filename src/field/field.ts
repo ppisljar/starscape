@@ -58,7 +58,7 @@ import {
   LINK_BASE_ALPHA,
   LINK_LEN_SOFT,
 } from './constants';
-import { buildNodeLayer } from './nodes';
+import { buildNodeLayer, SHAPE_COUNT } from './nodes';
 import type { NodeStyle } from './nodes';
 import { buildLinkLayer } from './links';
 import type { LinkStyle } from './links';
@@ -84,6 +84,12 @@ export interface FieldOpts {
   sizeColumn?: string;
   /** Facet driving node colour. Default: the graph's first facet (uniform grey without any). */
   colorFacet?: string;
+  /** Facet driving node GLYPH SHAPE (§3.3): each node's `iShape` is its facet value index
+   *  mapped into the seven glyph families (field/nodes.ts NODE_SHAPES). `null` (the default)
+   *  leaves every node a disc. Value index k → shape k, WRAPPED mod 7 for facets with more
+   *  than seven values (so a high-cardinality facet still shows variety rather than collapsing
+   *  its tail onto one glyph). Shapes read best at a larger node size / lower density. */
+  shapeFacet?: string | null;
   /** 'additive' (glows that stack — the dark-ground preset look) or 'normal' (solid glyphs,
    *  correct on any ground). Blending is a property of the GROUND, not a per-material choice —
    *  both layers follow this one setting. Default 'normal', the predecessor's shipped default
@@ -133,6 +139,8 @@ export interface FieldStats {
    *  colorColumn are both null then. The density is recomputed from the target geometry on every
    *  retarget, so this look follows an arrangement change without the caller re-binding it. */
   colorDensity: boolean;
+  /** The facet bound to node GLYPH SHAPE (setShapeFacet), or null when every node is a disc. */
+  shapeFacet: string | null;
   /** The live highlight roll-off: operator name + pre-curve exposure (stage 8, ./tonemap). */
   tonemap: { op: TonemapOp; exposure: number };
   /** Morph progress (§4): t and whether any tween (morph or spread) is still running. */
@@ -173,6 +181,14 @@ export interface Field {
   setTonemap(op: TonemapOp, exposure?: number): void;
   /** Re-bind node size to a numeric column ('uniform' for equal dots). */
   setSizeColumn(key: string): void;
+  /** Bind node GLYPH SHAPE to a facet (§3.3): writes each node's `iShape` from the facet's
+   *  value index, mapped into the seven glyph families (field/nodes.ts NODE_SHAPES) — value
+   *  index k → shape (k mod 7), so a facet with more than seven values WRAPS rather than
+   *  piling its tail onto one glyph. `null` resets every node to a disc. A whole-buffer
+   *  attribute write on an event (never per frame); unaffected by colour, which is an
+   *  independent channel. Shapes only read as distinct at a decent projected size — pair this
+   *  with a larger node size / lower density. */
+  setShapeFacet(key: string | null): void;
   /** One blending setting for both layers (see FieldOpts.blend). */
   setBlend(mode: 'additive' | 'normal'): void;
   /** Report the viewport's CSS-pixel height after a resize (one pixel unit, everywhere). */
@@ -337,6 +353,10 @@ export function createField(graph: Graph, opts: FieldOpts = {}): Field {
   if (colorFacet !== null && !graph.facets[colorFacet]) {
     throw new Error(`createField: colorFacet "${colorFacet}" names no facet`);
   }
+  let shapeFacet: string | null = opts.shapeFacet ?? null;
+  if (shapeFacet !== null && !graph.facets[shapeFacet]) {
+    throw new Error(`createField: shapeFacet "${shapeFacet}" names no facet`);
+  }
 
   let colorColumn: string | null = null; // set by setColorColumn; exclusive with colorFacet
   /* Local-density colour state (setColorByDensity). densityRamp non-null ⟺ the density channel
@@ -348,9 +368,10 @@ export function createField(graph: Graph, opts: FieldOpts = {}): Field {
   let densityRamp: RampLike | null = null;
   let densScratch: Float32Array | null = null;
   const colors = new Float32Array(n * 3);
-  const shapes = new Float32Array(n); // all discs at stage 3; shapeBy binding arrives later
+  const shapes = new Float32Array(n); // disc (0) per node; setShapeFacet binds iShape to a facet
   const sizes = computeSizes(graph, sizeColumn, n);
   paintColors(graph, colorFacet, n, colors);
+  if (shapeFacet !== null) paintShapes(graph, shapeFacet, n, shapes); // boot-path shape binding
 
   /* Stage 8: the shared highlight roll-off rig — ONE op/exposure uniform pair spliced into
      both layers' fragment stages (./tonemap). Off (op 0) by default: the bypass is the
@@ -724,6 +745,17 @@ export function createField(graph: Graph, opts: FieldOpts = {}): Field {
       node.sizeAttr.needsUpdate = true;
     },
 
+    setShapeFacet(key: string | null): void {
+      if (key !== null && !graph.facets[key]) {
+        throw new Error(`setShapeFacet: "${key}" names no facet`);
+      }
+      shapeFacet = key;
+      paintShapes(graph, shapeFacet, n, shapes);
+      // A whole-buffer rewrite on an event — the same bare version bump setSizeColumn uses
+      // (iShape is not a focus-owned attribute, so the ranges discipline does not apply here).
+      node.shapeAttr.needsUpdate = true;
+    },
+
     setBlend,
 
     setHover(i: number): boolean {
@@ -858,6 +890,7 @@ export function createField(graph: Graph, opts: FieldOpts = {}): Field {
         colorFacet,
         colorColumn,
         colorDensity: densityRamp !== null,
+        shapeFacet,
         tonemap: { op: tonemapOp, exposure: tonemap.uniforms.exposure.value },
         morph: { t: tweens.get('morph'), active: tweens.active() },
         projection,
@@ -1079,4 +1112,18 @@ function paintColors(
   }
   const facet = graph.facets[facetKey]!;
   paintFacetColors(facet.data, n, facetPalette(facet.values.length), out);
+}
+
+/** Fill the per-node `iShape` buffer from a facet's value index: node i's shape is its facet
+ *  code mapped into the seven glyph families (nodes.ts NODE_SHAPES). The map is value index k →
+ *  shape (k mod SHAPE_COUNT) — WRAPPING (not clamping) so a facet with more than seven values
+ *  keeps cycling through distinct glyphs instead of collapsing its whole tail onto 'bar'. A
+ *  null facet leaves every node a disc (0). */
+function paintShapes(graph: Graph, facetKey: string | null, n: number, out: Float32Array): void {
+  if (facetKey === null) {
+    out.fill(0);
+    return;
+  }
+  const codes = graph.facets[facetKey]!.data;
+  for (let i = 0; i < n; i++) out[i] = codes[i]! % SHAPE_COUNT;
 }
