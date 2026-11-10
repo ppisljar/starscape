@@ -93,8 +93,46 @@ export interface NodeLayer {
      *  size — the px clamp pins a distant field at NODE_MIN_PX (2.2), ABOVE the shipped
      *  FLAT_PX of 2, so without the lift the LOD branch never fires at all. */
     flatPx: { value: number };
+    /* ---- glyph style, GLOBAL (same for every node — cheap scalar uniforms, not per-node).
+       All seven were compile-time constants until stage 10; now they are live so the tuning
+       panel's node rows have something to write (Field.setNodeStyle). Defaults are the
+       constants in constants.ts (DESIGN §10 single-source). */
+    /** Solid part of the glyph body, fraction of the sprite radius (default BODY_R). */
+    bodyR: { value: number };
+    /** Halo reach beyond the body, CSS px (default HALO_PX). */
+    haloPx: { value: number };
+    /** Halo strength relative to the body (default HALO_GAIN). */
+    haloGain: { value: number };
+    /** How much the bright centre burns toward white (default CORE_HOT). */
+    coreHot: { value: number };
+    /** Projected radius lower clamp, CSS px (default NODE_MIN_PX). */
+    minPx: { value: number };
+    /** Projected radius upper clamp, CSS px (default NODE_MAX_PX). */
+    maxPx: { value: number };
+    /** Perspective bend on projected size; 1 = true projection (default FALLOFF). */
+    falloff: { value: number };
   };
   dispose(): void;
+}
+
+/** Live glyph-style overrides for the node layer — every field optional, each falling back to
+ *  its constants.ts default. Shared by the build-time boot path (opts.style) and the live
+ *  setter (Field.setNodeStyle). All GLOBAL (one value for the whole field). */
+export interface NodeStyle {
+  /** Solid part of the glyph body, fraction of the sprite radius. */
+  bodyR?: number;
+  /** Halo reach beyond the body, CSS px. */
+  haloPx?: number;
+  /** Halo strength relative to the body. */
+  haloGain?: number;
+  /** How much the bright centre burns toward white. */
+  coreHot?: number;
+  /** Projected radius lower clamp, CSS px. */
+  minPx?: number;
+  /** Projected radius upper clamp, CSS px. */
+  maxPx?: number;
+  /** Perspective bend on projected size; 1 = true projection. */
+  falloff?: number;
 }
 
 /** Build the instanced node quad. `transform` is the shared GPU transform the position is
@@ -118,6 +156,9 @@ export function buildNodeLayer(
     /** The shared highlight roll-off rig (stage 8, ./tonemap) — same instance as the links,
      *  so the two draw calls can never roll off differently. */
     tonemap: TonemapRig;
+    /** Initial glyph-style overrides (boot path — a saved look applied on load). Each field
+     *  falls back to its constants.ts default; live changes go through Field.setNodeStyle. */
+    style?: NodeStyle;
   },
 ): NodeLayer {
   /* ---- geometry: one unit quad, instanced n times. Per-instance data lives in instanced
@@ -149,6 +190,17 @@ export function buildNodeLayer(
   const uFogNear = uniform(opts.fogNear);
   const uFogFar = uniform(opts.fogFar);
   const uFlatPx = uniform(FLAT_PX);
+  /* Glyph-style uniforms, GLOBAL (one value per field, not per node). Each defaults to its
+     constants.ts value (single source) and is overridable at boot via opts.style; all are
+     live — writing .value needs no recompile (Field.setNodeStyle). */
+  const s = opts.style ?? {};
+  const uBodyR = uniform(s.bodyR ?? BODY_R);
+  const uHaloPx = uniform(s.haloPx ?? HALO_PX);
+  const uHaloGain = uniform(s.haloGain ?? HALO_GAIN);
+  const uCoreHot = uniform(s.coreHot ?? CORE_HOT);
+  const uMinPx = uniform(s.minPx ?? NODE_MIN_PX);
+  const uMaxPx = uniform(s.maxPx ?? NODE_MAX_PX);
+  const uFalloff = uniform(s.falloff ?? FALLOFF);
 
   /* ---- vertex stage: world radius → projected px → clamp → world radius at this depth.
      The clamp is done from the REAL projection, so it is exact rather than an approximation
@@ -169,8 +221,8 @@ export function buildNodeLayer(
      scaling only the radius would make hover invisible exactly when it is most needed. */
   const rw = iSize.mul(NODE_SCALE).mul(iBoost);
   const base = rw.mul(uHalfH).div(uTanHalf.mul(uDRef));
-  const px = base.mul(pow(uDRef.div(depth), FALLOFF));
-  const pxc = clamp(px, iBoost.mul(NODE_MIN_PX), iBoost.mul(NODE_MAX_PX));
+  const px = base.mul(pow(uDRef.div(depth), uFalloff));
+  const pxc = clamp(px, iBoost.mul(uMinPx), iBoost.mul(uMaxPx));
   const rWorld = pxc.mul(uTanHalf).mul(depth).div(uHalfH);
 
   /* Varyings: computed per vertex, constant across the quad (so interpolation is a no-op). */
@@ -245,10 +297,10 @@ export function buildNodeLayer(
          radius in CSS px and r runs 0..1 across exactly that, so one pixel is 1/vPx in
          r units; no derivatives required. */
       const e = clamp(float(1.0).div(max(vPx, 1.0)), 0.004, 0.45);
-      const body = smoothstep(float(BODY_R).sub(e), float(BODY_R).add(e), r).oneMinus();
-      const hw = clamp(float(HALO_PX).div(max(vPx, 1.0)), e, max(1.0 - BODY_R, e));
-      const halo = smoothstep(float(BODY_R), float(BODY_R).add(hw), r).oneMinus();
-      const a = body.add(halo.mul(HALO_GAIN).mul(body.oneMinus())).mul(vFog).mul(vAlpha);
+      const body = smoothstep(uBodyR.sub(e), uBodyR.add(e), r).oneMinus();
+      const hw = clamp(uHaloPx.div(max(vPx, 1.0)), e, max(uBodyR.oneMinus(), e));
+      const halo = smoothstep(uBodyR, uBodyR.add(hw), r).oneMinus();
+      const a = body.add(halo.mul(uHaloGain).mul(body.oneMinus())).mul(vFog).mul(vAlpha);
       Discard(a.lessThan(0.004));
 
       /* A small bright centre, not the whole body — with a solid body, reusing `body` here
@@ -256,8 +308,8 @@ export function buildNodeLayer(
          toward the ground as well dims twice (predecessor's measured mistake). The boost
          term (capped, predecessor's `min(vBoost, 1.6)`) burns a hovered/selected core
          hotter, so emphasis reads in colour as well as size. */
-      const hot = smoothstep(0.0, BODY_R * 0.5, r).oneMinus();
-      const c = mix(vColor, vec3(1.0), hot.mul(CORE_HOT).mul(min(vBoost, 1.6)));
+      const hot = smoothstep(0.0, uBodyR.mul(0.5), r).oneMinus();
+      const c = mix(vColor, vec3(1.0), hot.mul(uCoreHot).mul(min(vBoost, 1.6)));
       out.assign(vec4(c, a));
     });
 
@@ -287,6 +339,13 @@ export function buildNodeLayer(
       fogNear: uFogNear,
       fogFar: uFogFar,
       flatPx: uFlatPx,
+      bodyR: uBodyR,
+      haloPx: uHaloPx,
+      haloGain: uHaloGain,
+      coreHot: uCoreHot,
+      minPx: uMinPx,
+      maxPx: uMaxPx,
+      falloff: uFalloff,
     },
     dispose() {
       geo.dispose();

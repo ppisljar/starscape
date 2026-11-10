@@ -59,7 +59,9 @@ import {
   LINK_LEN_SOFT,
 } from './constants';
 import { buildNodeLayer } from './nodes';
+import type { NodeStyle } from './nodes';
 import { buildLinkLayer } from './links';
+import type { LinkStyle } from './links';
 import { createFocus } from './focus';
 import type { FocusOpts } from './focus';
 import { CHAIN_CAP, bakeMix, centroidOf, flattenAxis, packChainIds, spreadPoint } from './morph';
@@ -99,6 +101,13 @@ export interface FieldOpts {
   flatAxis?: 0 | 1 | 2;
   /** Default morph/projection tween duration, seconds. Default MORPH_DURATION. */
   morphDuration?: number;
+  /** Initial GLYPH style (boot path, so a saved look applies on load): the solid-body
+   *  fraction, halo width/strength, core heat, px clamp rails and the distance falloff. Each
+   *  field falls back to its constants.ts default; all are live afterwards via setNodeStyle. */
+  nodeStyle?: NodeStyle;
+  /** Initial LINK style (boot path): the long-edge fade length (fraction of the diagonal) and
+   *  the floor the longest edges keep. Defaults from constants.ts; live via setLinkStyle. */
+  linkStyle?: LinkStyle;
 }
 
 export interface FieldStats {
@@ -171,6 +180,21 @@ export interface Field {
    *  notch (quality.ts) must lift this OVER the clamp floor before the branch fires at all.
    *  A simplification, not a cull — nothing is dropped, so no stats row (§10.4). */
   setFlatPx(px: number): void;
+  /** Node GLYPH style — the seven knobs that were compile-time constants until stage 10, all
+   *  GLOBAL (one value for the whole field) and all live (a uniform `.value` write, no
+   *  recompile, like setFov/setFlatPx): the solid-body fraction (`bodyR`), halo width in CSS
+   *  px (`haloPx`) and strength (`haloGain`), how hot the core burns (`coreHot`), the
+   *  projected-radius clamp rails in CSS px (`minPx`/`maxPx`) and the perspective falloff
+   *  (`falloff`, 1 = true projection). Pass only the fields you are changing; omitted (or
+   *  non-finite) fields are left untouched. Note the px clamp is also baked into the picker's
+   *  hit disc (pick/grid.ts constants) — moving `minPx`/`maxPx`/`falloff` far from their
+   *  defaults drifts the clickable disc from the drawn one. */
+  setNodeStyle(style: NodeStyle): void;
+  /** Link style — the long-edge fade. `lenSoft` is the fade length as a FRACTION of the field
+   *  diagonal (the field multiplies by its diagonal internally, matching LINK_LEN_SOFT);
+   *  `lenFloor` (0..1) is the fraction of itself the longest edge keeps. Both live uniform
+   *  writes. Pass only the fields you are changing. */
+  setLinkStyle(style: LinkStyle): void;
   /** Hover node i (-1 clears): lights it, its CSR neighbourhood and its incident links.
    *  Repaints only the hovered degree — never the whole colour buffer (DESIGN.md §6).
    *  Returns true when the state actually changed. */
@@ -411,7 +435,9 @@ export function createField(graph: Graph, opts: FieldOpts = {}): Field {
   const link = buildLinkLayer(graph.links, transform, {
     fogNear: diagonal * FOG_NEAR * 0.8,
     fogFar: diagonal * FOG_FAR * 0.9,
-    lenSoft: diagonal * LINK_LEN_SOFT,
+    // lenSoft is a FRACTION of the diagonal (constant or boot override) → world length here.
+    lenSoft: diagonal * (opts.linkStyle?.lenSoft ?? LINK_LEN_SOFT),
+    lenFloor: opts.linkStyle?.lenFloor,
     tonemap,
   });
 
@@ -517,6 +543,7 @@ export function createField(graph: Graph, opts: FieldOpts = {}): Field {
     fogNear: diagonal * FOG_NEAR,
     fogFar: diagonal * FOG_FAR,
     tonemap,
+    style: opts.nodeStyle,
   });
 
   const totalLinks = graph.links.length >> 1;
@@ -734,6 +761,34 @@ export function createField(graph: Graph, opts: FieldOpts = {}): Field {
         throw new Error(`setFlatPx: threshold must be finite and >= 0, got ${px}`);
       }
       node.uniforms.flatPx.value = px;
+    },
+
+    setNodeStyle(style: NodeStyle): void {
+      // Each knob is a live GLOBAL uniform (§10): write the ones supplied, skip the rest. A
+      // non-finite slip would blank the whole field (one bad uniform poisons every glyph), so
+      // guard each — a defensive no-op is cheaper than a black screen.
+      const u = node.uniforms;
+      const set = (slot: { value: number }, v: number | undefined): void => {
+        if (v !== undefined && Number.isFinite(v)) slot.value = v;
+      };
+      set(u.bodyR, style.bodyR);
+      set(u.haloPx, style.haloPx);
+      set(u.haloGain, style.haloGain);
+      set(u.coreHot, style.coreHot);
+      set(u.minPx, style.minPx);
+      set(u.maxPx, style.maxPx);
+      set(u.falloff, style.falloff);
+    },
+
+    setLinkStyle(style: LinkStyle): void {
+      // lenSoft arrives as a FRACTION of the diagonal (matching LINK_LEN_SOFT and the config
+      // key) → world length, the same conversion as at build. lenFloor is a bare 0..1.
+      if (style.lenSoft !== undefined && Number.isFinite(style.lenSoft)) {
+        link.uniforms.lenSoft.value = diagonal * style.lenSoft;
+      }
+      if (style.lenFloor !== undefined && Number.isFinite(style.lenFloor)) {
+        link.uniforms.lenFloor.value = style.lenFloor;
+      }
     },
 
     stats(): FieldStats {

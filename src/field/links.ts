@@ -58,12 +58,27 @@ export interface LinkLayer {
   uniforms: {
     fogNear: { value: number };
     fogFar: { value: number };
-    /** World length over which a link's alpha eases to LINK_LEN_FLOOR of itself. */
+    /** World length over which a link's alpha eases to `lenFloor` of itself. Live (stage 10):
+     *  the tuning panel's "long-edge fade over" row writes it (Field.setLinkStyle). */
     lenSoft: { value: number };
+    /** The fraction of itself a maximally-long link's alpha keeps — the floor the fade eases
+     *  to (default LINK_LEN_FLOOR). Was a compile-time constant until stage 10; now live so
+     *  the "longest edges keep" panel row has something to write (Field.setLinkStyle). */
+    lenFloor: { value: number };
   };
   /** Draw the first k links of the ordered buffer (vertices = 2k). */
   setDrawCount(links: number): void;
   dispose(): void;
+}
+
+/** Live style overrides for the link layer — both fields optional, falling back to defaults.
+ *  Shared by the boot path (buildLinkLayer opts) and the live setter (Field.setLinkStyle). */
+export interface LinkStyle {
+  /** Long-edge fade length, as a FRACTION of the field diagonal (default LINK_LEN_SOFT). The
+   *  field multiplies by its diagonal before writing the world-length uniform. */
+  lenSoft?: number;
+  /** The fraction of itself the longest edge keeps, 0..1 (default LINK_LEN_FLOOR). */
+  lenFloor?: number;
 }
 
 /** Build the batched line list. `links` is the importance-ordered 2m buffer from buildGraph
@@ -77,6 +92,9 @@ export function buildLinkLayer(
     fogNear: number;
     fogFar: number;
     lenSoft: number;
+    /** Initial long-link fade floor (boot path); defaults to LINK_LEN_FLOOR. Live changes go
+     *  through Field.setLinkStyle. */
+    lenFloor?: number;
     /** The shared highlight roll-off rig (stage 8, ./tonemap) — same instance as the nodes,
      *  so the two draw calls can never roll off differently. */
     tonemap: TonemapRig;
@@ -106,6 +124,7 @@ export function buildLinkLayer(
   const uFogNear = uniform(opts.fogNear);
   const uFogFar = uniform(opts.fogFar);
   const uLenSoft = uniform(opts.lenSoft);
+  const uLenFloor = uniform(opts.lenFloor ?? LINK_LEN_FLOOR);
 
   /* Vertex stage: pull both endpoints, place this one. The long-link fade reads the LIVE
      base-space separation scaled by the spread uniform, so a spread field fades like the
@@ -123,7 +142,7 @@ export function buildLinkLayer(
   );
 
   const lColor = varying(vec4(attribute('lColor', 'vec4')));
-  const lenFade = varying(mix(1.0, LINK_LEN_FLOOR, clamp(liveLen.div(uLenSoft), 0.0, 1.0)));
+  const lenFade = varying(mix(1.0, uLenFloor, clamp(liveLen.div(uLenSoft), 0.0, 1.0)));
   const vFog = varying(
     clamp(positionView.z.negate().sub(uFogNear).div(max(uFogFar.sub(uFogNear), 1.0)), 0.0, 1.0)
       .oneMinus(),
@@ -151,7 +170,7 @@ export function buildLinkLayer(
     material,
     colors,
     colorAttr,
-    uniforms: { fogNear: uFogNear, fogFar: uFogFar, lenSoft: uLenSoft },
+    uniforms: { fogNear: uFogNear, fogFar: uFogFar, lenSoft: uLenSoft, lenFloor: uLenFloor },
     setDrawCount(count: number) {
       geo.setDrawRange(0, count * 2);
     },

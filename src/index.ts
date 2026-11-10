@@ -17,6 +17,8 @@ export type { Facet, Graph, GraphInput, NumericColumn } from './core/types';
 
 export { createField, MORPH_DURATION } from './field/field';
 export type { Field, FieldOpts, FieldStats } from './field/field';
+export type { NodeStyle } from './field/nodes';
+export type { LinkStyle } from './field/links';
 export {
   CHAIN_CAP,
   bakeMix,

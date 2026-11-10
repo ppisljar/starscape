@@ -2,6 +2,8 @@
  * renderer, its pure parts, and the GPU morph/frame-chain/spread machinery. */
 export { createField, MORPH_DURATION } from './field';
 export type { Field, FieldOpts, FieldStats } from './field';
+export type { NodeStyle } from './nodes';
+export type { LinkStyle } from './links';
 export {
   CHAIN_CAP,
   bakeMix,
