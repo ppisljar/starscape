@@ -57,32 +57,38 @@ export const VISUAL_PRESETS = {
 
   nebula: {
     label: 'nebula',
-    note: 'the signature look — black ground, additive glyphs SUMMING in an HDR buffer, a screen-space bloom carrying the glow, and the accumulated blaze rolled off POST-SUM to a true black. Reinhard, not agx: agx lifts small values off zero and greys the negative space, where reinhard maps 0→0 and keeps the space between clusters truly black. Colour is cool→hot BY DEGREE (the `nebula` ramp), so crowded hubs burn white-orange cores while leaves stay blue. The consumer turns the glow on when this look is picked; the bloom is what makes it a nebula rather than a white blob.',
+    note: 'the signature look — black ground, additive glyphs SUMMING in an HDR buffer, a screen-space bloom carrying the glow, and the accumulated blaze rolled off POST-SUM to a true black. Reinhard, not agx: agx lifts small values off zero and greys the negative space, where reinhard maps 0→0 and keeps the space between clusters truly black. Colour is LOCAL SPATIAL DENSITY through the cool→hot→white `iceFire` ramp (field/density.ts): a node is blue where its NEIGHBOURHOOD is sparse and hot where it is crowded, white at the densest cores — the #4/#5 reference recipe. This is a geometric signal degree cannot stand in for: additive blending sums hues, so a degree ramp loses the spatial gradient in every pile, while density paints it directly. Pure #000 ground, a TIGHT bloom, high size contrast (big hubs, small leaves), links taking their endpoints’ (so cool/blue) hue. The consumer turns the glow on when this look is picked; the bloom is what makes it a nebula rather than a white blob.',
     set: {
-      background: 'dark',
+      // A TRUE black ground (BG_BLACK): BG_DARK’s #05070d lifts to grey under additive, where
+      // #4/#5 is pure #000 between the clusters. Reinhard’s 0→0 black point keeps it there.
+      background: 'black',
       blend: 'additive',
       // The post-sum roll-off (the bloom chain applies it once over the whole accumulated
       // field). Reinhard for a clean black point — see the note; agx washed the negative space.
       tonemap: 'reinhard',
-      // Deliberately LOW: the roll-off runs once over the entire additive SUM, which is large,
-      // so a low gain is what keeps the sparse field black and lets only the dense cores bloom
-      // bright. A per-fragment look would want ~1; this is the whole-field post value. Tuned on
-      // a 1M synth corpus against the reference nebula.
-      exposure: 0.11,
+      // VERY LOW: the roll-off runs once over the entire additive SUM, which is large, so a low
+      // gain is what keeps the sparse blue field dark and lets only the dense cores bloom hot.
+      // Lower than the old 0.11 because the density channel lights more of the field (every
+      // sparse node carries a real blue, not a near-black floor) — the floor is 0.01. Tuned on
+      // the 1M synth against #4/#5.
+      exposure: 0.03,
       // Sublinear highlight compression (post/bloom.ts, PRE-bloom): additive accumulation makes
-      // a spiral core ~2000× brighter than the sparse arms, which a single exposure cannot
-      // serve — the core clips to a flat white disc while the arms go black. A moderate value
-      // crushes that density dynamic range HUE-FIRST before the bloom, so the core shows its
-      // internal structure and the lifted arms bloom. Tuned on the 1M synth spiral; 0 reproduces
-      // the old blown look exactly.
-      compression: 0.6,
-      // colour is the degree column through the cool→hot `nebula` ramp (rank-normalised, the
-      // field's setColorColumn): importance IS the hue, so hubs read warm and leaves blue — the
-      // reference's palette, reproduced by data rather than painted. (Additive summing only keeps
-      // the hue where the per-pixel density is low — the sparse cluster edges; dense cores blow to
-      // a white bloom, exactly as the reference's hot centres do.)
-      colorMode: 'column',
-      ramp: 'nebula',
+      // a dense core thousands of times brighter than the sparse arms, which a single exposure
+      // cannot serve — the core clips to a flat white disc while the arms go black. A strong
+      // value crushes that density dynamic range HUE-FIRST before the bloom, so the core shows its
+      // internal structure and the lifted arms bloom; stronger than the old 0.6 because the
+      // density ramp’s own white top makes the cores even hotter. 0 reproduces the old blown look.
+      compression: 0.7,
+      // colour is LOCAL SPATIAL DENSITY through the cool→hot→white `iceFire` ramp (the field’s
+      // setColorByDensity): the neighbourhood’s crowding IS the hue, so an isolated node reads
+      // BLUE however bright it is, and only genuinely dense cores go orange→white. The geometric
+      // signal degree cannot paint under additive blending — see the note.
+      colorMode: 'density',
+      ramp: 'iceFire',
+      // Big hubs, small leaves (the #5 contrast): a steep size curve keeps the mass of the field
+      // sub-pixel dust and lets only the top ranks grow — the reference’s discrete points of
+      // widely varying size, rather than a uniform spray.
+      sizeCurve: 1.6,
       // TINY bright additive dots, NOT big halos: at 1M zoomed out every glyph is a sub-pixel
       // additive point and the BLOOM, not a per-node halo, carries the glow. Big halos (the
       // predecessor's instinct) pile into a solid white sheet at this density — the exact blob the
@@ -96,7 +102,9 @@ export const VISUAL_PRESETS = {
       bodyR: 0.5,
       haloPx: 4,
       falloff: 1.0,
-      linkBase: 0.03,
+      // Links take their endpoints’ density hue, so in the sparse periphery they are thin cool
+      // filaments (the #5 network look); a touch more resting alpha than the old 0.03 so they read.
+      linkBase: 0.05,
       lenSoft: 0.1,
       lenFloor: 0.02,
     },

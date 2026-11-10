@@ -82,6 +82,16 @@ describe('rampAt (predecessor sampler, values verbatim)', () => {
     expect(hot[0]).toBeGreaterThan(hot[2]); // hot end: red dominates blue (hubs)
   });
 
+  it('ships the iceFire density ramp (blue sparse → orange dense → white cores)', () => {
+    expect(RAMP_NAMES).toContain('iceFire');
+    const cool = rampAt('iceFire', 0);
+    const hot = rampAt('iceFire', 0.75);
+    const top = rampAt('iceFire', 1);
+    expect(cool[2]).toBeGreaterThan(cool[0]); // sparse end: blue dominates red
+    expect(hot[0]).toBeGreaterThan(hot[2]); // dense end: red/orange dominates blue
+    for (const c of top) expect(c).toBeCloseTo(1, 2); // densest cores: white
+  });
+
   it('ships the viridis-like ramp alongside the predecessor set', () => {
     expect(RAMP_NAMES).toContain('viridis');
     expect(RAMPS.viridis.length).toBeGreaterThanOrEqual(5);
@@ -277,7 +287,7 @@ describe('visual presets (diffs from defaults — §7)', () => {
     expect(set.haloGain as number).toBeLessThan(0.1); // no glow — the look's actual mechanism
   });
 
-  it('nebula: additive + reinhard (true black) + hot cores + degree ramp', () => {
+  it('nebula: additive + reinhard (true black) + hot cores + local-density colour', () => {
     const set = VISUAL_PRESETS.nebula.set;
     expect(set.blend).toBe('additive');
     // reinhard, not agx: the bloom post-pass applies the roll-off post-sum, and reinhard's 0→0
@@ -285,9 +295,12 @@ describe('visual presets (diffs from defaults — §7)', () => {
     expect(set.tonemap).toBe('reinhard');
     expect(set.coreHot).toBeGreaterThanOrEqual(0.9);
     expect(set.haloGain as number).toBeGreaterThan(1); // the hot halo that seeds the bloom up close
-    // cool→hot BY DEGREE is the look's defining colour decision (the `nebula` ramp).
-    expect(set.colorMode).toBe('column');
-    expect(set.ramp).toBe('nebula');
+    // a pure-#000 ground: BG_DARK lifts to grey under additive, the reference is true black.
+    expect(set.background).toBe('black');
+    // cool→hot by LOCAL SPATIAL DENSITY is the look's defining colour decision — the geometric
+    // signal degree cannot paint under additive blending (field/density.ts + the iceFire ramp).
+    expect(set.colorMode).toBe('density');
+    expect(set.ramp).toBe('iceFire');
   });
 
   it('blueprint: a single hue', () => {
