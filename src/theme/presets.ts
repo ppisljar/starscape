@@ -69,6 +69,13 @@ export const VISUAL_PRESETS = {
       // bright. A per-fragment look would want ~1; this is the whole-field post value. Tuned on
       // a 1M synth corpus against the reference nebula.
       exposure: 0.11,
+      // Sublinear highlight compression (post/bloom.ts, PRE-bloom): additive accumulation makes
+      // a spiral core ~2000× brighter than the sparse arms, which a single exposure cannot
+      // serve — the core clips to a flat white disc while the arms go black. A moderate value
+      // crushes that density dynamic range HUE-FIRST before the bloom, so the core shows its
+      // internal structure and the lifted arms bloom. Tuned on the 1M synth spiral; 0 reproduces
+      // the old blown look exactly.
+      compression: 0.6,
       // colour is the degree column through the cool→hot `nebula` ramp (rank-normalised, the
       // field's setColorColumn): importance IS the hue, so hubs read warm and leaves blue — the
       // reference's palette, reproduced by data rather than painted. (Additive summing only keeps

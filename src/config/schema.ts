@@ -168,13 +168,20 @@ export const SCHEMA: readonly SchemaRow[] = [
   { group: 'colour', key: 'background', label: 'ground', kind: 'select', options: BACKGROUNDS, default: 'dark', unit: 'none' },
   { group: 'colour', key: 'palette', label: 'palette', kind: 'select', options: PALETTES, default: 'golden', unit: 'none' },
   { group: 'colour', key: 'blend', label: 'blending', kind: 'select', options: BLENDS, default: 'normal', unit: 'none' },
-  { group: 'colour', key: 'tonemap', label: 'highlight roll-off', kind: 'select', options: TONEMAPS, default: 'none', unit: 'none' },
+  { group: 'colour', key: 'tonemap', label: 'tone curve', kind: 'select', options: TONEMAPS, default: 'none', unit: 'none' },
   /* The ramp serves the 'column' colour mode (theme/palettes.ts RAMPS — a NUMBER to a colour;
      categorical facets keep discrete palettes, a ramp would imply an order they lack). */
   { group: 'colour', key: 'ramp', label: 'colour ramp', kind: 'select', options: RAMP_NAMES, default: DEFAULT_RAMP, unit: 'none' },
   /* Pre-curve gain, applied before the roll-off and ONLY when an operator is on (op 'none'
      is a true bypass — field/tonemap.ts). floor: setTonemap throws on exposure ≤ 0. */
   { group: 'colour', key: 'exposure', label: 'exposure', kind: 'range', min: 0.1, max: 4, step: 0.05, default: EXPOSURE_DEFAULT, unit: 'none', floor: 0 },
+  /* Sublinear highlight compression on the accumulated additive HDR, applied PRE-bloom in the
+     post chain (post/bloom.ts). 0 is off — an exact linear pass-through, today's look — and 1
+     the strongest roll-off: it curves luminance by pow(L, g) (hue preserved) so a dense core
+     stops blowing out to a flat white disc while the lifted sparse arms bloom. Only the bloom
+     post-process reads it; with the glow off it has no effect. Distinct from 'tone curve' above
+     (the post-SUM operator) — this crushes the density dynamic range BEFORE the bloom sees it. */
+  { group: 'colour', key: 'compression', label: 'highlight compression', kind: 'range', min: 0, max: 1, step: 0.05, default: 0, unit: 'none' },
 
   /* ---- the links: alphas (field/constants + focus) and the budget fraction. -------------- */
   { group: 'links', key: 'linkBase', label: 'resting', kind: 'range', min: 0, max: 0.4, step: 0.002, default: LINK_BASE_ALPHA, unit: 'none' },
