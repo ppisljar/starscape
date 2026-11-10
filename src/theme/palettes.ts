@@ -53,6 +53,18 @@ export const RAMPS = {
     [0.95, 0.45, 0.1],
     [1.0, 0.9, 0.55],
   ],
+  /* cool→hot by degree — the nebula look's defining ramp (§7 "hot-by-degree"). Low-degree
+   * leaves are a cool blue, high-degree hubs a hot orange that, where they crowd and SUM under
+   * additive blending, bloom and tonemap into the white-orange dense core of the reference. The
+   * stops are chosen so the BULK of the field (low ranks) reads blue and only the rare high-rank
+   * hubs go warm — the rank-normalised channel (rampColors) already pushes the mass toward 0. */
+  nebula: [
+    [0.16, 0.36, 0.86],
+    [0.26, 0.56, 0.98],
+    [0.62, 0.68, 0.95],
+    [0.98, 0.56, 0.22],
+    [1.0, 0.86, 0.58],
+  ],
   spectral: [
     [0.23, 0.07, 0.4],
     [0.13, 0.42, 0.66],

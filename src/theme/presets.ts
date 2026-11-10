@@ -57,23 +57,38 @@ export const VISUAL_PRESETS = {
 
   nebula: {
     label: 'nebula',
-    note: 'black-ground additive glow with hot cores — big soft halos SUM past white where nodes crowd, and agx rolls the blaze off while keeping its hue',
+    note: 'the signature look — black ground, additive glyphs SUMMING in an HDR buffer, a screen-space bloom carrying the glow, and the accumulated blaze rolled off POST-SUM to a true black. Reinhard, not agx: agx lifts small values off zero and greys the negative space, where reinhard maps 0→0 and keeps the space between clusters truly black. Colour is cool→hot BY DEGREE (the `nebula` ramp), so crowded hubs burn white-orange cores while leaves stay blue. The consumer turns the glow on when this look is picked; the bloom is what makes it a nebula rather than a white blob.',
     set: {
       background: 'dark',
       blend: 'additive',
-      tonemap: 'agx',
-      exposure: 1.8,
-      // A BIG soft sprite with a TINY hot core, not a tiny speck: large overlapping halos
-      // reproduce the reference's MECHANISM (overlap → brightness) at any corpus density —
-      // the predecessor measured the literal "tiny bright specks" reading as grey mush.
-      nodeScale: 2.8,
-      nodeMinPx: 5,
-      nodeMaxPx: 300,
+      // The post-sum roll-off (the bloom chain applies it once over the whole accumulated
+      // field). Reinhard for a clean black point — see the note; agx washed the negative space.
+      tonemap: 'reinhard',
+      // Deliberately LOW: the roll-off runs once over the entire additive SUM, which is large,
+      // so a low gain is what keeps the sparse field black and lets only the dense cores bloom
+      // bright. A per-fragment look would want ~1; this is the whole-field post value. Tuned on
+      // a 1M synth corpus against the reference nebula.
+      exposure: 0.11,
+      // colour is the degree column through the cool→hot `nebula` ramp (rank-normalised, the
+      // field's setColorColumn): importance IS the hue, so hubs read warm and leaves blue — the
+      // reference's palette, reproduced by data rather than painted. (Additive summing only keeps
+      // the hue where the per-pixel density is low — the sparse cluster edges; dense cores blow to
+      // a white bloom, exactly as the reference's hot centres do.)
+      colorMode: 'column',
+      ramp: 'nebula',
+      // TINY bright additive dots, NOT big halos: at 1M zoomed out every glyph is a sub-pixel
+      // additive point and the BLOOM, not a per-node halo, carries the glow. Big halos (the
+      // predecessor's instinct) pile into a solid white sheet at this density — the exact blob the
+      // bloom exists to replace. The hot-core + halo terms below only fire when you fly IN
+      // (non-flat glyphs), giving each near node a bright centre that seeds the bloom up close.
+      nodeScale: 1.0,
+      nodeMinPx: 1.3,
+      nodeMaxPx: 280,
       coreHot: 0.95,
-      haloGain: 1.7,
-      bodyR: 0.22,
-      haloPx: 11,
-      falloff: 1.1,
+      haloGain: 1.2,
+      bodyR: 0.5,
+      haloPx: 4,
+      falloff: 1.0,
       linkBase: 0.03,
       lenSoft: 0.1,
       lenFloor: 0.02,

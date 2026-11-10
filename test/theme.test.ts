@@ -74,6 +74,14 @@ describe('rampAt (predecessor sampler, values verbatim)', () => {
     for (const c of mid) expect(c).toBeCloseTo(0.5, 10);
   });
 
+  it('ships the cool→hot nebula ramp (blue leaves → orange/white hubs)', () => {
+    expect(RAMP_NAMES).toContain('nebula');
+    const cool = rampAt('nebula', 0);
+    const hot = rampAt('nebula', 1);
+    expect(cool[2]).toBeGreaterThan(cool[0]); // cool end: blue dominates red (leaves)
+    expect(hot[0]).toBeGreaterThan(hot[2]); // hot end: red dominates blue (hubs)
+  });
+
   it('ships the viridis-like ramp alongside the predecessor set', () => {
     expect(RAMP_NAMES).toContain('viridis');
     expect(RAMPS.viridis.length).toBeGreaterThanOrEqual(5);
@@ -269,12 +277,17 @@ describe('visual presets (diffs from defaults — §7)', () => {
     expect(set.haloGain as number).toBeLessThan(0.1); // no glow — the look's actual mechanism
   });
 
-  it('nebula: additive + agx + hot cores', () => {
+  it('nebula: additive + reinhard (true black) + hot cores + degree ramp', () => {
     const set = VISUAL_PRESETS.nebula.set;
     expect(set.blend).toBe('additive');
-    expect(set.tonemap).toBe('agx');
+    // reinhard, not agx: the bloom post-pass applies the roll-off post-sum, and reinhard's 0→0
+    // black point keeps the negative space black where agx lifts it to grey (measured on 1M).
+    expect(set.tonemap).toBe('reinhard');
     expect(set.coreHot).toBeGreaterThanOrEqual(0.9);
-    expect(set.haloGain as number).toBeGreaterThan(1); // the overlap that sums past white
+    expect(set.haloGain as number).toBeGreaterThan(1); // the hot halo that seeds the bloom up close
+    // cool→hot BY DEGREE is the look's defining colour decision (the `nebula` ramp).
+    expect(set.colorMode).toBe('column');
+    expect(set.ramp).toBe('nebula');
   });
 
   it('blueprint: a single hue', () => {
