@@ -113,6 +113,61 @@ export const RAMPS = {
     [0.42, 0.298, 0.502],
     [0.49, 0.42, 0.365],
   ],
+  /* ---- character ramps (stage F3) — full-spectrum sweeps and single-hue / diverging themes, for
+   * the SPATIAL facet gradient above all: projecting centroids onto one axis sweeps t uniformly
+   * across [0,1], so a ramp that spans the whole spectrum paints reds, greens and blues (and
+   * everything between) across the field. They are ordinary RampStops, so they serve the column /
+   * density channels identically. */
+  /* rainbow — a bright, fully-saturated hue sweep red→orange→yellow→green→cyan→blue→violet (the HSV
+   * wheel at S=V=1, hues 0/30/60/120/180/240/285). The full visible spectrum; "reds, greens, blues
+   * and everything in between" in one ramp. */
+  rainbow: [
+    [1.0, 0.0, 0.0],
+    [1.0, 0.5, 0.0],
+    [1.0, 1.0, 0.0],
+    [0.0, 1.0, 0.0],
+    [0.0, 1.0, 1.0],
+    [0.0, 0.0, 1.0],
+    [0.78, 0.0, 1.0],
+  ],
+  /* pastel — the same red→violet hue sweep but soft (≈S 0.3, V 1): the full spectrum desaturated
+   * toward white, for a gentle gradient that still names every hue. */
+  pastel: [
+    [1.0, 0.7, 0.72],
+    [1.0, 0.85, 0.65],
+    [1.0, 1.0, 0.72],
+    [0.72, 1.0, 0.74],
+    [0.7, 0.95, 1.0],
+    [0.73, 0.78, 1.0],
+    [0.88, 0.72, 1.0],
+  ],
+  /* blues — single-hue sequential, dark navy → pale blue (ColorBrewer "Blues", dark→light). */
+  blues: [
+    [0.03, 0.11, 0.35],
+    [0.13, 0.31, 0.62],
+    [0.26, 0.52, 0.78],
+    [0.55, 0.74, 0.9],
+    [0.87, 0.95, 1.0],
+  ],
+  /* reds — single-hue sequential, dark maroon → red → orange → pale peach (ColorBrewer "OrRd",
+   * dark→light). */
+  reds: [
+    [0.25, 0.0, 0.0],
+    [0.65, 0.07, 0.05],
+    [0.9, 0.25, 0.1],
+    [1.0, 0.55, 0.25],
+    [1.0, 0.87, 0.72],
+  ],
+  /* coolwarm — diverging blue ↔ near-white ↔ red (Moreland's smooth cool-warm, ParaView/matplotlib
+   * 'coolwarm'): the "blues and reds" map, cool at one end of the field and hot at the other with a
+   * light pivot in the middle. */
+  coolwarm: [
+    [0.23, 0.3, 0.75],
+    [0.56, 0.69, 0.96],
+    [0.95, 0.95, 0.95],
+    [0.96, 0.6, 0.48],
+    [0.71, 0.02, 0.15],
+  ],
 } as const satisfies Record<string, RampStops>;
 
 export type RampName = keyof typeof RAMPS;
