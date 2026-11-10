@@ -145,6 +145,13 @@ export interface Field {
   resize(heightCss: number): void;
   /** Report a camera fov change (degrees). */
   setFov(fov: number): void;
+  /** Scale how far the field fades out — the depth haze that decides how far you can see.
+   *  The node/link fog near+far planes become their creation defaults (derived from the
+   *  field diagonal) × `mult`; 1 is the default, larger sees further. Returns the resulting
+   *  near/far world distances so the caller can push its own camera far-plane past `far`
+   *  (the camera is the consumer's — the field only owns the haze). Live uniform write, no
+   *  recompile. */
+  setViewDistance(mult: number): { near: number; far: number };
   /** Flat-glyph threshold, CSS px (stage 9 LOD): glyphs projected under this draw the cheap
    *  no-halo branch. The px clamp pins a distant field at NODE_MIN_PX, so the boot quality
    *  notch (quality.ts) must lift this OVER the clamp floor before the branch fires at all.
@@ -662,6 +669,19 @@ export function createField(graph: Graph, opts: FieldOpts = {}): Field {
 
     setFov(f: number): void {
       node.uniforms.tanHalf.value = Math.tan((f * Math.PI) / 360);
+    },
+
+    setViewDistance(mult: number): { near: number; far: number } {
+      const m = Number.isFinite(mult) && mult > 0 ? mult : 1;
+      // nodes fade over [diagonal·FOG_NEAR, diagonal·FOG_FAR]; links fade a touch nearer
+      // (×0.8/×0.9, as at creation) so edges recede before the dots they connect.
+      const near = diagonal * FOG_NEAR * m;
+      const far = diagonal * FOG_FAR * m;
+      node.uniforms.fogNear.value = near;
+      node.uniforms.fogFar.value = far;
+      link.uniforms.fogNear.value = diagonal * FOG_NEAR * 0.8 * m;
+      link.uniforms.fogFar.value = diagonal * FOG_FAR * 0.9 * m;
+      return { near, far };
     },
 
     setFlatPx(px: number): void {
