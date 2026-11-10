@@ -91,4 +91,19 @@ describe('package.json — the consumable surface (§8)', () => {
       expect(a.facets[key], `synth facet "${key}" must exist`).toBeDefined();
     }
   });
+
+  /* The HDR bloom post-process (DESIGN.md §5 tier-3) is part of the surface: a consumer drops
+   * post.render() into its loop in place of renderer.render. Same contract as above — the barrel
+   * is what the build compiles into the root export, so asserting on it asserts on what ships.
+   * Only the FACTORY is touched here (typeof): createPostProcess needs a live renderer to run,
+   * which is a browser/GPU concern the headless suite deliberately leaves to in-browser checks. */
+  it('exports the bloom post-process (createPostProcess) at the root', async () => {
+    const surface = (await import('../src/index')) as Record<string, unknown>;
+    expect(
+      typeof surface['createPostProcess'],
+      'createPostProcess must be on the package surface (DESIGN §5 tier-3 post-sum pass)',
+    ).toBe('function');
+    // it takes (renderer, scene, camera, opts) — the four-arg helper shape the app installs
+    expect((surface['createPostProcess'] as (...a: unknown[]) => unknown).length).toBe(3);
+  });
 });

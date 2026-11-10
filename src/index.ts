@@ -176,6 +176,13 @@ export type { VisualPreset, VisualPresetName } from './theme/presets';
 export { createTonemap, tonemapRGB, EXPOSURE_DEFAULT, OP_INDEX, TONEMAP_OPS } from './field/tonemap';
 export type { TonemapOp, TonemapRig } from './field/tonemap';
 
+/* ---- the HDR bloom post-process (DESIGN.md §5 "tier-3 post-sum pass reusing the tonemap
+ * curves"): a helper the CONSUMER installs — scene → additive HDR buffer → bloom → one post-sum
+ * tonemap → screen — replacing renderer.render in the loop with post.render(). The library owns
+ * no renderer or render target (§5), so this is deliberately a helper, not a field method. */
+export { createPostProcess } from './post/bloom';
+export type { BloomParams, PostProcess, PostProcessOpts } from './post/bloom';
+
 /* ---- the synth corpus generator (src/synth/) --------------------------------------------
  * Deterministic 10²…10⁶-node corpora from (n, seed) alone — the demo's and the tests' fuel,
  * exported so an external consumer can exercise its own integration at sizes no real dataset
