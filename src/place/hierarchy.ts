@@ -31,10 +31,10 @@
  *   - a `groupBy` naming no facet throws, naming the known facets;
  *   - a missing `groupBy` on a non-leaf level (or a stray one on the leaf) throws;
  *   - a child radius exceeding its parent's is scaled into it and counted in
- *     `stats.radiusScaled`, never silently. (Backstop: under the default policy it cannot
+ *     `stats.radiusScaled`, never silently. (Under the DEFAULT radius policy it cannot
  *     fire — a child's node count never exceeds its parent's and both share one floor, so
- *     child ≤ parent always — but a future per-level radius override must hit a guard,
- *     not a silent overlap.)
+ *     child ≤ parent always — but a level's `radiusScale` override CAN push a child past
+ *     its parent, and then this guard engages rather than silently overlapping.)
  */
 
 import type { Graph } from '../core/types';
@@ -75,6 +75,16 @@ export interface LevelSpec {
   place: PlacementSpec | { preset: string };
   /** Optional rotating frame about this level's group pivots (§3.5). */
   spin?: SpinSpec;
+  /** Scale applied to this level's computed group radii — AFTER the `spacing × count^⅓`
+   *  policy (floor included), BEFORE the parent-fit guard, so a scale large enough to
+   *  push a child past its parent is clamped into it and counted in `stats.radiusScaled`
+   *  rather than overlapping silently. Scaling a level's radius is how far apart the
+   *  things INSIDE its groups sit (child group centres, or leaf nodes): < 1 packs them
+   *  around the group centre, > 1 spreads them. Default 1; must be finite and > 0.
+   *  Like `spin`, it is forbidden on the leaf level of a multi-level hierarchy (the leaf
+   *  creates no pivots of its own to scale — scale the level whose groupBy makes the
+   *  groups); a single-level hierarchy's synthetic whole-field group is the exception. */
+  radiusScale?: number;
 }
 
 export interface HierarchyOpts {
@@ -200,6 +210,7 @@ export function compileHierarchy(
   /* ---- validate every level up front: a typo in level 5 must not come up only after
    * levels 0–4 placed half the field. Spin axes are normalised here, once per level. */
   const placeSpecs: PlacementSpec[] = [];
+  const radiusScaleOf = new Float64Array(L).fill(1);
   const spinAxis = new Float64Array(L * 3);
   const spinRate = new Float64Array(L);
   const hasSpin = new Uint8Array(L);
@@ -228,6 +239,21 @@ export function compileHierarchy(
       }
     }
     placeSpecs.push(resolvePlace(lv.place));
+    const rs = lv.radiusScale;
+    if (rs !== undefined) {
+      if (k === leafIndex && L > 1) {
+        throw new Error(
+          'compileHierarchy: radiusScale on the leaf level has no pivot of its own to ' +
+            'scale — put it on the level whose groupBy creates the groups it should resize',
+        );
+      }
+      if (!Number.isFinite(rs) || rs <= 0) {
+        throw new Error(
+          `compileHierarchy: level ${k} radiusScale must be finite and > 0, got ${rs}`,
+        );
+      }
+      radiusScaleOf[k] = rs;
+    }
     spinAxis[k * 3 + 1] = 1; // default axis: canonical up
     const spin = lv.spin;
     if (spin !== undefined) {
@@ -366,7 +392,9 @@ export function compileHierarchy(
   const rootRadius = Math.max(radiusFloor, spacing * Math.cbrt(Math.max(n, 1)));
   let radiusScaled = 0;
   for (let p = 0; p < P; p++) {
-    let r = Math.max(radiusFloor, spacing * Math.cbrt(pCount[p]!));
+    // the count^⅓ policy (floor included), then the level's radiusScale, THEN the
+    // parent-fit guard — so an oversized scale is clamped loudly, never overlapped
+    let r = Math.max(radiusFloor, spacing * Math.cbrt(pCount[p]!)) * radiusScaleOf[level[p]!]!;
     const pr = parent[p]! < 0 ? rootRadius : radius[parent[p]!]!;
     if (r > pr) {
       r = pr; // scaled into the parent — reported, never silent (§10.4)

@@ -309,6 +309,87 @@ describe('radius policy: spacing × count^(1/3), floored (§3.4)', () => {
   });
 });
 
+/* ------------------------------------------------------------------ radiusScale */
+
+describe('per-level radiusScale: after the count^⅓ policy, before the parent-fit guard', () => {
+  /** 8 groups of 64 nodes: root = 10·cbrt(512) = 80, every group 10·cbrt(64) = 40 — far
+   *  enough from the root that a 1.5× scale cannot touch the parent-fit guard. */
+  const g8 = handGraph([64, 64, 64, 64, 64, 64, 64, 64]);
+  const lvls = (rs?: number): LevelSpec[] => [
+    { groupBy: 'g', place: { shape: 'shell' }, radiusScale: rs },
+    { place: { shape: 'cloud' } },
+  ];
+
+  it('scales that level\'s radii linearly', () => {
+    const base = compileHierarchy(g8, lvls(), { spacing: 10 });
+    const up = compileHierarchy(g8, lvls(1.5), { spacing: 10 });
+    const down = compileHierarchy(g8, lvls(0.5), { spacing: 10 });
+    for (let p = 0; p < base.pivots.count; p++) {
+      expect(base.pivots.radius[p]).toBe(40);
+      expect(up.pivots.radius[p]).toBe(60);
+      expect(down.pivots.radius[p]).toBe(20);
+    }
+    expect(up.stats.radiusScaled).toBe(0);
+    expect(down.stats.radiusScaled).toBe(0);
+  });
+
+  it('scales radii only — the level\'s own centres do not move (children spread, groups stay)', () => {
+    const base = compileHierarchy(g8, lvls(), { spacing: 10 });
+    const down = compileHierarchy(g8, lvls(0.5), { spacing: 10 });
+    expect(fnv1a(down.pivots.centre)).toBe(fnv1a(base.pivots.centre));
+    expect(fnv1a(down.positions)).not.toBe(fnv1a(base.positions)); // leaves pack inward
+  });
+
+  it('radiusScale 1 (explicit) leaves the goldens byte-identical', () => {
+    const levels2: LevelSpec[] = [
+      { groupBy: 'type', place: { shape: 'shell' }, spin: { rate: 0.1 }, radiusScale: 1 },
+      { place: { shape: 'cloud' } },
+    ];
+    expect(digest(compileHierarchy(SYNTH, levels2, { spacing: 10 }))).toEqual(GOLDEN_2);
+    const levels4: LevelSpec[] = [
+      { groupBy: 'type', place: { shape: 'shell' }, spin: { rate: 0.2 }, radiusScale: 1 },
+      {
+        groupBy: 'galaxy',
+        place: { preset: 'spiralGalaxy' },
+        spin: { rate: 0.5, axis: [0, 0, 3] },
+        radiusScale: 1,
+      },
+      { groupBy: 'era', place: { shape: 'ring' }, radiusScale: 1 },
+      { place: { shape: 'cloud', scatter: 'gaussian' } },
+    ];
+    expect(digest(compileHierarchy(SYNTH, levels4, { spacing: 10, salt: 42 }))).toEqual(GOLDEN_4);
+  });
+
+  it('the parent-fit guard still engages: an oversized scale clamps into the parent, counted', () => {
+    const g = handGraph([8, 8]); // root = 10·cbrt(16) ≈ 25.198; groups floored at 20
+    const r = compileHierarchy(g, lvls(100), { spacing: 10 });
+    expect(r.stats.radiusScaled).toBe(2);
+    for (let p = 0; p < r.pivots.count; p++) {
+      expect(r.pivots.radius[p]).toBeCloseTo(10 * Math.cbrt(16), 3); // the ROOT radius, not 2000
+    }
+  });
+
+  it('is allowed on a leaf-only level (the synthetic whole-field group scales)', () => {
+    const r = compileHierarchy(SYNTH, [{ place: { shape: 'cloud' }, radiusScale: 0.5 }], {
+      spacing: 10,
+    });
+    expect(r.pivots.radius[0]).toBeCloseTo(0.5 * 10 * Math.cbrt(SYNTH.n), 3);
+    expect(r.stats.radiusScaled).toBe(0);
+  });
+
+  it('guard rails: non-positive or non-finite throws; multi-level leaf radiusScale throws', () => {
+    expect(() => compileHierarchy(g8, lvls(0), { spacing: 10 })).toThrow(/radiusScale/);
+    expect(() => compileHierarchy(g8, lvls(NaN), { spacing: 10 })).toThrow(/radiusScale/);
+    expect(() =>
+      compileHierarchy(
+        g8,
+        [{ groupBy: 'g', place: { shape: 'shell' } }, { place: { shape: 'cloud' }, radiusScale: 2 }],
+        { spacing: 10 },
+      ),
+    ).toThrow(/radiusScale on the leaf level/);
+  });
+});
+
 /* ------------------------------------------------------------------ empty dropping */
 
 describe('empty-group dropping', () => {
