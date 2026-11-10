@@ -137,6 +137,17 @@ export const BACKGROUNDS = ['dark', 'light', 'black'] as const;
  *  extends this list from the live graph, the schema ships what always exists.) */
 export const SIZE_CHANNELS = ['degree', 'uniform'] as const;
 
+/** WHICH facet colours the nodes when colorMode is 'facet' (Field.setColorFacet). Facets are
+ *  corpus-specific, so the schema ships only 'type' (the facet nearly every corpus carries,
+ *  and today's hardcoded default) and a panel WIDENS the options from the live graph's facets —
+ *  exactly the SIZE_CHANNELS extension point. Inert in every other colour mode. */
+export const COLOR_FACETS = ['type'] as const;
+
+/** WHICH facet binds node GLYPH SHAPE (Field.setShapeFacet): 'none' (every node a disc) plus
+ *  the facets a panel widens in from the live graph, same pattern as COLOR_FACETS. 'none' is
+ *  the only corpus-agnostic option, so it is the shipped default. */
+export const SHAPE_FACETS = ['none'] as const;
+
 /** The schema. Order is panel order; rows share a group by adjacency. */
 export const SCHEMA: readonly SchemaRow[] = [
   /* ---- the zoom ladder (§6): where each tier fires. Distances in page-spacings. ---------- */
@@ -157,6 +168,9 @@ export const SCHEMA: readonly SchemaRow[] = [
 
   /* ---- the nodes: size channel, px clamps, glyph body, falloff (field/constants). -------- */
   { group: 'nodes', key: 'sizeChannel', label: 'size', kind: 'select', options: SIZE_CHANNELS, default: 'degree', unit: 'none' },
+  /* Which facet binds the node glyph SHAPE (setShapeFacet). 'none' = all discs; a panel widens
+     the options from the live graph's facets. Best read at a larger node size / lower density. */
+  { group: 'nodes', key: 'shapeFacet', label: 'shape by', kind: 'select', options: SHAPE_FACETS, default: 'none', unit: 'none' },
   { group: 'nodes', key: 'nodeScale', label: 'node size', kind: 'range', min: 0.05, max: 4, step: 0.05, default: NODE_SCALE, unit: 'none' },
   { group: 'nodes', key: 'sizeCurve', label: 'size contrast', kind: 'range', min: 0.15, max: 3, step: 0.05, default: SIZE_CURVE, unit: 'none' },
   { group: 'nodes', key: 'nodeMinPx', label: 'never smaller than', kind: 'range', min: 0.2, max: 10, step: 0.1, default: NODE_MIN_PX, unit: 'px' },
@@ -169,6 +183,9 @@ export const SCHEMA: readonly SchemaRow[] = [
 
   /* ---- colour and ground: mode, background, palette, blend, tonemap. --------------------- */
   { group: 'colour', key: 'colorMode', label: 'colour', kind: 'select', options: COLOR_MODES, default: 'facet', unit: 'none' },
+  /* WHICH facet colours the nodes in 'facet' mode (setColorFacet). The schema ships 'type';
+     a panel widens the options from the live graph. Inert in column/uniform/density modes. */
+  { group: 'colour', key: 'colorFacet', label: 'colour facet', kind: 'select', options: COLOR_FACETS, default: 'type', unit: 'none' },
   { group: 'colour', key: 'background', label: 'ground', kind: 'select', options: BACKGROUNDS, default: 'dark', unit: 'none' },
   { group: 'colour', key: 'palette', label: 'palette', kind: 'select', options: PALETTES, default: 'golden', unit: 'none' },
   { group: 'colour', key: 'blend', label: 'blending', kind: 'select', options: BLENDS, default: 'normal', unit: 'none' },

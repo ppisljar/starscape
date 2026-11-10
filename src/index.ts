@@ -17,7 +17,8 @@ export type { Facet, Graph, GraphInput, NumericColumn } from './core/types';
 
 export { createField, MORPH_DURATION } from './field/field';
 export type { Field, FieldOpts, FieldStats } from './field/field';
-export type { NodeStyle } from './field/nodes';
+export { NODE_SHAPES, SHAPE_COUNT } from './field/nodes';
+export type { NodeStyle, NodeShape } from './field/nodes';
 export type { LinkStyle } from './field/links';
 export {
   CHAIN_CAP,
@@ -135,13 +136,14 @@ export { byAdjacency, byColumn, byFacet, byHash } from './place/orderings';
 export { exponential, gaussian, mixture, powerLaw } from './place/densities';
 export { probitApprox } from './place/stat';
 
-export { compileHierarchy, MAX_LEVELS } from './place/hierarchy';
+export { compileHierarchy, MAX_LEVELS, RANDOM_SHAPES } from './place/hierarchy';
 export type {
   CompiledHierarchy,
   HierarchyOpts,
   HierarchyStats,
   LevelSpec,
   PivotTable,
+  RandomPlace,
   SpinSpec,
 } from './place/hierarchy';
 export { attachToAnchors, HOP_MAX } from './place/pull';
