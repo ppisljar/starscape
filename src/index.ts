@@ -55,7 +55,7 @@ export {
 } from './field/channels';
 export { localDensity, DENSITY_TARGET_PER_CELL } from './field/density';
 export type { DensityOpts } from './field/density';
-export { spatialFacetColors, hilbertIndex3, SPATIAL_HILBERT_BITS } from './field/spatial';
+export { spatialFacetColors, principalAxis3 } from './field/spatial';
 export { bootQuality, RENDER_SCALE_FLOOR } from './field/quality';
 export type { BootQuality } from './field/quality';
 export { facetPalette, hslToRgb, paintFacetColors, GOLDEN } from './field/palette';

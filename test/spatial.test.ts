@@ -1,130 +1,140 @@
 /* SPATIAL facet colouring (field/spatial.ts, Feature F1): clusters coloured by their centroid's
- * position along a 3D Hilbert curve through a ramp, so spatially-adjacent clusters share hue.
+ * projection onto the dominant spatial axis through a ramp, so spatially-adjacent clusters share
+ * hue — a smooth, SEAM-FREE gradient.
  *
- * Two things are pinned: the Hilbert index is a genuine space-filling curve (a bijection on the
- * lattice whose consecutive indices are grid-adjacent — THE locality guarantee), and the colouring
- * built on it is deterministic (§10) and actually smooth (spatially-near clusters get nearer colours
- * than spatially-far ones — the feature's whole point).
+ * Two things are pinned: the principal axis is the direction of greatest spread (so the gradient
+ * runs along the field's longest dimension and sweeps the whole ramp), and the colouring built on
+ * it is deterministic (§10) AND seamless — because a projection is a MONOTONIC 3D→1D map, there is
+ * no fold where spatially-adjacent clusters jump to opposite ends of the ramp (the hard seam the
+ * predecessor's space-filling curve could not avoid).
  */
 
 import { describe, expect, it } from 'vitest';
-import { hilbertIndex3, spatialFacetColors } from '../src/field/spatial';
+import { principalAxis3, spatialFacetColors } from '../src/field/spatial';
+import { rampAt } from '../src/theme/palettes';
 
-describe('hilbertIndex3 — a genuine 3D Hilbert curve', () => {
-  it('is a bijection on the lattice with grid-adjacent consecutive indices', () => {
-    const bits = 2; // 4 per axis → 64 cells
-    const side = 1 << bits;
-    const cells: { x: number; y: number; z: number; d: number }[] = [];
-    const seen = new Set<number>();
-    for (let x = 0; x < side; x++) {
-      for (let y = 0; y < side; y++) {
-        for (let z = 0; z < side; z++) {
-          const d = hilbertIndex3(x, y, z, bits);
-          cells.push({ x, y, z, d });
-          seen.add(d);
-        }
-      }
-    }
-    // bijection: 64 distinct indices, exactly 0..63
-    expect(seen.size).toBe(side * side * side);
-    let min = Infinity;
-    let max = -Infinity;
-    for (const d of seen) {
-      min = Math.min(min, d);
-      max = Math.max(max, d);
-    }
-    expect(min).toBe(0);
-    expect(max).toBe(side * side * side - 1);
-    // locality: walking the curve in index order never jumps — each step is one lattice cell
-    cells.sort((a, b) => a.d - b.d);
-    for (let i = 1; i < cells.length; i++) {
-      const a = cells[i - 1]!;
-      const b = cells[i]!;
-      const manhattan = Math.abs(a.x - b.x) + Math.abs(a.y - b.y) + Math.abs(a.z - b.z);
-      expect(manhattan).toBe(1);
-    }
+describe('principalAxis3 — the dominant axis of a symmetric 3×3 covariance', () => {
+  it('returns the coordinate axis of the largest variance for a diagonal matrix', () => {
+    expect(principalAxis3(9, 1, 2, 0, 0, 0)).toEqual([1, 0, 0]);
+    expect(principalAxis3(1, 9, 2, 0, 0, 0)).toEqual([0, 1, 0]);
+    expect(principalAxis3(1, 2, 9, 0, 0, 0)).toEqual([0, 0, 1]);
   });
 
-  it('is deterministic (no RNG, no clock)', () => {
-    expect(hilbertIndex3(13, 7, 42, 16)).toBe(hilbertIndex3(13, 7, 42, 16));
+  it('finds the elongation direction of a tilted spread (eigenvector of the largest eigenvalue)', () => {
+    // points spread mostly along (1, 1, 0): covariance of {t·(1,1,0)} is [[s,s,0],[s,s,0],[0,0,0]]
+    const [x, y, z] = principalAxis3(5, 5, 0, 5, 0, 0);
+    // unit vector along (1, 1, 0), sign-canonicalised to a positive lead component
+    expect(Math.hypot(x, y, z)).toBeCloseTo(1, 6);
+    expect(Math.abs(x - y)).toBeLessThan(1e-6);
+    expect(Math.abs(z)).toBeLessThan(1e-6);
+    expect(x).toBeGreaterThan(0);
+  });
+
+  it('is deterministic and sign-stable (same matrix → byte-identical axis)', () => {
+    const a = principalAxis3(7, 3, 2, 1.5, -0.5, 0.8);
+    const b = principalAxis3(7, 3, 2, 1.5, -0.5, 0.8);
+    expect(a).toEqual(b);
   });
 });
 
-/** One node per facet value, positioned at its 3D grid cell; value index is the RASTER order
- *  (x + side·y + side²·z), which has poor spatial locality — a good foil for the Hilbert order. */
-function gridClusters(side: number): {
+/** K clusters strung along a dominant axis d (with a small deterministic perpendicular jitter so
+ *  the distribution is genuinely 3D, not a perfect line), one node per cluster. Projection order
+ *  along d is the cluster index order. */
+function lineClusters(K: number): {
   codes: Uint32Array;
-  valueCount: number;
   positions: Float32Array;
-  cellOf: { x: number; y: number; z: number }[];
+  axis: [number, number, number];
 } {
-  const v = side * side * side;
-  const codes = new Uint32Array(v);
-  const positions = new Float32Array(v * 3);
-  const cellOf: { x: number; y: number; z: number }[] = [];
-  for (let z = 0; z < side; z++) {
-    for (let y = 0; y < side; y++) {
-      for (let x = 0; x < side; x++) {
-        const idx = x + side * y + side * side * z;
-        codes[idx] = idx;
-        positions[idx * 3] = x;
-        positions[idx * 3 + 1] = y;
-        positions[idx * 3 + 2] = z;
-        cellOf[idx] = { x, y, z };
-      }
-    }
+  // a deliberately tilted dominant axis, normalised
+  const dx = 1,
+    dy = 0.3,
+    dz = -0.2;
+  const dm = Math.hypot(dx, dy, dz);
+  const axis: [number, number, number] = [dx / dm, dy / dm, dz / dm];
+  const codes = new Uint32Array(K);
+  const positions = new Float32Array(K * 3);
+  for (let i = 0; i < K; i++) {
+    codes[i] = i;
+    const s = i * 2; // spacing along the dominant axis dwarfs the jitter below
+    positions[i * 3] = s * axis[0] + 0.2 * Math.sin(i * 1.3);
+    positions[i * 3 + 1] = s * axis[1] + 0.2 * Math.cos(i * 0.7);
+    positions[i * 3 + 2] = s * axis[2] + 0.2 * Math.sin(i * 2.1);
   }
-  return { codes, valueCount: v, positions, cellOf };
+  return { codes, positions, axis };
 }
 
 const rgbDist = (c: Float32Array, a: number, b: number): number =>
   Math.hypot(c[a * 3]! - c[b * 3]!, c[a * 3 + 1]! - c[b * 3 + 1]!, c[a * 3 + 2]! - c[b * 3 + 2]!);
 
-describe('spatialFacetColors — a smooth spatial gradient', () => {
+describe('spatialFacetColors — a smooth, seam-free spatial gradient', () => {
   it('is deterministic (same positions → byte-identical colours)', () => {
-    const g = gridClusters(4);
-    const a = spatialFacetColors(g.codes, g.valueCount, g.positions, g.valueCount, 'spectral');
-    const b = spatialFacetColors(g.codes, g.valueCount, g.positions, g.valueCount, 'spectral');
+    const g = lineClusters(40);
+    const a = spatialFacetColors(g.codes, 40, g.positions, 40, 'spectral');
+    const b = spatialFacetColors(g.codes, 40, g.positions, 40, 'spectral');
     expect(Array.from(b)).toEqual(Array.from(a));
   });
 
+  it('sweeps the WHOLE ramp: the extreme clusters hit the ramp endpoints', () => {
+    const K = 40;
+    const g = lineClusters(K);
+    const colors = spatialFacetColors(g.codes, K, g.positions, K, 'spectral');
+    const first = rampAt('spectral', 0);
+    const last = rampAt('spectral', 1);
+    // the min-projection cluster is coloured the ramp's start, the max-projection cluster its end —
+    // t = (proj − min)/(max − min) hits exactly 0 and 1. (Index order ≈ projection order here.)
+    let nearStart = Infinity;
+    let nearEnd = Infinity;
+    for (let i = 0; i < K; i++) {
+      nearStart = Math.min(nearStart, Math.hypot(colors[i * 3]! - first[0], colors[i * 3 + 1]! - first[1], colors[i * 3 + 2]! - first[2]));
+      nearEnd = Math.min(nearEnd, Math.hypot(colors[i * 3]! - last[0], colors[i * 3 + 1]! - last[1], colors[i * 3 + 2]! - last[2]));
+    }
+    expect(nearStart).toBeLessThan(1e-6);
+    expect(nearEnd).toBeLessThan(1e-6);
+  });
+
+  it('has NO seam: consecutive clusters along the axis never jump across the ramp', () => {
+    const K = 48;
+    const g = lineClusters(K);
+    const colors = spatialFacetColors(g.codes, K, g.positions, K, 'spectral');
+    // cluster index order follows the projection order, so the step between consecutive clusters is
+    // the gradient's local slope. The largest such step must stay a small fraction of the total ramp
+    // extent — a fold (the predecessor's failure) would show up as one step comparable to the whole
+    // ramp. Measure the ramp's end-to-end distance as the reference.
+    const first = rampAt('spectral', 0);
+    const last = rampAt('spectral', 1);
+    const rampSpan = Math.hypot(first[0] - last[0], first[1] - last[1], first[2] - last[2]);
+    let maxStep = 0;
+    for (let i = 1; i < K; i++) maxStep = Math.max(maxStep, rgbDist(colors, i - 1, i));
+    expect(maxStep).toBeLessThan(rampSpan * 0.25);
+  });
+
   it('colours spatially-near clusters more alike than spatially-far ones', () => {
-    const side = 4;
-    const g = gridClusters(side);
-    const colors = spatialFacetColors(g.codes, g.valueCount, g.positions, g.valueCount, 'spectral');
-    let nearSum = 0;
-    let nearCount = 0;
-    let farSum = 0;
-    let farCount = 0;
-    for (let i = 0; i < g.valueCount; i++) {
-      for (let j = i + 1; j < g.valueCount; j++) {
-        const a = g.cellOf[i]!;
-        const b = g.cellOf[j]!;
-        const dist = Math.abs(a.x - b.x) + Math.abs(a.y - b.y) + Math.abs(a.z - b.z);
+    const K = 40;
+    const g = lineClusters(K);
+    const colors = spatialFacetColors(g.codes, K, g.positions, K, 'spectral');
+    let nearSum = 0,
+      nearCount = 0,
+      farSum = 0,
+      farCount = 0;
+    for (let i = 0; i < K; i++) {
+      for (let j = i + 1; j < K; j++) {
         const cd = rgbDist(colors, i, j);
-        if (dist === 1) {
+        if (j - i === 1) {
           nearSum += cd;
           nearCount++;
-        } else if (dist >= side + 1) {
+        } else if (j - i >= K / 2) {
           farSum += cd;
           farCount++;
         }
       }
     }
-    const nearMean = nearSum / nearCount;
-    const farMean = farSum / farCount;
-    // the Hilbert order makes adjacent clusters neighbours on the ramp: their mean colour distance
-    // is well under that of distant clusters (a scattered value-index palette would make the two
-    // roughly equal). A comfortable margin so the assertion is about the gradient, not noise.
-    expect(nearMean).toBeLessThan(farMean * 0.6);
+    expect(nearSum / nearCount).toBeLessThan((farSum / farCount) * 0.6);
   });
 
   it('a single present value takes one ramp colour; absent values are left untouched', () => {
-    // 3 values but only value 1 has members
     const codes = new Uint32Array([1, 1, 1]);
     const positions = new Float32Array([0, 0, 0, 1, 0, 0, 0, 1, 0]);
     const out = spatialFacetColors(codes, 3, positions, 3, 'ember');
-    // all three nodes (all value 1) share one colour
     expect(rgbDist(out, 0, 1)).toBe(0);
     expect(rgbDist(out, 0, 2)).toBe(0);
   });

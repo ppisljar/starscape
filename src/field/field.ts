@@ -140,9 +140,9 @@ export interface FieldStats {
    *  colorColumn and colorSpatialFacet are all null then. The density is recomputed from the target
    *  geometry on every retarget, so this look follows an arrangement change without re-binding. */
   colorDensity: boolean;
-  /** The facet coloured by SPATIAL ORDER (setColorFacetSpatial — clusters along a Hilbert curve
-   *  through the ramp), or null when a categorical facet / column / density drives the colour.
-   *  Position-dependent, so it too is recomputed on every retarget. */
+  /** The facet coloured by SPATIAL ORDER (setColorFacetSpatial — clusters projected onto their
+   *  dominant spatial axis through the ramp), or null when a categorical facet / column / density
+   *  drives the colour. Position-dependent, so it too is recomputed on every retarget. */
   colorSpatialFacet: string | null;
   /** The facet bound to node GLYPH SHAPE (setShapeFacet), or null when every node is a disc. */
   shapeFacet: string | null;
@@ -381,9 +381,9 @@ export function createField(graph: Graph, opts: FieldOpts = {}): Field {
   let densityRamp: RampLike | null = null;
   let densScratch: Float32Array | null = null;
   /* SPATIAL facet-colour state (setColorFacetSpatial). spatialFacet non-null ⟺ clusters are
-     coloured by their centroid's position along a 3D Hilbert curve through spatialRamp (field/
-     spatial.ts) — colorFacet / colorColumn null and densityRamp null then. Like density it reads
-     the TARGET geometry (baseB), so it is recomputed on every retarget, never per frame (§4). */
+     coloured by their centroid's projection onto the dominant spatial axis through spatialRamp
+     (field/spatial.ts) — colorFacet / colorColumn null and densityRamp null then. Like density it
+     reads the TARGET geometry (baseB), so it is recomputed on every retarget, never per frame (§4). */
   let spatialFacet: string | null = null;
   let spatialRamp: RampLike = DEFAULT_RAMP;
   const colors = new Float32Array(n * 3);
@@ -685,11 +685,11 @@ export function createField(graph: Graph, opts: FieldOpts = {}): Field {
     writeLinkColors();
   };
 
-  /** Recompute the SPATIAL facet colouring from the current TARGET geometry (baseB): order the
-   *  colour facet's values along a 3D Hilbert curve over their centroids and paint each node its
+  /** Recompute the SPATIAL facet colouring from the current TARGET geometry (baseB): project the
+   *  colour facet's value centroids onto their dominant spatial axis and paint each node its
    *  value's ramp colour (field/spatial.ts). Called by setColorFacetSpatial and, while the mode is
    *  active, by every retarget (finishRetarget) — the centroids move with the arrangement, so the
-   *  gradient must follow. O(n) + O(values·log values); an event cost, never per frame. */
+   *  gradient must follow. O(n) + O(values); an event cost, never per frame. */
   const recolorSpatial = (): void => {
     const facet = graph.facets[spatialFacet!]!;
     spatialFacetColors(facet.data, facet.values.length, baseB, n, spatialRamp, colors);
