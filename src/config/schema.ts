@@ -174,7 +174,7 @@ export const SCHEMA: readonly SchemaRow[] = [
   { group: 'colour', key: 'ramp', label: 'colour ramp', kind: 'select', options: RAMP_NAMES, default: DEFAULT_RAMP, unit: 'none' },
   /* Pre-curve gain, applied before the roll-off and ONLY when an operator is on (op 'none'
      is a true bypass — field/tonemap.ts). floor: setTonemap throws on exposure ≤ 0. */
-  { group: 'colour', key: 'exposure', label: 'exposure', kind: 'range', min: 0.1, max: 4, step: 0.05, default: EXPOSURE_DEFAULT, unit: 'none', floor: 0 },
+  { group: 'colour', key: 'exposure', label: 'exposure', kind: 'range', min: 0.01, max: 4, step: 0.005, default: EXPOSURE_DEFAULT, unit: 'none', floor: 0 },
   /* Sublinear highlight compression on the accumulated additive HDR, applied PRE-bloom in the
      post chain (post/bloom.ts). 0 is off — an exact linear pass-through, today's look — and 1
      the strongest roll-off: it curves luminance by pow(L, g) (hue preserved) so a dense core
