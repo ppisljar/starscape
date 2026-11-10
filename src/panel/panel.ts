@@ -237,6 +237,12 @@ export interface Panel {
   /** Mark the settings as matching no named look (host-driven change). Returns true when the
    *  picker actually moved to CUSTOM. */
   markCustom(): boolean;
+  /** Replace the inert key set and repaint the affected rows LIVE — the host calls this when a
+   *  mode change makes a control momentarily meaningless (e.g. the palette is dead while colour
+   *  order is 'spatial', the ramp dead while it is 'value'), so the greying tracks the real state
+   *  instead of being fixed at build time. The control stays usable; only its "no live effect"
+   *  styling changes. */
+  setInert(keys: readonly string[]): void;
   /** The look picker, exposed so a host masthead can mirror it (one list, two places). */
   readonly lookSel: HTMLSelectElement;
   dispose(): void;
@@ -321,9 +327,22 @@ export function createPanel(opts: PanelOptions): Panel {
   interface RowRec {
     row: SchemaRow;
     input: HTMLInputElement | HTMLSelectElement;
+    label: HTMLElement;
     show: () => void;
   }
   const rows = new Map<string, RowRec>();
+
+  /** Apply the inert styling to one row's label from the live `inert` set (shared by the initial
+   *  build and setInert): greyed, italic label, explanatory tooltip when inert; plain otherwise. */
+  const paintInert = (key: string, label: HTMLElement): void => {
+    if (inert.has(key)) {
+      label.classList.add('ss-cfg-inert');
+      label.title = `${key}: no live effect in this mode — the value still saves and rides looks`;
+    } else {
+      label.classList.remove('ss-cfg-inert');
+      label.removeAttribute('title');
+    }
+  };
 
   for (const section of groupRows(schema)) {
     const h = doc.createElement('div');
@@ -337,10 +356,7 @@ export function createPanel(opts: PanelOptions): Panel {
       l.className = 'ss-cfg-l';
       l.textContent = row.label;
       l.title = row.key;
-      if (inert.has(row.key)) {
-        label.classList.add('ss-cfg-inert');
-        label.title = `${row.key}: no live effect in this build — the value still saves and rides looks`;
-      }
+      paintInert(row.key, label);
       label.appendChild(l);
 
       let input: HTMLInputElement | HTMLSelectElement;
@@ -401,7 +417,7 @@ export function createPanel(opts: PanelOptions): Panel {
         onChange(row.key);
       });
 
-      rows.set(row.key, { row, input, show });
+      rows.set(row.key, { row, input, label, show });
       body.appendChild(label);
     }
   }
@@ -594,6 +610,11 @@ export function createPanel(opts: PanelOptions): Panel {
       if (!mark()) return false;
       store.save();
       return true;
+    },
+    setInert(keys: readonly string[]): void {
+      inert.clear();
+      for (const k of keys) inert.add(k);
+      for (const rec of rows.values()) paintInert(rec.row.key, rec.label);
     },
     lookSel: sel,
     dispose(): void {
