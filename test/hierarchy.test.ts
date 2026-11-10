@@ -390,6 +390,83 @@ describe('per-level radiusScale: after the count^⅓ policy, before the parent-f
   });
 });
 
+/* ------------------------------------------------------------------ rootRadiusScale */
+
+describe('rootRadiusScale: the one knob above level 0 — spreads the outermost groups apart', () => {
+  // 8 groups of 64: the top-level centres sit on a shell of the root radius; scaling it
+  // moves those centres without changing any group's own size.
+  const g8 = handGraph([64, 64, 64, 64, 64, 64, 64, 64]);
+  const lvls: LevelSpec[] = [
+    { groupBy: 'g', place: { shape: 'shell' } },
+    { place: { shape: 'cloud' } },
+  ];
+  const centreSpread = (r: ReturnType<typeof compileHierarchy>): number => {
+    // RMS distance of the level-0 pivot centres from their centroid.
+    let cx = 0,
+      cy = 0,
+      cz = 0,
+      c = 0;
+    for (let p = 0; p < r.pivots.count; p++) {
+      if (r.pivots.level[p] !== 0) continue;
+      cx += r.pivots.world[p * 3]!;
+      cy += r.pivots.world[p * 3 + 1]!;
+      cz += r.pivots.world[p * 3 + 2]!;
+      c++;
+    }
+    cx /= c;
+    cy /= c;
+    cz /= c;
+    let s = 0;
+    for (let p = 0; p < r.pivots.count; p++) {
+      if (r.pivots.level[p] !== 0) continue;
+      const dx = r.pivots.world[p * 3]! - cx,
+        dy = r.pivots.world[p * 3 + 1]! - cy,
+        dz = r.pivots.world[p * 3 + 2]! - cz;
+      s += dx * dx + dy * dy + dz * dz;
+    }
+    return Math.sqrt(s / c);
+  };
+
+  it('scales how far apart the top-level centres sit, linearly', () => {
+    const base = compileHierarchy(g8, lvls, { spacing: 10 });
+    const wide = compileHierarchy(g8, lvls, { spacing: 10, rootRadiusScale: 3 });
+    expect(centreSpread(wide) / centreSpread(base)).toBeCloseTo(3, 6);
+  });
+
+  it('leaves every group\'s OWN radius untouched (groups move apart, do not grow)', () => {
+    const base = compileHierarchy(g8, lvls, { spacing: 10 });
+    const wide = compileHierarchy(g8, lvls, { spacing: 10, rootRadiusScale: 3 });
+    expect(fnv1a(wide.pivots.radius)).toBe(fnv1a(base.pivots.radius));
+    expect(wide.stats.radiusScaled).toBe(0); // bigger root can only help the parent-fit guard
+  });
+
+  it('default (omitted or 1) is byte-identical — the goldens hold', () => {
+    expect(digest(compileHierarchy(SYNTH, LEVELS_2, { spacing: 10 }))).toEqual(GOLDEN_2);
+    expect(digest(compileHierarchy(SYNTH, LEVELS_2, { spacing: 10, rootRadiusScale: 1 }))).toEqual(
+      GOLDEN_2,
+    );
+  });
+
+  it('composes with a level\'s radiusScale: root moves centres, radiusScale grows contents', () => {
+    const rootOnly = compileHierarchy(g8, lvls, { spacing: 10, rootRadiusScale: 2 });
+    // root scaled but group radii unchanged vs base
+    const base = compileHierarchy(g8, lvls, { spacing: 10 });
+    expect(rootOnly.pivots.radius[0]).toBe(base.pivots.radius[0]);
+  });
+
+  it('guard rails: non-positive or non-finite throws', () => {
+    expect(() => compileHierarchy(g8, lvls, { spacing: 10, rootRadiusScale: 0 })).toThrow(
+      /rootRadiusScale/,
+    );
+    expect(() => compileHierarchy(g8, lvls, { spacing: 10, rootRadiusScale: -1 })).toThrow(
+      /rootRadiusScale/,
+    );
+    expect(() => compileHierarchy(g8, lvls, { spacing: 10, rootRadiusScale: NaN })).toThrow(
+      /rootRadiusScale/,
+    );
+  });
+});
+
 /* ------------------------------------------------------------------ empty dropping */
 
 describe('empty-group dropping', () => {

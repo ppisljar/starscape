@@ -97,6 +97,11 @@ export interface HierarchyOpts {
   /** Base of every derived salt (default 0): change it and every level re-deals, change
    *  nothing and the output is byte-identical forever. */
   salt?: number;
+  /** Scales the root radius — the sphere the top level's group centres are seated in — so
+   *  the outermost groups spread apart (or pack in) without changing how big each group is.
+   *  Default 1. A level's own `radiusScale` governs how far its *contents* spread; this is
+   *  the one knob above level 0, which no level's radiusScale can reach. Finite and > 0. */
+  rootRadiusScale?: number;
 }
 
 /** The pivot table: one record per group, columnar (§3.1 discipline — typed arrays, no
@@ -201,6 +206,12 @@ export function compileHierarchy(
   if (!Number.isFinite(radiusFloor) || radiusFloor < 0) {
     throw new Error(
       `compileHierarchy: opts.radiusFloor must be finite and >= 0, got ${radiusFloor}`,
+    );
+  }
+  const rootRadiusScale = opts.rootRadiusScale ?? 1;
+  if (!Number.isFinite(rootRadiusScale) || rootRadiusScale <= 0) {
+    throw new Error(
+      `compileHierarchy: opts.rootRadiusScale must be finite and > 0, got ${rootRadiusScale}`,
     );
   }
   const baseSalt = (opts.salt ?? 0) | 0;
@@ -389,7 +400,8 @@ export function compileHierarchy(
     }
   }
 
-  const rootRadius = Math.max(radiusFloor, spacing * Math.cbrt(Math.max(n, 1)));
+  const rootRadius =
+    Math.max(radiusFloor, spacing * Math.cbrt(Math.max(n, 1))) * rootRadiusScale;
   let radiusScaled = 0;
   for (let p = 0; p < P; p++) {
     // the count^⅓ policy (floor included), then the level's radiusScale, THEN the
