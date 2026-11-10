@@ -82,19 +82,36 @@ export const RANDOM_SHAPES = [
 ] as const;
 
 /** A per-group RANDOM arrangement for a level (§3.3, §10.1): instead of ONE shape for the whole
- *  level, each group pivot the level fills draws a shape from `shapes` (default RANDOM_SHAPES)
- *  chosen by `hash(groupPivotId, salt)` — fully DETERMINISTIC (no RNG, no clock), so the same
- *  hierarchy + salt yields an identical assignment forever. Everything else the level does —
- *  ordering, density, scatter, params, and the level's own spread (`radiusScale`) and `spin` —
- *  is shared across groups through `base`; only the SHAPE varies. On the LEAF level each leaf
- *  group lays its nodes out with its own shape; on an interior level each parent group lays its
- *  child centres out with its own shape. */
+ *  level, each group pivot the level fills draws a shape from `shapes` (default RANDOM_SHAPES).
+ *  Everything else the level does — ordering, density, scatter, params, and the level's own
+ *  spread (`radiusScale`) and `spin` — is shared across groups through `base`; only the SHAPE
+ *  varies. On the LEAF level each leaf group lays its nodes out with its own shape; on an
+ *  interior level each parent group lays its child centres out with its own shape.
+ *
+ *  Two ways to pick each group's shape, both DETERMINISTIC (no RNG, no clock — §10.1), set by
+ *  `by`:
+ *    - `'hash'` (default): `hash(groupPivotId, salt)` — a decorrelated pseudo-random shape per
+ *      group, so the same hierarchy + salt yields an identical but scattered assignment forever.
+ *    - `'facet'`: the shape is keyed to the group's OWN groupBy FACET-VALUE index —
+ *      `shapes[facetValueIndex mod shapes.length]`. So all groups that share a facet value get
+ *      the SAME shape (meaningful, not scattered), and distinct values cycle through the set in
+ *      order (so the `shapes` order is significant here, unlike the hash form). The "facet value"
+ *      is the value that DEFINES the group being filled: at the leaf it is the innermost groupBy
+ *      value of each leaf group; on an interior level it is the PARENT group's groupBy value (the
+ *      filled group is the parent whose children are being seated). A filled group with no facet
+ *      value of its own — the root's direct children at level 0, or a leaf-only hierarchy's
+ *      synthetic whole-field group — falls back to shape index 0. */
 export interface RandomPlace {
   /** The sentinel discriminant — must be the literal `true`. */
   random: true;
   /** Shape keys to pick from (each resolved and validated at compile time; an unknown key throws
-   *  naming the registered shapes). Default RANDOM_SHAPES. */
+   *  naming the registered shapes). Default RANDOM_SHAPES. With `by: 'facet'` the ORDER matters —
+   *  facet value index k maps to `shapes[k mod shapes.length]`. */
   shapes?: readonly string[];
+  /** How each filled group picks its shape from `shapes`: `'hash'` (default) decorrelates per
+   *  group; `'facet'` keys it to the group's own groupBy facet-value index so same-value groups
+   *  share a shape. See the interface doc for the exact "facet value" each form uses. */
+  by?: 'hash' | 'facet';
   /** The shared knobs applied to EVERY group (ordering / density / densityAxis / scatter /
    *  params) — a PlacementSpec without its `shape`, which the per-group pick supplies. A
    *  `densityAxis` is clamped into each chosen shape's dimension (the shapes vary in dim, so an
@@ -217,23 +234,38 @@ function resolvePlace(place: PlacementSpec | { preset: string }): PlacementSpec 
   return 'preset' in place ? getPreset(place.preset) : place;
 }
 
-/** Resolve the PlacementSpec for ONE group of a RANDOM level: hash the group pivot id into the
- *  level's shape set and bolt the chosen shape onto the shared `base` knobs. Deterministic
- *  (§10.1): `hash(groupPivot, salt)` with a shape-dedicated, level-decorrelated salt — same
- *  hierarchy + base salt ⇒ same shape every time. `groupPivot` is the pivot the level is FILLING
- *  (the parent whose children are being seated, or the leaf group whose nodes are being placed),
- *  the same id the group's placement salt already keys on. */
+/** Resolve the PlacementSpec for ONE group of a RANDOM level: pick a shape from the level's set
+ *  and bolt it onto the shared `base` knobs. Deterministic (§10.1) under both `by` forms.
+ *  `groupPivot` is the pivot the level is FILLING (the parent whose children are being seated, or
+ *  the leaf group whose nodes are being placed), the same id the group's placement salt already
+ *  keys on; `facetValue` is that filled group's own groupBy facet-value index (−1 when it has
+ *  none — the root, or a leaf-only field's synthetic group).
+ *
+ *  - `by: 'hash'` (default): `hash(groupPivot, salt)` with a shape-dedicated, level-decorrelated
+ *    salt — same hierarchy + base salt ⇒ same (scattered) shape every time, independent of where
+ *    the members land.
+ *  - `by: 'facet'`: `shapes[facetValue mod shapes.length]` — same facet value ⇒ same shape, and
+ *    distinct values cycle through the set in ORDER. A group with no facet value (−1) falls back
+ *    to index 0. Still a pure function of the compiled structure — no RNG, no clock. */
 function randomSpecFor(
   rp: RandomPlace,
   groupPivot: number,
   level: number,
   salt: number,
+  facetValue: number,
 ): PlacementSpec {
   const set = rp.shapes ?? RANDOM_SHAPES;
-  // A stream distinct from the placement draws that reuse `salt`, so the shape choice does not
-  // correlate with where the members land. level-folded so the same pivot id at two levels differs.
-  const stream = (salt ^ Math.imul(level + 1, 0x27d4eb2f)) | 0;
-  const pick = (hash(groupPivot, stream) * set.length) | 0;
+  let pick: number;
+  if (rp.by === 'facet') {
+    // keyed to the group's own facet value: same value → same shape, values cycle the set in
+    // order. No facet value of its own (root child / synthetic whole-field group) → index 0.
+    pick = facetValue >= 0 ? facetValue % set.length : 0;
+  } else {
+    // A stream distinct from the placement draws that reuse `salt`, so the shape choice does not
+    // correlate with where the members land. level-folded so the same pivot id at two levels differs.
+    const stream = (salt ^ Math.imul(level + 1, 0x27d4eb2f)) | 0;
+    pick = (hash(groupPivot, stream) * set.length) | 0;
+  }
   const shape = set[pick < set.length ? pick : set.length - 1]!;
   const base = rp.base ?? {};
   const spec: PlacementSpec = { ...base, shape };
@@ -404,6 +436,11 @@ export function compileHierarchy(
   const pParent: number[] = [];
   const pStart: number[] = [];
   const pCount: number[] = [];
+  /* The groupBy facet-value index that DEFINES each pivot (the `touched` value it was split on),
+     −1 for the synthetic whole-field group of a leaf-only hierarchy. O(groups), not O(nodes) —
+     consumed by the `{ random: true, by: 'facet' }` shape pick so same-value groups share a
+     shape (randomSpecFor). */
+  const pValue: number[] = [];
   const levelFirst: number[] = [0]; // first pivot id of each pivot level; last entry = total
   const groupsPerLevel: number[] = [];
   let emptyDropped = 0;
@@ -439,6 +476,7 @@ export function compileHierarchy(
         pParent.push(parentId);
         pStart.push(w);
         pCount.push(counts[v]!);
+        pValue.push(v); // the facet-value index this pivot was split on (by: 'facet' shape pick)
         writePos[v] = w;
         w += counts[v]!;
       }
@@ -463,6 +501,7 @@ export function compileHierarchy(
     pParent.push(-1);
     pStart.push(0);
     pCount.push(n);
+    pValue.push(-1); // no groupBy value — by: 'facet' falls back to shape index 0
     levelFirst.push(1);
   }
 
@@ -528,10 +567,11 @@ export function compileHierarchy(
       const par = parent[a]!;
       let b = a + 1;
       while (b < hi && parent[b]! === par) b++;
-      // RANDOM level: the parent group being filled picks its own shape (hash(par, salt)); a
-      // plain level reuses its one resolved spec. Everything else about the call is identical.
+      // RANDOM level: the parent group being filled picks its own shape — by hash(par, salt), or
+      // (by: 'facet') by the PARENT's own facet value, pValue[par] (−1 at the root). A plain level
+      // reuses its one resolved spec. Everything else about the call is identical.
       const gSalt = groupSalt(baseSalt, k, par);
-      placeGroup(spec ?? randomSpecFor(rp!, par, k, gSalt), {
+      placeGroup(spec ?? randomSpecFor(rp!, par, k, gSalt, par < 0 ? -1 : pValue[par]!), {
         members: pivotIds.subarray(a, b),
         count: b - a,
         graph: null,
@@ -579,9 +619,10 @@ export function compileHierarchy(
   for (let q = leafLo; q < leafHi; q++) {
     const s = pStart[q]!;
     const c = pCount[q]!;
-    // RANDOM leaf: each leaf group lays its nodes out with a shape of its own (hash(q, salt)).
+    // RANDOM leaf: each leaf group lays its nodes out with a shape of its own — by hash(q, salt),
+    // or (by: 'facet') by the leaf group's own innermost facet value, pValue[q].
     const gSalt = groupSalt(baseSalt, leafIndex, q);
-    placeGroup(leafSpec ?? randomSpecFor(leafRandom!, q, leafIndex, gSalt), {
+    placeGroup(leafSpec ?? randomSpecFor(leafRandom!, q, leafIndex, gSalt, pValue[q]!), {
       members: order.subarray(s, s + c),
       count: c,
       graph,

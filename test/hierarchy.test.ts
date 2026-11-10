@@ -834,3 +834,153 @@ describe('place: { random } — a deterministic per-group shape', () => {
     expect(fnv1a(h2.positions)).toBe(fnv1a(h.positions));
   });
 });
+
+/* ---------------------------------------------- RandomPlace by: 'facet' (§3.3, Feature F2) */
+
+describe("place: { random, by: 'facet' } — shape keyed to the group's own facet value", () => {
+  const EIGHT = handGraph([8, 8, 8, 8, 8, 8, 8, 8]);
+  const byFacetLevels: LevelSpec[] = [
+    { groupBy: 'g', place: { shape: 'shell' } },
+    { place: { random: true, by: 'facet' } },
+  ];
+
+  /** Per-group world-y spread (local layout fingerprint): same for two groups iff they drew the
+   *  same shape (equal size, radius, ordering), since the parent offset is constant per group. */
+  const yExtentByGroup = (h: CompiledHierarchy, n: number): Map<number, number> => {
+    const lo = new Map<number, number>();
+    const hi = new Map<number, number>();
+    for (let i = 0; i < n; i++) {
+      const g = h.nodePivot[i]!;
+      const y = h.positions[i * 3 + 1]!;
+      lo.set(g, Math.min(lo.get(g) ?? Infinity, y));
+      hi.set(g, Math.max(hi.get(g) ?? -Infinity, y));
+    }
+    const ext = new Map<number, number>();
+    for (const g of lo.keys()) ext.set(g, hi.get(g)! - lo.get(g)!);
+    return ext;
+  };
+
+  /** Is a group's shape PLANAR? A ring/disc lies in the XZ plane (y ≈ parent offset only), a
+   *  volumetric shape is not — so flatness is a salt-invariant fingerprint of the SHAPE itself
+   *  (the within-shape member layout still varies with the per-group salt; the flat/not category
+   *  does not). Maps each facet value (node i's g value is i >> 3) to its group's flatness. */
+  const flatByValue = (h: CompiledHierarchy): Map<number, boolean> => {
+    const ext = yExtentByGroup(h, EIGHT.n);
+    const flat = new Map<number, boolean>();
+    for (let i = 0; i < EIGHT.n; i++) flat.set(i >> 3, ext.get(h.nodePivot[i]!)! < 1e-4);
+    return flat;
+  };
+  // ring (planar) for even values, ball (volumetric) for odd — flatness then encodes the shape.
+  const ringBall: LevelSpec[] = [
+    { groupBy: 'g', place: { shape: 'shell' } },
+    { place: { random: true, by: 'facet', shapes: ['ring', 'ball'] } },
+  ];
+
+  it('same hierarchy → byte-identical output (determinism, §10)', () => {
+    const a = compileHierarchy(EIGHT, byFacetLevels, { spacing: 1, salt: 3 });
+    const b = compileHierarchy(EIGHT, byFacetLevels, { spacing: 1, salt: 3 });
+    expect(fnv1a(b.positions)).toBe(fnv1a(a.positions));
+  });
+
+  it('the SHAPE assignment is salt-independent (unlike the hash form, it does not re-deal)', () => {
+    // the per-group salt still varies the member layout WITHIN each shape, but which shape each
+    // value draws is a pure function of the facet value — so the flat/not pattern is salt-stable.
+    const a = flatByValue(compileHierarchy(EIGHT, ringBall, { spacing: 1, salt: 3 }));
+    const b = flatByValue(compileHierarchy(EIGHT, ringBall, { spacing: 1, salt: 99 }));
+    expect([...a.entries()].sort()).toEqual([...b.entries()].sort());
+    // and it actually cycles: even values are flat (ring), odd are not (ball)
+    for (const [v, isFlat] of a) expect(isFlat).toBe(v % 2 === 0);
+  });
+
+  it('values cycle through the shape set in order', () => {
+    // two shapes: ring (planar, y-spread ~0) and ball (volumetric). value v → shapes[v mod 2],
+    // so EVEN g values are rings (flat) and ODD are balls (not flat).
+    const cyc: LevelSpec[] = [
+      { groupBy: 'g', place: { shape: 'shell' } },
+      { place: { random: true, by: 'facet', shapes: ['ring', 'ball'] } },
+    ];
+    const h = compileHierarchy(EIGHT, cyc, { spacing: 1, salt: 1 });
+    // map leaf pivot → its g value via any member node (node i's g value is i >> 3)
+    const valueOfPivot = new Map<number, number>();
+    for (let i = 0; i < EIGHT.n; i++) valueOfPivot.set(h.nodePivot[i]!, i >> 3);
+    const ext = yExtentByGroup(h, EIGHT.n);
+    for (const [g, e] of ext) {
+      if (valueOfPivot.get(g)! % 2 === 0) expect(e).toBeLessThan(1e-4); // ring
+      else expect(e).toBeGreaterThan(1e-4); // ball
+    }
+  });
+
+  it('same facet value → same shape across different parents; different values differ', () => {
+    // outer (2 values) × inner (2 values), inner repeating under both outers. Leaf by-facet keys on
+    // the leaf group's OWN (innermost = inner) value, so the inner=k cluster under outer A and under
+    // outer B must draw the SAME shape regardless of parent. ring (flat) for inner 0, ball (not
+    // flat) for inner 1 — flatness is the salt-invariant shape fingerprint (see flatByValue above).
+    const per = 8;
+    const outerVals = ['A', 'B'];
+    const innerVals = ['x', 'y'];
+    const nn = outerVals.length * innerVals.length * per;
+    const outer = new Uint8Array(nn);
+    const inner = new Uint8Array(nn);
+    let i = 0;
+    for (let o = 0; o < outerVals.length; o++) {
+      for (let v = 0; v < innerVals.length; v++) {
+        for (let k = 0; k < per; k++) {
+          outer[i] = o;
+          inner[i] = v;
+          i++;
+        }
+      }
+    }
+    const g2 = buildGraph({
+      n: nn,
+      links: new Uint32Array(0),
+      facets: { outer: { values: outerVals, data: outer }, inner: { values: innerVals, data: inner } },
+    });
+    const levels: LevelSpec[] = [
+      { groupBy: 'outer', place: { shape: 'shell' } },
+      { groupBy: 'inner', place: { shape: 'shell' } },
+      { place: { random: true, by: 'facet', shapes: ['ring', 'ball'] } },
+    ];
+    const h = compileHierarchy(g2, levels, { spacing: 1, salt: 5 });
+    const lo = new Map<number, number>();
+    const hi = new Map<number, number>();
+    const innerOfPivot = new Map<number, number>();
+    for (let j = 0; j < nn; j++) {
+      const g = h.nodePivot[j]!;
+      const y = h.positions[j * 3 + 1]!;
+      lo.set(g, Math.min(lo.get(g) ?? Infinity, y));
+      hi.set(g, Math.max(hi.get(g) ?? -Infinity, y));
+      innerOfPivot.set(g, inner[j]!);
+    }
+    // every leaf group: flat iff its inner value is 0 (ring) — so the two outers' copies of each
+    // inner value agree (same shape across parents), and the two inner values differ (ring vs ball).
+    let flatGroups = 0;
+    let roundGroups = 0;
+    for (const g of lo.keys()) {
+      const flat = hi.get(g)! - lo.get(g)! < 1e-4;
+      expect(flat).toBe(innerOfPivot.get(g) === 0);
+      if (flat) flatGroups++;
+      else roundGroups++;
+    }
+    expect(flatGroups).toBe(2); // inner=0 under both outers
+    expect(roundGroups).toBe(2); // inner=1 under both outers
+  });
+
+  it('falls back cleanly where the filled group has no facet value (root / leaf-only)', () => {
+    // interior by-facet whose parent is the root (-1): every top group falls back to shape 0, but
+    // it must still compile finite and deterministic.
+    const interior: LevelSpec[] = [
+      { groupBy: 'g', place: { random: true, by: 'facet' } },
+      { place: { shape: 'cloud' } },
+    ];
+    const h = compileHierarchy(EIGHT, interior, { spacing: 1, salt: 2 });
+    for (let i = 0; i < EIGHT.n; i++) expect(Number.isFinite(h.positions[i * 3]!)).toBe(true);
+    expect(fnv1a(compileHierarchy(EIGHT, interior, { spacing: 1, salt: 2 }).positions)).toBe(
+      fnv1a(h.positions),
+    );
+    // leaf-only: the synthetic whole-field group has value -1 → shape 0, still compiles.
+    const leafOnly: LevelSpec[] = [{ place: { random: true, by: 'facet' } }];
+    const ho = compileHierarchy(EIGHT, leafOnly, { spacing: 1 });
+    for (let i = 0; i < EIGHT.n; i++) expect(Number.isFinite(ho.positions[i * 3]!)).toBe(true);
+  });
+});
