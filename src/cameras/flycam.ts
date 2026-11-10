@@ -11,7 +11,7 @@
  *     is roll. This reads as *the universe* turning. Measured in the predecessor and pinned in
  *     test/flycam.test.ts: the target moves 0.000 and aim·toTarget stays 1.0000.
  *
- *   MOVING (WASD, R/F) adds the same delta to BOTH camera and target, which slides the whole
+ *   MOVING (WASD, X/C) adds the same delta to BOTH camera and target, which slides the whole
  *     rig through the scene and leaves the orbit radius untouched. So flying somewhere does
  *     not quietly change what dragging will pivot around.
  *
@@ -46,28 +46,32 @@ const EDIT = 'input,textarea,select,[contenteditable=""],[contenteditable="true"
 type MoveAxis = 'f' | 'r' | 'u';
 type TurnAxis = 'yaw' | 'pitch' | 'roll';
 
-/* W/S lift and drop; the RIGHT-hand modifiers drive forward and back.
+/* W/S drive forward and back; X/C lift and drop.
  * Flying a graph is not flying a plane: you spend most of the time rising above a cluster to
- * see it and dropping into it to read, and far less time holding a straight line. Putting the
- * vertical on the home row and the throttle under the right hand means both can be held at
- * once without the hand leaving wasd. R/F and PageUp/PageDown stay bound to the same
- * vertical — they cost nothing and they are what a returning user will reach for. */
+ * see it and dropping into it to read, and far less time holding a straight line. W/S run the
+ * throttle on the home row while X/C sit right below them, so the left hand can hold a climb
+ * and a cruise at once without leaving wasd. PageUp/PageDown stay bound to the same vertical as
+ * X/C — they cost nothing and they are what a returning user will reach for. */
 const MOVE: Readonly<Record<string, readonly [MoveAxis, 1 | -1]>> = {
-  KeyW: ['u', 1], KeyS: ['u', -1],
+  KeyW: ['f', 1], KeyS: ['f', -1],
   KeyA: ['r', -1], KeyD: ['r', 1],
-  KeyR: ['u', 1], KeyF: ['u', -1],
+  KeyX: ['u', 1], KeyC: ['u', -1],
   PageUp: ['u', 1], PageDown: ['u', -1],
-  ShiftRight: ['f', 1],
-  AltRight: ['f', -1], ControlRight: ['f', -1],
 };
-/* Speed modifiers are LEFT-hand only, because the right-hand ones are the throttle. Reading
- * `ev.shiftKey` would make flying forward permanently "fast" and remove any way to creep —
- * and `ev.shiftKey` cannot tell you the side, so the side is tracked by `ev.code`.
- * Left shift HOLDS the speed, it does not multiply it: cruising speed is proportional to room,
- * with a proximity damp on top, so "faster" scales the cruise AND the crawl — you would still
- * decelerate, just from a higher number. Holding latches the speed you had when you pressed it
- * and bypasses both, so approaching a cluster no longer brakes for you. */
-const MODS: Readonly<Record<string, 'hold' | 'fine'>> = { ShiftLeft: 'hold', AltLeft: 'fine' };
+/* CapsLock LOCKS the speed; left Alt is the fine-motion gain; left Shift is the coarse-wheel
+ * modifier (its only remaining job — see the wheel handler). CapsLock is a toggle, not a key
+ * you hold: on macOS it fires keydown when the lock turns ON and keyup when it turns OFF, so the
+ * add-on-keydown / delete-on-keyup tracking below makes `hold` mean simply "caps is on" — tap
+ * once to lock the speed, tap again to release it, no finger pinned down.
+ * It HOLDS the speed, it does not multiply it: cruising speed is proportional to room, with a
+ * proximity damp on top, so "faster" would scale the cruise AND the crawl — you would still
+ * decelerate, just from a higher number. Locking latches the speed you had when you toggled it
+ * on and bypasses both, so approaching a cluster no longer brakes for you.
+ * Only the roles differ per entry; what the rig reads is membership in `mods`, which is why
+ * ShiftLeft must stay listed here for the wheel to keep seeing it. */
+const MODS: Readonly<Record<string, 'hold' | 'fine' | 'coarse'>> = {
+  CapsLock: 'hold', AltLeft: 'fine', ShiftLeft: 'coarse',
+};
 const TURN: Readonly<Record<string, readonly [TurnAxis, 1 | -1]>> = {
   ArrowLeft: ['yaw', 1], ArrowRight: ['yaw', -1],
   ArrowUp: ['pitch', 1], ArrowDown: ['pitch', -1],
@@ -76,7 +80,7 @@ const TURN: Readonly<Record<string, readonly [TurnAxis, 1 | -1]>> = {
 const BY_KEY: Readonly<Record<string, string>> = {
   arrowup: 'ArrowUp', arrowdown: 'ArrowDown', arrowleft: 'ArrowLeft', arrowright: 'ArrowRight',
   pageup: 'PageUp', pagedown: 'PageDown', w: 'KeyW', a: 'KeyA', s: 'KeyS', d: 'KeyD',
-  q: 'KeyQ', e: 'KeyE', r: 'KeyR', f: 'KeyF',
+  q: 'KeyQ', e: 'KeyE', x: 'KeyX', c: 'KeyC',
 };
 
 const closestEdit = (t: unknown): boolean => {
@@ -88,8 +92,8 @@ const inEditor = (ev: { target?: unknown }): boolean => {
   if (typeof document === 'undefined') return false;
   return closestEdit(document.activeElement);
 };
-/* `ev.key` for a modifier is just "Shift"/"Alt"/"Control" with no side, so the BY_KEY fallback
- * cannot serve them — modifiers are matched on `ev.code` above and nowhere else. */
+/* `ev.key` for left Alt is just "Alt" with no side, so the BY_KEY fallback cannot tell AltLeft
+ * from AltRight — the speed modifiers are matched on `ev.code` above and nowhere else. */
 const codeOf = (ev: KeyEventLike): string | null => {
   if (MOVE[ev.code] || TURN[ev.code]) return ev.code;
   return BY_KEY[(ev.key ?? '').toLowerCase()] ?? null;
@@ -182,7 +186,7 @@ export function createFlycam(camera: RigCamera, cfg: FlycamConfig, opts: FlycamO
     { f: 0, r: 0, u: 0, yaw: 0, pitch: 0, roll: 0 };
   let hold = false, fine = false, blocked = false;
   let tween: Tween | null = null;
-  let heldSpeed = 0;        // the speed latched when left shift went down
+  let heldSpeed = 0;        // the speed latched when the CapsLock speed-lock turned on
   let spin = false, spinScale = 1, busyNow = false;
   const WORLD_UP = new Vector3(0, 1, 0);
 
@@ -212,7 +216,7 @@ export function createFlycam(camera: RigCamera, cfg: FlycamConfig, opts: FlycamO
     const mod = MODS[ev.code];
     if (mod) {
       if (down) mods.add(ev.code); else mods.delete(ev.code);
-      hold = mods.has('ShiftLeft');
+      hold = mods.has('CapsLock');
       if (!hold) heldSpeed = 0;        // re-latch next time, from wherever you then are
       fine = mods.has('AltLeft');
     }
@@ -316,7 +320,8 @@ export function createFlycam(camera: RigCamera, cfg: FlycamConfig, opts: FlycamO
     ev.preventDefault?.();
     tween = null;
     const k = ev.deltaY > 0 ? WHEEL_K : 1 / WHEEL_K;
-    // left shift only, for the same reason as the hold latch: the right one is the throttle
+    // left Shift held while wheeling raises the dolly ratio — a coarse zoom, distinct from the
+    // CapsLock speed-lock; this one reads ShiftLeft directly off `ev.code` and nothing else
     dolly(radius() * Math.pow(k, mods.has('ShiftLeft') ? 2.4 : 1));
     onInput();
   };

@@ -85,36 +85,45 @@ function axis(m: { f: number; r: number; u: number }): string {
 }
 
 describe('flycam keymap', () => {
-  it('W and S go UP and DOWN, not forward and back', () => {
-    expect(axis(press('KeyW'))).toBe('up');
-    expect(axis(press('KeyS'))).toBe('-up');
+  it('W and S go FORWARD and BACK, not up and down', () => {
+    expect(axis(press('KeyW'))).toBe('forward');
+    expect(axis(press('KeyS'))).toBe('-forward');
   });
 
-  it('the right-hand modifiers are the throttle', () => {
-    expect(axis(press('ShiftRight'))).toBe('forward');
-    expect(axis(press('AltRight'))).toBe('-forward');
-    expect(axis(press('ControlRight'))).toBe('-forward');
+  it('X and C move UP and DOWN; the old right-hand throttle keys are inert', () => {
+    expect(axis(press('KeyX'))).toBe('up');
+    expect(axis(press('KeyC'))).toBe('-up');
+    // ShiftRight/AltRight/ControlRight used to be the forward/back throttle; forward is W/S now,
+    // so those keys move nothing at all.
+    const still = (code: string): number => {
+      const m = press(code);
+      return Math.hypot(m.f, m.r, m.u);
+    };
+    expect(still('ShiftRight')).toBeLessThan(1e-9);
+    expect(still('AltRight')).toBeLessThan(1e-9);
+    expect(still('ControlRight')).toBeLessThan(1e-9);
   });
 
-  it('A and D still strafe, R and F still lift', () => {
+  it('A and D still strafe, X and C lift', () => {
     expect(axis(press('KeyD'))).toBe('right');
     expect(axis(press('KeyA'))).toBe('-right');
-    expect(axis(press('KeyR'))).toBe('up');
-    expect(axis(press('KeyF'))).toBe('-up');
+    expect(axis(press('KeyX'))).toBe('up');
+    expect(axis(press('KeyC'))).toBe('-up');
   });
 });
 
 describe('flycam speed', () => {
-  /** Fly forward 90 frames (optionally holding a modifier), coast 120 more; distance covered. */
+  /** Fly forward (W) 90 frames (optionally with the speed-lock toggled on), coast 120 more;
+   *  distance covered. `mod` is toggled on before the run and off after — CapsLock semantics. */
   const fly = (mod: string | null, roomAt: (p: readonly [number, number, number]) => number)
   : number => {
     const { camera, cam, keys } = rig({ roomAt }, {}, [0, 0, 9000]);
     const p0 = camera.position.clone();
-    if (mod) keys.fire('keydown', key(mod, { key: 'Shift' }));
-    keys.fire('keydown', key('ShiftRight', { key: 'Shift' }));
+    if (mod) keys.fire('keydown', key(mod));       // CapsLock keydown = lock ON
+    keys.fire('keydown', key('KeyW'));
     for (let t = 0; t < 90; t++) cam.update(0.016);
-    keys.fire('keyup', key('ShiftRight', { key: 'Shift' }));
-    if (mod) keys.fire('keyup', key(mod, { key: 'Shift' }));
+    keys.fire('keyup', key('KeyW'));
+    if (mod) keys.fire('keyup', key(mod));          // CapsLock keyup = lock OFF
     for (let t = 0; t < 120; t++) cam.update(0.016);
     return camera.position.distanceTo(p0);
   };
@@ -123,15 +132,15 @@ describe('flycam speed', () => {
     Math.max(60, Math.hypot(p[0], p[1], p[2]) - 200);
   const flat = (): number => 900;
 
-  it('LEFT shift holds speed through an approach; plain flight brakes', () => {
+  it('CapsLock locks speed through an approach; plain flight brakes', () => {
     const plain = fly(null, closing);
-    const held = fly('ShiftLeft', closing);
+    const held = fly('CapsLock', closing);
     expect(held).toBeGreaterThan(plain * 1.3);
   });
 
-  it('with nothing to brake for, holding is NOT a boost', () => {
+  it('with nothing to brake for, locking is NOT a boost', () => {
     const pf = fly(null, flat);
-    const hf = fly('ShiftLeft', flat);
+    const hf = fly('CapsLock', flat);
     expect(hf).toBeLessThan(pf * 1.15);
   });
 
@@ -139,24 +148,25 @@ describe('flycam speed', () => {
     expect(Math.abs(fly(null, flat) - fly(null, flat))).toBeLessThan(1e-9);
   });
 
-  it('releasing left shift re-latches from wherever you then are', () => {
-    // The latch has to clear on keyup, or a speed grabbed far out would follow you forever.
+  it('releasing the CapsLock lock re-latches from wherever you then are', () => {
+    // The latch has to clear when the lock toggles off, or a speed grabbed far out would follow
+    // you forever.
     const { camera, cam, keys } = rig(
       { roomAt: (p) => Math.max(60, Math.hypot(p[0], p[1], p[2]) - 200) }, {}, [0, 0, 9000]);
     const step = (codes: string[], n: number): number => {
-      for (const c of codes) keys.fire('keydown', key(c, { key: 'Shift' }));
+      for (const c of codes) keys.fire('keydown', key(c));
       let d = 0;
       for (let t = 0; t < n; t++) {
         const p = camera.position.clone();
         cam.update(0.016);
         d += camera.position.distanceTo(p);
       }
-      for (const c of codes) keys.fire('keyup', key(c, { key: 'Shift' }));
+      for (const c of codes) keys.fire('keyup', key(c));
       return d;
     };
-    step(['ShiftLeft', 'ShiftRight'], 90);          // close in while holding
+    step(['CapsLock', 'KeyW'], 90);          // close in while the speed is locked
     const near = camera.position.length();
-    const after = step(['ShiftRight'], 30);          // now fly WITHOUT the hold
+    const after = step(['KeyW'], 30);          // now fly WITHOUT the lock
     const expected = Math.max(60, near - 200) * FLYCAM_DEFAULTS.speedK * 30 * 0.016;
     expect(after).toBeLessThan(expected * 2.5);
   });
@@ -169,7 +179,7 @@ describe('flycam proximity damping', () => {
     // invariant: every held frame moves the ship.
     const { camera, cam, keys } = rig(
       { roomAt: (p) => Math.max(1, Math.hypot(p[0], p[1], p[2]) - 100) }, {}, [0, 0, 300]);
-    keys.fire('keydown', key('ShiftRight', { key: 'Shift' }));
+    keys.fire('keydown', key('KeyW'));
     let sawBlocked = false;
     const prev = camera.position.clone();
     for (let t = 0; t < 400; t++) {
@@ -186,7 +196,7 @@ describe('flycam proximity damping', () => {
 
   it('a constant tiny room (no gradient ahead) never freezes the ship either', () => {
     const { camera, cam, keys } = rig({ roomAt: () => 5 });
-    keys.fire('keydown', key('ShiftRight', { key: 'Shift' }));
+    keys.fire('keydown', key('KeyW'));
     const prev = camera.position.clone();
     for (let t = 0; t < 60; t++) {
       cam.update(0.016);
@@ -199,7 +209,7 @@ describe('flycam proximity damping', () => {
     const run = (roomAt: (p: readonly [number, number, number]) => number): number => {
       const { camera, cam, keys } = rig({ roomAt }, {}, [0, 0, 300]);
       const p0 = camera.position.clone();
-      keys.fire('keydown', key('ShiftRight', { key: 'Shift' }));
+      keys.fire('keydown', key('KeyW'));
       for (let t = 0; t < 90; t++) cam.update(0.016);
       return camera.position.distanceTo(p0);
     };
@@ -270,10 +280,10 @@ describe('flycam turning and flying', () => {
   it('a release is honoured even if focus moved into a text box', () => {
     // the old bug: gating keyup on focus swallowed the release and the ship flew on forever
     const { camera, cam, keys } = rig();
-    keys.fire('keydown', key('ShiftRight', { key: 'Shift' }));
+    keys.fire('keydown', key('KeyW'));
     for (let t = 0; t < 30; t++) cam.update(0.016);
     const editor = { closest: () => ({}) };
-    keys.fire('keyup', key('ShiftRight', { key: 'Shift', target: editor }));
+    keys.fire('keyup', key('KeyW', { target: editor }));
     for (let t = 0; t < 200; t++) cam.update(0.016);
     const settled = camera.position.clone();
     for (let t = 0; t < 120; t++) cam.update(0.016);
