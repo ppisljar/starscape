@@ -81,6 +81,12 @@ export const BG_DARK = 0x05070d;
  *  host (§7) — a host-invented ground made the same preset render differently per app. */
 export const BG_LIGHT = 0xf2efe7;
 
+/** A TRUE black ground (the config schema's `background: 'black'`). BG_DARK's #05070d is a near-
+ *  black with a trace of blue that the additive nebula look reveals as a lifted, greyish negative
+ *  space; the #4/#5 reference is pure #000 between the clusters, which only a real black ground and
+ *  a 0→0 roll-off (reinhard) give. The nebula preset selects this. */
+export const BG_BLACK = 0x000000;
+
 /** Default vertical field of view, degrees. */
 export const DEFAULT_FOV = 55;
 

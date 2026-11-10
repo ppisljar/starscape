@@ -38,6 +38,37 @@ export function rankPercentiles(data: ArrayLike<number>, n: number): Float32Arra
   return out;
 }
 
+/** Rank-normalise a column with TIES COLLAPSED (midrank): every node sharing a value gets the
+ *  SAME percentile — the average of the ranks that value occupies — instead of rankPercentiles'
+ *  index tiebreak. The geometric density channel (field/density.ts) needs this: its counts are a
+ *  tie-heavy integer-ish signal, and the sparsest tier is a large block of equal low values that
+ *  MUST read as one colour (all equally cool), not spread across a blue→orange index gradient
+ *  that would betray a false spatial order. Still deterministic (sort tiebreak by index), still a
+ *  pure function; a column with no ties gives exactly rankPercentiles' result. */
+export function rankPercentilesTied(data: ArrayLike<number>, n: number): Float32Array {
+  const out = new Float32Array(n);
+  if (n === 0) return out;
+  if (n === 1) {
+    out[0] = 1;
+    return out;
+  }
+  const order = new Uint32Array(n);
+  for (let i = 0; i < n; i++) order[i] = i;
+  order.sort((a, b) => data[a]! - data[b]! || a - b);
+  const inv = 1 / (n - 1);
+  let r = 0;
+  while (r < n) {
+    const v = data[order[r]!]!;
+    let s = r + 1;
+    while (s < n && data[order[s]!]! === v) s++;
+    // ranks [r, s-1] share value v → the midrank percentile, assigned to every tied node
+    const mid = ((r + s - 1) / 2) * inv;
+    for (let k = r; k < s; k++) out[order[k]!] = mid;
+    r = s;
+  }
+  return out;
+}
+
 /** The size channel: world radii swept MIN→MAX by percentile^curve. One output buffer the
  *  caller owns; call again with another column to switch channels (what is big changes, how
  *  aggressively bigness is drawn does not). */

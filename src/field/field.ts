@@ -44,9 +44,10 @@ import {
   uniformSizes,
 } from './channels';
 import { facetPalette, paintFacetColors } from './palette';
+import { localDensity } from './density';
 import { createTonemap, OP_INDEX } from './tonemap';
 import type { TonemapOp } from './tonemap';
-import { DEFAULT_RAMP, rampColors } from '../theme/palettes';
+import { DEFAULT_RAMP, rampColors, rampColorsTied } from '../theme/palettes';
 import type { RampLike } from '../theme/palettes';
 import {
   BG_DARK,
@@ -107,9 +108,14 @@ export interface FieldStats {
   links: { drawn: number; total: number };
   sizeColumn: string;
   colorFacet: string | null;
-  /** The numeric column colour is bound to (setColorColumn), or null when a facet drives it —
-   *  exactly one of colorFacet / colorColumn is non-null. */
+  /** The numeric column colour is bound to (setColorColumn), or null when a facet or the density
+   *  channel drives it — at most one of colorFacet / colorColumn is non-null (both null when
+   *  density colours the field, where colorDensity is true instead). */
   colorColumn: string | null;
+  /** True when LOCAL SPATIAL DENSITY colours the field (setColorByDensity) — colorFacet and
+   *  colorColumn are both null then. The density is recomputed from the target geometry on every
+   *  retarget, so this look follows an arrangement change without the caller re-binding it. */
+  colorDensity: boolean;
   /** The live highlight roll-off: operator name + pre-curve exposure (stage 8, ./tonemap). */
   tonemap: { op: TonemapOp; exposure: number };
   /** Morph progress (§4): t and whether any tween (morph or spread) is still running. */
@@ -134,6 +140,14 @@ export interface Field {
    *  reason (a linear map leaves a heavy-tailed column on the ramp's floor). Links take
    *  their endpoints' colours with it. Default ramp DEFAULT_RAMP (theme/palettes). */
   setColorColumn(key: string, ramp?: RampLike): void;
+  /** Re-bind node colour to LOCAL SPATIAL DENSITY (field/density.ts): a per-node count of how
+   *  crowded its neighbourhood is in the CURRENT target geometry, rank-normalised through the ramp
+   *  (tie-collapsed, so equally-sparse nodes share one cool colour) — crowded regions hot, sparse
+   *  ones cool, the nebula look's defining signal. Unlike setColorColumn this binds to GEOMETRY,
+   *  not a data column, so it is recomputed automatically whenever the arrangement changes
+   *  (setHierarchy / setTarget / setProjection). Links take their endpoints' colours with it.
+   *  Default ramp 'nebula'. */
+  setColorByDensity(ramp?: RampLike): void;
   /** Select the highlight roll-off operator for BOTH layers ('none' bypasses — the raw
    *  pipeline, exposure included) and optionally the pre-curve exposure (stage 8, §7). */
   setTonemap(op: TonemapOp, exposure?: number): void;
@@ -270,6 +284,14 @@ export function createField(graph: Graph, opts: FieldOpts = {}): Field {
   }
 
   let colorColumn: string | null = null; // set by setColorColumn; exclusive with colorFacet
+  /* Local-density colour state (setColorByDensity). densityRamp non-null ⟺ the density channel
+     drives the field (colorFacet and colorColumn both null then); densScratch is the per-node
+     count buffer, reused across recomputes so a retarget recolour allocates nothing node-shaped
+     (§10.2). The density is a function of the TARGET geometry (baseB) alone — rotation preserves
+     distances and spread is a uniform scale the grid's own extent cancels, so neither changes the
+     rank — which is why one recompute per retarget suffices, never per frame (§4). */
+  let densityRamp: RampLike | null = null;
+  let densScratch: Float32Array | null = null;
   const colors = new Float32Array(n * 3);
   const shapes = new Float32Array(n); // all discs at stage 3; shapeBy binding arrives later
   const sizes = computeSizes(graph, sizeColumn, n);
@@ -379,6 +401,10 @@ export function createField(graph: Graph, opts: FieldOpts = {}): Field {
     posStore.upload(baseA, baseB, chainIds, n); // the ONE upload of the retarget
     tweens.set('morph', 0); // emits → centroid ← cA (already cA if t was 0: no emit needed)
     tweens.to('morph', 1, { duration });
+    // The density channel depends on the TARGET geometry, which just changed: recolour from the
+    // new baseB (O(n) density, an event cost — never per frame). Colours snap to the destination's
+    // density while the positions morph into it; the brief staleness is the accepted §4 seam.
+    if (densityRamp !== null) recolorDensity();
   };
 
   /* ---- layers ------------------------------------------------------------------------ */
@@ -522,6 +548,16 @@ export function createField(graph: Graph, opts: FieldOpts = {}): Field {
   writeLinkColors();
   focus.repaint(); // seed every alpha slot (resting link alpha, nodes lit)
 
+  /** Recompute the local-density colouring from the current TARGET geometry (baseB) and repaint
+   *  nodes + links. Called by setColorByDensity and, while the density channel is active, by every
+   *  retarget (finishRetarget). O(n); an event cost, never per frame. */
+  const recolorDensity = (): void => {
+    densScratch = localDensity(baseB, n, densScratch ?? undefined);
+    rampColorsTied(densScratch, n, densityRamp ?? 'nebula', colors);
+    node.colorAttr.needsUpdate = true;
+    writeLinkColors();
+  };
+
   /** mix(A, B, t) with exact endpoints — shared by basePositions and viewPositions
    *  (no `this`: the Field object must survive destructuring). */
   const basePositionsInto = (out?: Float32Array): Float32Array => {
@@ -557,6 +593,7 @@ export function createField(graph: Graph, opts: FieldOpts = {}): Field {
       if (!graph.facets[key]) throw new Error(`setColorFacet: "${key}" names no facet`);
       colorFacet = key;
       colorColumn = null;
+      densityRamp = null;
       paintColors(graph, colorFacet, n, colors);
       node.colorAttr.needsUpdate = true;
       writeLinkColors();
@@ -567,9 +604,17 @@ export function createField(graph: Graph, opts: FieldOpts = {}): Field {
       if (!col) throw new Error(`setColorColumn: "${key}" names no numeric column`);
       colorColumn = key;
       colorFacet = null;
+      densityRamp = null;
       rampColors(col.data, n, ramp, colors); // rank-normalised — the sizeOf rank machinery
       node.colorAttr.needsUpdate = true;
       writeLinkColors();
+    },
+
+    setColorByDensity(ramp: RampLike = 'nebula'): void {
+      colorColumn = null;
+      colorFacet = null;
+      densityRamp = ramp;
+      recolorDensity(); // from the current baseB; recomputed on every retarget hereafter
     },
 
     setTonemap(op: TonemapOp, exposure?: number): void {
@@ -698,6 +743,7 @@ export function createField(graph: Graph, opts: FieldOpts = {}): Field {
         sizeColumn,
         colorFacet,
         colorColumn,
+        colorDensity: densityRamp !== null,
         tonemap: { op: tonemapOp, exposure: tonemap.uniforms.exposure.value },
         morph: { t: tweens.get('morph'), active: tweens.active() },
         projection,

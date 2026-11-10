@@ -14,7 +14,7 @@
  * RAMPS and rampAt are ported from vault-site-3d src/config.js, values verbatim.
  */
 
-import { rankPercentiles } from '../field/channels';
+import { rankPercentiles, rankPercentilesTied } from '../field/channels';
 import { paintFacetColors } from '../field/palette';
 
 /** One colour: RGB in [0, 1]. */
@@ -64,6 +64,19 @@ export const RAMPS = {
     [0.62, 0.68, 0.95],
     [0.98, 0.56, 0.22],
     [1.0, 0.86, 0.58],
+  ],
+  /* ice→fire, the LOCAL-DENSITY ramp (field/density.ts + rampColorsTied): cool blue where a
+   * node's neighbourhood is sparse, hot orange where it is crowded, WHITE at the densest cores —
+   * the #4/#5 reference recipe, now with an explicit white stop because the signal driving it is
+   * geometric, not additive burnout. Unlike `aurora`'s note (white = where additive piles up), a
+   * density channel wants the densest RANK itself to read white, so the top stop is white and only
+   * the top sliver of the rank reaches it (rank-normalised, the bulk of the field sits blue). */
+  iceFire: [
+    [0.05, 0.14, 0.52],
+    [0.11, 0.37, 0.92],
+    [0.42, 0.62, 0.98],
+    [0.98, 0.58, 0.2],
+    [1.0, 1.0, 1.0],
   ],
   spectral: [
     [0.23, 0.07, 0.4],
@@ -274,8 +287,32 @@ export function rampColors(
   ramp: RampLike,
   out?: Float32Array,
 ): Float32Array {
+  return paintRampFromPct(rankPercentiles(data, n), n, ramp, out);
+}
+
+/** Column → ramp binding with TIE-COLLAPSED ranks (rankPercentilesTied): equal values share one
+ *  ramp colour instead of an index-ordered gradient. The geometric density channel
+ *  (field/density.ts) binds through this so a plateau of equally-sparse nodes reads as one cool
+ *  block — the #5 reference's isolated BLUE nodes — rather than smearing a false blue→orange order
+ *  across them. For a tie-free column it is exactly rampColors. */
+export function rampColorsTied(
+  data: ArrayLike<number>,
+  n: number,
+  ramp: RampLike,
+  out?: Float32Array,
+): Float32Array {
+  return paintRampFromPct(rankPercentilesTied(data, n), n, ramp, out);
+}
+
+/** Sample a ramp at precomputed percentiles — the shared inner loop of rampColors /
+ *  rampColorsTied, so the two rankers cannot drift from the sampling maths. */
+function paintRampFromPct(
+  pct: ArrayLike<number>,
+  n: number,
+  ramp: RampLike,
+  out?: Float32Array,
+): Float32Array {
   const colors = out ?? new Float32Array(n * 3);
-  const pct = rankPercentiles(data, n);
   const stops = rampStops(ramp);
   for (let i = 0; i < n; i++) {
     // rampAt inlined (no per-node tuple allocation — §10.2)

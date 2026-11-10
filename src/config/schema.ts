@@ -115,18 +115,22 @@ export const TONEMAPS = TONEMAP_OPS;
 /** Node colour source: a facet's categorical palette ('facet'); a numeric column
  *  rank-normalised through the `ramp` row ('column' — the degree column, the one buildGraph
  *  guarantees; a panel extends the choice from the live graph, exactly as SIZE_CHANNELS does);
- *  or one flat colour ('uniform'). */
-export const COLOR_MODES = ['facet', 'column', 'uniform'] as const;
+ *  one flat colour ('uniform'); or LOCAL SPATIAL DENSITY ('density' — a geometric channel the
+ *  field computes from the current positions, field/density.ts, rank-normalised through the
+ *  `ramp` the same way 'column' is: crowded neighbourhoods hot, sparse ones cool — the nebula
+ *  look's defining signal, and the one 'column' by degree cannot paint under additive blending). */
+export const COLOR_MODES = ['facet', 'column', 'uniform', 'density'] as const;
 
 /** Categorical palettes: 'golden' is the golden-angle generator (field/palette.ts); the named
  *  sets are theme data (theme/palettes.ts — the predecessor layer palette and the
  *  colorblind-safe sets), listed from their one source so the two lists can never drift. */
 export const PALETTES: readonly string[] = ['golden', ...PALETTE_NAMES];
 
-/** The ground. 'dark' is BG_DARK, 'light' BG_LIGHT (both field/constants — the named
- *  light-ground looks must mean the same paper in every host); blending follows the
- *  ground (§5). */
-export const BACKGROUNDS = ['dark', 'light'] as const;
+/** The ground. 'dark' is BG_DARK, 'light' BG_LIGHT, 'black' BG_BLACK (all field/constants — the
+ *  named grounds must mean the same colour in every host); blending follows the ground (§5). 'black'
+ *  is the pure-#000 ground the additive nebula look needs so the negative space between clusters
+ *  reads truly black (BG_DARK's near-black lifts to grey under the glow). */
+export const BACKGROUNDS = ['dark', 'light', 'black'] as const;
 
 /** Node size channel the field can bind without corpus knowledge: the degree column that
  *  buildGraph guarantees, or equal dots. (Other numeric columns are corpus-specific; a panel

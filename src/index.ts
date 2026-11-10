@@ -46,9 +46,12 @@ export {
   linkDrawCount,
   linkDrawVertices,
   rankPercentiles,
+  rankPercentilesTied,
   sizesFromColumn,
   uniformSizes,
 } from './field/channels';
+export { localDensity, DENSITY_TARGET_PER_CELL } from './field/density';
+export type { DensityOpts } from './field/density';
 export { bootQuality, RENDER_SCALE_FLOOR } from './field/quality';
 export type { BootQuality } from './field/quality';
 export { facetPalette, hslToRgb, paintFacetColors, GOLDEN } from './field/palette';
@@ -169,6 +172,7 @@ export {
   paletteBuffer,
   rampAt,
   rampColors,
+  rampColorsTied,
 } from './theme/palettes';
 export type { Palette, PaletteName, RGB, RampLike, RampName, RampStops } from './theme/palettes';
 export { VISUAL_PRESETS, VISUAL_PRESET_NAMES } from './theme/presets';
