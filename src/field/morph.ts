@@ -160,6 +160,34 @@ export function spreadPoint(
 }
 
 /**
+ * The CPU reference for the FIELD-GLOBAL root-frame rotation (DESIGN §3.5 top level): rotate
+ * `p` about `centroid` by quaternion `q` (xyzw) — the shader's last stage (stores.ts worldOf),
+ * applied after spread about the SAME centre. At the identity quaternion (0,0,0,1) it is an
+ * EXACT pass-through (t = 0 below, so no arithmetic moves the point), which keeps an unspun
+ * field byte-stable through this stage — the same guarantee spreadPoint makes at s = 1. The
+ * kernel is `v' = v + w·t + q×t` with `t = 2 q×v`, the frames.ts rotation, f64 locals.
+ */
+export function fieldSpinPoint(
+  p: ArrayLike<number>,
+  centroid: readonly [number, number, number],
+  q: readonly [number, number, number, number],
+  out: Float32Array | number[],
+  pOffset = 0,
+  outOffset = 0,
+): void {
+  const x = p[pOffset]! - centroid[0];
+  const y = p[pOffset + 1]! - centroid[1];
+  const z = p[pOffset + 2]! - centroid[2];
+  const qx = q[0], qy = q[1], qz = q[2], qw = q[3];
+  const tx = 2 * (qy * z - qz * y);
+  const ty = 2 * (qz * x - qx * z);
+  const tz = 2 * (qx * y - qy * x);
+  out[outOffset] = centroid[0] + x + qw * tx + (qy * tz - qz * ty);
+  out[outOffset + 1] = centroid[1] + y + qw * ty + (qz * tx - qx * tz);
+  out[outOffset + 2] = centroid[2] + z + qw * tz + (qx * ty - qy * tx);
+}
+
+/**
  * Fold a FrameSet's per-pivot (quat, centre) + compile-time world0 into the two arrays
  * the shader actually indexes — the one-apply form of frames.transformPoint:
  *

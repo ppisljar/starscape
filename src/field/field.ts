@@ -34,7 +34,7 @@
 import { AdditiveBlending, NormalBlending, type Object3D } from 'three/webgpu';
 import type { Graph } from '../core/types';
 import { createTweens } from '../anim/tween';
-import { createFrameSet } from '../anim/frames';
+import { createFrameSet, ANGLE_EPS } from '../anim/frames';
 import type { FrameSet } from '../anim/frames';
 import type { CompiledHierarchy } from '../place/hierarchy';
 import {
@@ -64,7 +64,15 @@ import { buildLinkLayer } from './links';
 import type { LinkStyle } from './links';
 import { createFocus } from './focus';
 import type { FocusOpts } from './focus';
-import { CHAIN_CAP, bakeMix, centroidOf, flattenAxis, packChainIds, spreadPoint } from './morph';
+import {
+  CHAIN_CAP,
+  bakeMix,
+  centroidOf,
+  fieldSpinPoint,
+  flattenAxis,
+  packChainIds,
+  spreadPoint,
+} from './morph';
 import { createGpuTransform, createPivotStore, createPositionStore } from './stores';
 
 /** Default morph/projection tween duration, seconds. */
@@ -133,6 +141,9 @@ export interface FieldStats {
   spread: number;
   /** Frame-chain pivots currently installed (0 = no hierarchy). */
   pivots: number;
+  /** The field-global ROOT-FRAME rotation rate (rad/time unit; 0 = the field is not turning
+   *  as a whole). Set by setFieldSpin — the top-level spin that no pivot carries (§3.5). */
+  fieldSpin: number;
 }
 
 export interface Field {
@@ -245,6 +256,26 @@ export interface Field {
   /** Spread: uniform scale about the field centroid, in-shader. duration 0 (default)
    *  sets it immediately; a duration tweens it. */
   setSpread(k: number, duration?: number): void;
+  /** Field-global ROOT-FRAME spin (DESIGN §3.5 top level): rotate the WHOLE field about its
+   *  centroid at `rate` rad/time unit, about `axis` (default [0,1,0], normalised). This is the
+   *  spin NO pivot carries — the exact analogue of rootRadiusScale for rotation (the top row of
+   *  a hierarchy editor drives it). The angle integrates in `update(dt)` (renderer owns the
+   *  clock — §10); the quaternion rebuilds once per frame, O(1), never per node. Independent of
+   *  the pivot store, so it works even when the hierarchy's pivots overflow. rate 0 parks the
+   *  field at its current orientation (it does not snap back). NOTE: a camera "riding" a frame
+   *  (frames.rideDelta) and frameOfPoint do NOT account for this outermost rotation — a seam the
+   *  caller can raise later. */
+  setFieldSpin(rate: number, axis?: [number, number, number]): void;
+  /** The field-global rotation quaternion (xyzw) the shader applies about centroid() AFTER
+   *  spread. Identity until the field has spun; stays parked (non-identity) after it stops.
+   *  Fills `out` (length ≥ 4) when given, else allocates. A consumer mirroring the shader per
+   *  node (picking/labels while the field turns) rotates each spread-space point about
+   *  centroid() by this — gate it on fieldSpinDisplaced(). */
+  fieldSpinQuat(out?: Float32Array | number[]): [number, number, number, number];
+  /** Is the field rotation off identity (the field has spun)? The gate for applying it in a
+   *  CPU mirror (viewPositions does it internally); also part of settled() via the per-tick
+   *  activity test, not this. */
+  fieldSpinDisplaced(): boolean;
   /** True when nothing is animating: no tween running, no frame moved last tick. The
    *  moment to rebuild a pick grid (DESIGN §6: on morph completion, never per frame). */
   settled(): boolean;
@@ -340,6 +371,22 @@ export function createField(graph: Graph, opts: FieldOpts = {}): Field {
   let pivotCount = 0;
   let projection: '2d' | '3d' = '3d';
 
+  /* ---- the FIELD-GLOBAL ROOT-FRAME rotation (DESIGN §3.5 top level): the spin no pivot
+   * carries. A uniform quaternion the shader applies about the centroid AFTER chain + spread
+   * (stores.ts worldOf), so the whole field turns as one rigid body — the exact rotational
+   * analogue of rootRadiusScale (the one spread knob above level 0). The angle integrates on
+   * the CPU each tick (O(1) — frames.ts rule 2: test the per-tick delta, never the accumulated
+   * angle, so a still field is free; §10: the renderer owns the clock, no Date.now); the
+   * quaternion rebuilds once per frame, never per node. It composes cleanly with spread (both
+   * are about the same centre, so they commute) and survives a morph untouched (applied last,
+   * uniformly, it just rotates the morphed result). SEAM: rideDelta / frameOfPoint do NOT
+   * extend to this outermost rotation (a camera inside the field is not carried by it) — an
+   * accepted limit the caller can raise later. */
+  let fieldSpinRate = 0;
+  const fieldSpinAxis: [number, number, number] = [0, 1, 0]; // unit, re-read on each setFieldSpin
+  let fieldSpinAngle = 0; // integrated, f64 (no drift) — this scope's own state
+  let fieldSpinActive = false; // did the field rotation move last tick (for settled())
+
   /* The spread centre rides the morph (§4 continuity): the shader's world is
    * c + (chain(base) − c)·spread, so swapping c in one tick while spread ≠ 1 would
    * displace every node by (1−s)·(c_new − c_old) — a snap the bake cannot prevent.
@@ -386,6 +433,18 @@ export function createField(graph: Graph, opts: FieldOpts = {}): Field {
     transform.uniforms.centroid.value.set(centroid[0], centroid[1], centroid[2]);
   };
   syncCentroid();
+  /** Rebuild the field-spin quaternion uniform from (fieldSpinAngle, fieldSpinAxis) — O(1),
+   *  once per frame while turning (and on an axis change). */
+  const syncFieldQuat = (): void => {
+    const h = fieldSpinAngle * 0.5;
+    const s = Math.sin(h);
+    transform.uniforms.fieldQuat.value.set(
+      fieldSpinAxis[0] * s,
+      fieldSpinAxis[1] * s,
+      fieldSpinAxis[2] * s,
+      Math.cos(h),
+    );
+  };
   pivStore.sync(null, null);
   posStore.upload(baseA, baseB, chainIds, n);
 
@@ -804,6 +863,7 @@ export function createField(graph: Graph, opts: FieldOpts = {}): Field {
         projection,
         spread: tweens.get('spread'),
         pivots: pivotCount,
+        fieldSpin: fieldSpinRate,
       };
     },
 
@@ -817,7 +877,14 @@ export function createField(graph: Graph, opts: FieldOpts = {}): Field {
         framesMoved = frames.advance(dt); // O(pivots), free when idle (frames.ts rule 2)
         if (framesMoved) pivStore.sync(frames, world0); // the only per-frame upload
       }
-      return framesMoved || wasTweening || tweens.active();
+      // Field-global rotation: integrate the angle and rebuild ONE quaternion, O(1). Rule 2:
+      // test the per-tick delta, not the accumulated angle, so a parked field costs nothing.
+      fieldSpinActive = fieldSpinRate !== 0 && Math.abs(fieldSpinRate * dt) > ANGLE_EPS;
+      if (fieldSpinActive) {
+        fieldSpinAngle += fieldSpinRate * dt;
+        syncFieldQuat();
+      }
+      return framesMoved || fieldSpinActive || wasTweening || tweens.active();
     },
 
     setTarget(target: Float32Array, duration: number = morphDuration): void {
@@ -881,8 +948,40 @@ export function createField(graph: Graph, opts: FieldOpts = {}): Field {
       else tweens.set('spread', k);
     },
 
+    setFieldSpin(rate: number, axis?: [number, number, number]): void {
+      if (!Number.isFinite(rate)) {
+        throw new Error(`setFieldSpin: rate must be finite, got ${rate}`);
+      }
+      fieldSpinRate = rate;
+      if (axis !== undefined) {
+        const len = Math.hypot(axis[0], axis[1], axis[2]);
+        if (!Number.isFinite(len) || len === 0) {
+          throw new Error('setFieldSpin: axis must have finite non-zero length');
+        }
+        fieldSpinAxis[0] = axis[0] / len;
+        fieldSpinAxis[1] = axis[1] / len;
+        fieldSpinAxis[2] = axis[2] / len;
+        syncFieldQuat(); // the new axis takes effect at the current angle immediately
+      }
+    },
+
+    fieldSpinQuat(out?: Float32Array | number[]): [number, number, number, number] {
+      const q = transform.uniforms.fieldQuat.value;
+      if (out) {
+        out[0] = q.x;
+        out[1] = q.y;
+        out[2] = q.z;
+        out[3] = q.w;
+      }
+      return [q.x, q.y, q.z, q.w];
+    },
+
+    fieldSpinDisplaced(): boolean {
+      return Math.abs(fieldSpinAngle) > ANGLE_EPS;
+    },
+
     settled(): boolean {
-      return !tweens.active() && !(frames?.activeThisTick() ?? false);
+      return !tweens.active() && !(frames?.activeThisTick() ?? false) && !fieldSpinActive;
     },
 
     get morphT(): number {
@@ -919,6 +1018,13 @@ export function createField(graph: Graph, opts: FieldOpts = {}): Field {
       const s = tweens.get('spread');
       if (s !== 1) {
         for (let i = 0; i < n; i++) spreadPoint(dst, centroid, s, dst, i * 3, i * 3);
+      }
+      // The field-global rotation is the shader's last stage — mirror it here (gate on the
+      // parked angle, exactly as spread gates on s ≠ 1), about the SAME centroid.
+      if (Math.abs(fieldSpinAngle) > ANGLE_EPS) {
+        const q = transform.uniforms.fieldQuat.value;
+        const qt: [number, number, number, number] = [q.x, q.y, q.z, q.w];
+        for (let i = 0; i < n; i++) fieldSpinPoint(dst, centroid, qt, dst, i * 3, i * 3);
       }
       return dst;
     },

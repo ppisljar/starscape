@@ -15,6 +15,7 @@ import {
   CHAIN_CAP,
   bakeMix,
   centroidOf,
+  fieldSpinPoint,
   flattenAxis,
   packChainIds,
   packPivotUniforms,
@@ -212,6 +213,51 @@ describe('spread invariance over the chain reference (frames.transformPoint)', (
     const back = new Float32Array(n * 3);
     for (let i = 0; i < n; i++) spreadPoint(chained, c, 1, back, i * 3, i * 3);
     expect(fnv1a(back)).toBe(fnv1a(chained)); // s = 1 is an EXACT identity, not a lerp
+  });
+});
+
+describe('fieldSpinPoint (the field-global root-frame rotation, §3.5)', () => {
+  it('identity quaternion is an EXACT pass-through (byte-stable, like spread at s = 1)', () => {
+    const graph = smallGraph(300, 7);
+    const n = graph.n;
+    const c = centroidOf(graph.positions!, n);
+    const out = new Float32Array(graph.positions!);
+    for (let i = 0; i < n; i++) fieldSpinPoint(out, c, [0, 0, 0, 1], out, i * 3, i * 3);
+    expect(fnv1a(out)).toBe(fnv1a(graph.positions!));
+  });
+
+  it('rotates about the centroid, preserving distance to it; a quarter-turn about y maps +x→−z', () => {
+    const c: [number, number, number] = [2, 5, -1];
+    // quaternion for +90° about [0,1,0]: (0, sin45, 0, cos45)
+    const s = Math.SQRT1_2;
+    const q: [number, number, number, number] = [0, s, 0, s];
+    const p = [c[0] + 1, c[1], c[2]]; // one unit along +x from the centre
+    const out = [0, 0, 0];
+    fieldSpinPoint(p, c, q, out);
+    // +x about +y by +90° → −z (right-handed)
+    expect(out[0]).toBeCloseTo(c[0], 6);
+    expect(out[1]).toBeCloseTo(c[1], 6);
+    expect(out[2]).toBeCloseTo(c[2] - 1, 6);
+    // distance to the centre is preserved (a rigid rotation)
+    const d = Math.hypot(out[0]! - c[0], out[1]! - c[1], out[2]! - c[2]);
+    expect(d).toBeCloseTo(1, 6);
+  });
+
+  it('round-trips: rotating by q then by its conjugate returns to the start', () => {
+    const c: [number, number, number] = [0, 0, 0];
+    const ang = 0.9;
+    const h = ang * 0.5;
+    const ax = 0.3, ay = 0.8, az = -0.5;
+    const len = Math.hypot(ax, ay, az);
+    const si = Math.sin(h) / len;
+    const q: [number, number, number, number] = [ax * si, ay * si, az * si, Math.cos(h)];
+    const qInv: [number, number, number, number] = [-q[0], -q[1], -q[2], q[3]];
+    const p = [1.2, -3.4, 2.1];
+    const mid = [0, 0, 0];
+    const back = [0, 0, 0];
+    fieldSpinPoint(p, c, q, mid);
+    fieldSpinPoint(mid, c, qInv, back);
+    for (let k = 0; k < 3; k++) expect(back[k]).toBeCloseTo(p[k]!, 5);
   });
 });
 

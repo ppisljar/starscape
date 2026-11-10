@@ -38,7 +38,7 @@
  * on capacity overflow (§10.5 spirit — silence would render garbage geometry).
  */
 
-import { DataTexture, FloatType, NearestFilter, RGBAFormat, StorageBufferAttribute, Vector3 } from 'three/webgpu';
+import { DataTexture, FloatType, NearestFilter, RGBAFormat, StorageBufferAttribute, Vector3, Vector4 } from 'three/webgpu';
 import type { Node } from 'three/webgpu';
 import { cross, int, ivec2, mix, storage, textureLoad, uniform } from 'three/tsl';
 import type { FrameSet } from '../anim/frames';
@@ -297,12 +297,19 @@ export interface GpuTransform {
     spread: { value: number };
     /** The spread centre — the field centroid of the CURRENT target (§4). */
     centroid: { value: Vector3 };
+    /** The field-global ROOT-FRAME rotation (DESIGN §3.5 top level): a quaternion xyzw the
+     *  shader applies about `centroid` AFTER the chain and spread, turning the whole field as
+     *  one rigid body. Identity (0,0,0,1) until the field has spun; driven by the Field's
+     *  setFieldSpin, integrated O(1) on the CPU (never per node). It rotates about the SAME
+     *  centre spread uses, so the two commute and compose cleanly; because it is applied last
+     *  and uniformly, it survives a morph untouched (it just rotates the morphed result). */
+    fieldQuat: { value: Vector4 };
   };
   /** Base-space position of node `index`: mix(A, B, t). Links use it for length. */
   baseOf(index: Node<'int'>): Node<'vec3'>;
   /** Chain slot of node `index` (A.w). */
   chainOf(index: Node<'int'>): Node<'float'>;
-  /** Fully transformed world position: spread(chain(mix(A, B, t))). */
+  /** Fully transformed world position: fieldSpin(spread(chain(mix(A, B, t)))). */
   worldOf(index: Node<'int'>): Node<'vec3'>;
 }
 
@@ -310,6 +317,7 @@ export function createGpuTransform(positions: PositionStore, pivots: PivotStore)
   const uMorphT = uniform(0);
   const uSpread = uniform(1);
   const uCentroid = uniform(new Vector3(0, 0, 0));
+  const uFieldQuat = uniform(new Vector4(0, 0, 0, 1)); // identity
 
   const baseOf = (index: Node<'int'>): Node<'vec3'> =>
     mix(positions.fetchA(index).xyz, positions.fetchB(index).xyz, uMorphT) as unknown as Node<'vec3'>;
@@ -319,6 +327,7 @@ export function createGpuTransform(positions: PositionStore, pivots: PivotStore)
       morphT: uMorphT as unknown as { value: number },
       spread: uSpread as unknown as { value: number },
       centroid: uCentroid as unknown as { value: Vector3 },
+      fieldQuat: uFieldQuat as unknown as { value: Vector4 },
     },
     baseOf,
     chainOf: (index) => positions.fetchA(index).w as unknown as Node<'float'>,
@@ -328,7 +337,14 @@ export function createGpuTransform(positions: PositionStore, pivots: PivotStore)
       const a = positions.fetchA(index);
       const base = mix(a.xyz, positions.fetchB(index).xyz, uMorphT) as unknown as Node<'vec3'>;
       const chained = pivots.apply(base, a.w as unknown as Node<'float'>);
-      return uCentroid.add(chained.sub(uCentroid).mul(uSpread)) as unknown as Node<'vec3'>;
+      const spread = uCentroid.add(chained.sub(uCentroid).mul(uSpread));
+      // Field-global root-frame rotation about the centroid, LAST: q ⊗ (spread − c) + c, the
+      // same v' = v + w·t + q×t kernel (t = 2 q×v) the pivot store uses. At the identity quat
+      // t = 0, so the point passes through EXACTLY — an unspun field is byte-stable here.
+      const rel = spread.sub(uCentroid);
+      const t2 = cross(uFieldQuat.xyz, rel).mul(2.0);
+      const rotated = rel.add(t2.mul(uFieldQuat.w)).add(cross(uFieldQuat.xyz, t2));
+      return uCentroid.add(rotated) as unknown as Node<'vec3'>;
     },
   };
 }
