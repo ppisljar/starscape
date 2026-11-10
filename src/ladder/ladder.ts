@@ -177,6 +177,10 @@ export function createLadder(opts: LadderOptions = {}): Ladder {
     cardRadiusSpacings: opts.cardRadiusSpacings ?? CARD_R_SPACINGS,
     cursorRadiusPx: opts.cursorRadiusPx ?? CURSOR_RADIUS_PX,
     cursorPull: opts.cursorPull ?? CURSOR_PULL,
+    // per-tier master switches: default on, so omitting them is exactly today's behaviour.
+    showLabels: opts.showLabels ?? true,
+    showCards: opts.showCards ?? true,
+    showOpen: opts.showOpen ?? true,
   };
 
   // ---- fixed scratch: candidate rank (grows geometrically, never shrinks, never per tick)
@@ -274,7 +278,14 @@ export function createLadder(opts: LadderOptions = {}): Ladder {
     const evNamed = events.named;
     evNamed.enterCount = 0;
     evNamed.exitCount = 0;
-    const keepN = Math.min(cfg.keep, m);
+    // Labels OFF (cfg.showLabels) is a true suppression, not a threshold: drop the whole live
+    // set this tick — emitting the exits the overlay unmounts on — and leave keepN/earnN at 0 so
+    // the keep, mount and publish passes below run zero iterations. The tier emits NOTHING.
+    if (!cfg.showLabels && liveCount > 0) {
+      for (let l = 0; l < liveCount; l++) evNamed.exit[evNamed.exitCount++] = liveNode[l]!;
+      liveCount = 0;
+    }
+    const keepN = cfg.showLabels ? Math.min(cfg.keep, m) : 0;
     let w = 0;
     for (let l = 0; l < liveCount; l++) {
       const node = liveNode[l]!;
@@ -301,7 +312,7 @@ export function createLadder(opts: LadderOptions = {}): Ladder {
     // immediately and a sub-dwell flyby still names what it passes; the dwell above is a
     // minimum lifetime, not an entry delay. Rank order, so when the cap bites the
     // better-ranked candidate wins the slot.
-    const earnN = Math.min(cfg.earn, m);
+    const earnN = cfg.showLabels ? Math.min(cfg.earn, m) : 0;
     for (let k = 0; k < earnN && liveCount < cfg.namedCap; k++) {
       const node = nodeCol[ord[k]!]!;
       let isLive = false;
@@ -359,15 +370,20 @@ export function createLadder(opts: LadderOptions = {}): Ladder {
     // the FIXED card radius (≤ cardSpacings × spacing), until the budget fills — so with six
     // nodes oversubscribing five slots, the best-ranked five win.
     let nSlots = 0;
-    if (pinned >= 0) {
+    // Cards OFF (cfg.showCards) is a true suppression: the budget is 0, so no card/lock slot is
+    // produced — not even a pinned node's, which otherwise rides ON TOP of the budget. The step-7
+    // event diff then unmounts whatever was showing. The open tier needs a card to open into, so
+    // this also suppresses open (step 6 forces openNode = -1 below).
+    if (cfg.showCards && pinned >= 0) {
       const s = slotPool[nSlots]!;
       s.node = pinned;
-      s.tier = 'open';
+      // a pin IS an open card — unless the open tier is itself suppressed, where it locks instead.
+      s.tier = cfg.showOpen ? 'open' : 'lock';
       s.growT = 1;
       slotDist[nSlots] = pinnedPos >= 0 ? distCol[pinnedPos]! : 0;
       nSlots++;
     }
-    const budget = pinned >= 0 ? cfg.cards + 1 : cfg.cards;
+    const budget = cfg.showCards ? (pinned >= 0 ? cfg.cards + 1 : cfg.cards) : 0;
     for (let k = 0; k < m && nSlots < budget; k++) {
       const c = ord[k]!;
       const node = nodeCol[c]!;
@@ -419,7 +435,13 @@ export function createLadder(opts: LadderOptions = {}): Ladder {
     // different page the retreat flight passes (the port's setOpenEnabled(false): a page
     // claiming the slot mid-retreat makes the gesture appear to OPEN something instead of
     // closing something) — until real user intent: a reported cursor move, or a pin.
-    if (pinned >= 0) {
+    if (!cfg.showCards || !cfg.showOpen) {
+      // Open tier suppressed — directly (showOpen off) or implicitly (showCards off: nothing to
+      // open into). Nothing is open; a pinned node still shows its LOCKED card (set in step 4).
+      openNode = -1;
+      openHeldMs = 0;
+      suspended = false;
+    } else if (pinned >= 0) {
       if (openNode !== pinned) {
         openNode = pinned;
         openHeldMs = 0;

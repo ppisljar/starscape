@@ -150,7 +150,11 @@ export const SHAPE_FACETS = ['none'] as const;
 
 /** The schema. Order is panel order; rows share a group by adjacency. */
 export const SCHEMA: readonly SchemaRow[] = [
-  /* ---- the zoom ladder (§6): where each tier fires. Distances in page-spacings. ---------- */
+  /* ---- the zoom ladder (§6): where each tier fires. Distances in page-spacings. ----------
+     The two master switches first: a tier threshold only moves WHERE a tier fires, never whether
+     it fires at all, so a true OFF needs its own toggle (ladder honours showCards/showOpen). */
+  { group: 'ladder', key: 'showCards', label: 'cards', kind: 'toggle', default: true, unit: 'none' },
+  { group: 'ladder', key: 'showOpen', label: 'full page view', kind: 'toggle', default: true, unit: 'none' },
   { group: 'ladder', key: 'tierCard', label: 'card appears', kind: 'range', min: 0.5, max: 12, step: 0.1, default: CARD_SPACINGS, unit: 'spacings' },
   { group: 'ladder', key: 'tierLock', label: 'box locks', kind: 'range', min: 0.2, max: 6, step: 0.05, default: LOCK_SPACINGS, unit: 'spacings' },
   { group: 'ladder', key: 'tierOpen', label: 'body opens', kind: 'range', min: 0.1, max: 3, step: 0.05, default: OPEN_SPACINGS, unit: 'spacings' },
@@ -159,7 +163,10 @@ export const SCHEMA: readonly SchemaRow[] = [
   { group: 'ladder', key: 'lockW', label: 'locked width', kind: 'range', min: 220, max: 760, step: 10, default: LOCK_W, unit: 'px' },
   { group: 'ladder', key: 'lockH', label: 'locked height', kind: 'range', min: 160, max: 640, step: 10, default: LOCK_H, unit: 'px' },
 
-  /* ---- the label band: earn/keep hysteresis, cap, dwell (ladder/constants). -------------- */
+  /* ---- the label band: earn/keep hysteresis, cap, dwell (ladder/constants). --------------
+     The master switch first — off suppresses the whole tier, below any px gate (ladder honours
+     showLabels: no node ever earns a label, live ones are dropped). */
+  { group: 'labels', key: 'showLabels', label: 'labels', kind: 'toggle', default: true, unit: 'none' },
   { group: 'labels', key: 'namedPx', label: 'label from', kind: 'range', min: 4, max: 60, step: 1, default: NAMED_PX, unit: 'px' },
   { group: 'labels', key: 'labelEarn', label: 'earn inside top', kind: 'range', min: 2, max: 60, step: 1, default: EARN, unit: 'none' },
   { group: 'labels', key: 'labelKeep', label: 'keep until top', kind: 'range', min: 4, max: 90, step: 1, default: KEEP, unit: 'none' },
@@ -174,7 +181,11 @@ export const SCHEMA: readonly SchemaRow[] = [
   { group: 'nodes', key: 'nodeScale', label: 'node size', kind: 'range', min: 0.05, max: 4, step: 0.05, default: NODE_SCALE, unit: 'none' },
   { group: 'nodes', key: 'sizeCurve', label: 'size contrast', kind: 'range', min: 0.15, max: 3, step: 0.05, default: SIZE_CURVE, unit: 'none' },
   { group: 'nodes', key: 'nodeMinPx', label: 'never smaller than', kind: 'range', min: 0.2, max: 10, step: 0.1, default: NODE_MIN_PX, unit: 'px' },
-  { group: 'nodes', key: 'nodeMaxPx', label: 'never larger than', kind: 'range', min: 10, max: 600, step: 10, default: NODE_MAX_PX, unit: 'px' },
+  /* nodeMaxPx rail runs to 8000, not 600: the upper clamp is what stops a node ever filling the
+     frame, and a consumer flying nose-to a focused node wants it to grow PAST the screen (the
+     close-orbit "fill the view" gesture). The default (NODE_MAX_PX) is unchanged — a distant
+     field still must not have a near page swallow the viewport; the high rail is opt-in. */
+  { group: 'nodes', key: 'nodeMaxPx', label: 'never larger than', kind: 'range', min: 10, max: 8000, step: 10, default: NODE_MAX_PX, unit: 'px' },
   { group: 'nodes', key: 'falloff', label: 'shrink with distance', kind: 'range', min: 0, max: 2.5, step: 0.05, default: FALLOFF, unit: 'none' },
   { group: 'nodes', key: 'bodyR', label: 'solid part', kind: 'range', min: 0.15, max: 1, step: 0.01, default: BODY_R, unit: 'none' },
   { group: 'nodes', key: 'haloPx', label: 'halo width', kind: 'range', min: 0, max: 24, step: 0.5, default: HALO_PX, unit: 'px' },

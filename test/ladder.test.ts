@@ -357,6 +357,77 @@ describe('a pin outranks the ladder', () => {
   });
 });
 
+describe('the per-tier master switches suppress a whole tier', () => {
+  // distances: D_OPEN(45) < D_LOCK(100) < D_CARD(220) at SP=100 — a dist:40 row is open-eligible.
+  const near = (node: number, px: number): Row => ({ node, px, dist: 40 });
+
+  it('showLabels:false — no node ever earns a label', () => {
+    const lad = createLadder({ dwellMs: 0, showLabels: false });
+    // a glyph well past NAMED_PX that would normally earn a label
+    const st = lad.update(0.016, viewOf([near(1, 80)]));
+    expect(namedOf(st)).toEqual([]);
+    expect(st.namedCount).toBe(0);
+    expect(evList(st.events.named).enter).toEqual([]);
+    // cards are independent — the card tier still fires
+    expect(st.open).toBe(1);
+  });
+
+  it('showLabels flipped off LIVE drops the live set this tick, emitting the exits', () => {
+    const lad = createLadder({ dwellMs: 0, earn: 5, keep: 8 });
+    let st = lad.update(0.016, ranked([1, 2, 3]));
+    expect(namedOf(st)).toEqual([1, 2, 3]);
+    lad.config.showLabels = false; // the site mutates ladder.config live (applyLadderCfg)
+    st = lad.update(0.016, ranked([1, 2, 3]));
+    expect(namedOf(st)).toEqual([]);
+    expect(evList(st.events.named).exit.sort()).toEqual([1, 2, 3]);
+    expect(evList(st.events.named).enter).toEqual([]);
+  });
+
+  it('showCards:false — the card budget is 0, not even a pin gets a card, and nothing opens', () => {
+    const lad = createLadder({ dwellMs: 0, showCards: false });
+    const rows: Row[] = [];
+    for (let k = 0; k < 6; k++) rows.push(near(10 + k, 40 - k));
+    let st = lad.update(0.016, viewOf(rows));
+    expect(st.cards.length).toBe(0);
+    expect(st.open).toBe(-1);
+    // a pin, which normally rides ON TOP of the budget, is suppressed too
+    st = lad.update(0.016, viewOf(rows, { pinned: 99 }));
+    expect(st.cards.length).toBe(0);
+    expect(st.open).toBe(-1);
+    // labels are independent — the named tier still fires
+    expect(namedOf(st).length).toBeGreaterThan(0);
+  });
+
+  it('showCards flipped off LIVE unmounts every card via the exit diff', () => {
+    const lad = createLadder({ dwellMs: 0 });
+    let st = lad.update(0.016, viewOf([near(1, 40), near(2, 30)]));
+    expect(st.cards.length).toBe(2);
+    lad.config.showCards = false;
+    st = lad.update(0.016, viewOf([near(1, 40), near(2, 30)]));
+    expect(st.cards.length).toBe(0);
+    expect(evList(st.events.card).exit.sort()).toEqual([1, 2]);
+  });
+
+  it('showOpen:false — the card/lock tiers still fire but the body never opens', () => {
+    const lad = createLadder({ dwellMs: 0, showOpen: false });
+    // dist 40 is inside the open distance, so this would normally be tier 'open'
+    const st = lad.update(0.016, viewOf([near(1, 40)]));
+    expect(st.open).toBe(-1);
+    expect(st.cards.length).toBe(1);
+    expect(st.cards[0]!.tier).toBe('lock'); // locked, but not open
+    expect(evList(st.events.open).enter).toEqual([]);
+  });
+
+  it('showOpen:false — a pin shows a LOCKED card, never an open one', () => {
+    const lad = createLadder({ showOpen: false });
+    const st = lad.update(0.016, viewOf([near(1, 40)], { pinned: 1 }));
+    expect(st.cards.length).toBe(1);
+    expect(st.cards[0]).toMatchObject({ node: 1, tier: 'lock', growT: 1 });
+    expect(st.open).toBe(-1);
+    expect(evList(st.events.open).enter).toEqual([]);
+  });
+});
+
 describe('the open slot (budget 1)', () => {
   const near = (node: number, px: number): Row => ({ node, px, dist: 40 });
 

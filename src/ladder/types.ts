@@ -111,6 +111,21 @@ export interface LadderOptions {
   cardRadiusSpacings?: number;
   cursorRadiusPx?: number;
   cursorPull?: number;
+  /* ---- per-tier master switches (default on). Each SUPPRESSES one whole tier — a true OFF the
+   * tier thresholds alone cannot reach (a threshold only moves WHERE a tier fires, never whether
+   * it fires at all). They are read live every tick, so flipping one off drops that tier's set
+   * the same frame, emitting the exits the overlay needs to unmount. The tiers nest, so the
+   * switches compose: cards off implies no open (no box to open), open off leaves the box but
+   * never resolves the body. */
+  /** When false the named (label) tier emits nothing — no node ever earns a label, and any live
+   *  one is dropped (exited) this tick. */
+  showLabels?: boolean;
+  /** When false the card budget is 0: no card/lock slot is produced, not even a pinned node's,
+   *  and (the tiers nesting) nothing opens. */
+  showCards?: boolean;
+  /** When false the open tier never fires: auto-open is inert and a pin locks its card but never
+   *  resolves the body. Leaves the card/lock tiers untouched. */
+  showOpen?: boolean;
 }
 
 export interface Ladder {
