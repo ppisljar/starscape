@@ -45,6 +45,7 @@ import {
 } from './channels';
 import { facetPalette, paintFacetColors } from './palette';
 import { localDensity } from './density';
+import { spatialFacetColors } from './spatial';
 import { createTonemap, OP_INDEX } from './tonemap';
 import type { TonemapOp } from './tonemap';
 import { DEFAULT_RAMP, rampColors, rampColorsTied } from '../theme/palettes';
@@ -132,13 +133,17 @@ export interface FieldStats {
   sizeColumn: string;
   colorFacet: string | null;
   /** The numeric column colour is bound to (setColorColumn), or null when a facet or the density
-   *  channel drives it — at most one of colorFacet / colorColumn is non-null (both null when
-   *  density colours the field, where colorDensity is true instead). */
+   *  channel drives it — at most one of colorFacet / colorColumn / colorSpatialFacet is non-null
+   *  (all null when density colours the field, where colorDensity is true instead). */
   colorColumn: string | null;
-  /** True when LOCAL SPATIAL DENSITY colours the field (setColorByDensity) — colorFacet and
-   *  colorColumn are both null then. The density is recomputed from the target geometry on every
-   *  retarget, so this look follows an arrangement change without the caller re-binding it. */
+  /** True when LOCAL SPATIAL DENSITY colours the field (setColorByDensity) — colorFacet,
+   *  colorColumn and colorSpatialFacet are all null then. The density is recomputed from the target
+   *  geometry on every retarget, so this look follows an arrangement change without re-binding. */
   colorDensity: boolean;
+  /** The facet coloured by SPATIAL ORDER (setColorFacetSpatial — clusters along a Hilbert curve
+   *  through the ramp), or null when a categorical facet / column / density drives the colour.
+   *  Position-dependent, so it too is recomputed on every retarget. */
+  colorSpatialFacet: string | null;
   /** The facet bound to node GLYPH SHAPE (setShapeFacet), or null when every node is a disc. */
   shapeFacet: string | null;
   /** The live highlight roll-off: operator name + pre-curve exposure (stage 8, ./tonemap). */
@@ -163,6 +168,14 @@ export interface Field {
   setLinkBudget(k: number): number;
   /** Re-bind node colour to a facet; links take their endpoints' colours with it. */
   setColorFacet(key: string): void;
+  /** Re-bind node colour to a facet by SPATIAL ORDER (field/spatial.ts): each facet-value cluster
+   *  is coloured by its centroid's position along a 3D Hilbert curve, mapped to `ramp` by rank —
+   *  so spatially-adjacent clusters share hue (a smooth gradient), unlike setColorFacet's
+   *  categorical palette where a high-cardinality facet scatters colours by value index. Reads the
+   *  CURRENT target geometry, so (like setColorByDensity) it recomputes automatically on every
+   *  arrangement change (setHierarchy / setTarget / setProjection). Links take their endpoints'
+   *  colours with it. Default ramp DEFAULT_RAMP (theme/palettes). */
+  setColorFacetSpatial(key: string, ramp?: RampLike): void;
   /** Re-bind node colour to a numeric column through a ramp (stage 8, §7): rank-normalised
    *  percentile → ramp colour — the same rank machinery the size channel uses, for the same
    *  reason (a linear map leaves a heavy-tailed column on the ramp's floor). Links take
@@ -367,6 +380,12 @@ export function createField(graph: Graph, opts: FieldOpts = {}): Field {
      rank — which is why one recompute per retarget suffices, never per frame (§4). */
   let densityRamp: RampLike | null = null;
   let densScratch: Float32Array | null = null;
+  /* SPATIAL facet-colour state (setColorFacetSpatial). spatialFacet non-null ⟺ clusters are
+     coloured by their centroid's position along a 3D Hilbert curve through spatialRamp (field/
+     spatial.ts) — colorFacet / colorColumn null and densityRamp null then. Like density it reads
+     the TARGET geometry (baseB), so it is recomputed on every retarget, never per frame (§4). */
+  let spatialFacet: string | null = null;
+  let spatialRamp: RampLike = DEFAULT_RAMP;
   const colors = new Float32Array(n * 3);
   const shapes = new Float32Array(n); // disc (0) per node; setShapeFacet binds iShape to a facet
   const sizes = computeSizes(graph, sizeColumn, n);
@@ -505,10 +524,11 @@ export function createField(graph: Graph, opts: FieldOpts = {}): Field {
     posStore.upload(baseA, baseB, chainIds, n); // the ONE upload of the retarget
     tweens.set('morph', 0); // emits → centroid ← cA (already cA if t was 0: no emit needed)
     tweens.to('morph', 1, { duration });
-    // The density channel depends on the TARGET geometry, which just changed: recolour from the
-    // new baseB (O(n) density, an event cost — never per frame). Colours snap to the destination's
-    // density while the positions morph into it; the brief staleness is the accepted §4 seam.
+    // The density AND spatial-facet channels depend on the TARGET geometry, which just changed:
+    // recolour from the new baseB (O(n) event cost — never per frame). Colours snap to the
+    // destination while the positions morph into it; the brief staleness is the accepted §4 seam.
     if (densityRamp !== null) recolorDensity();
+    else if (spatialFacet !== null) recolorSpatial();
   };
 
   /* ---- layers ------------------------------------------------------------------------ */
@@ -665,6 +685,18 @@ export function createField(graph: Graph, opts: FieldOpts = {}): Field {
     writeLinkColors();
   };
 
+  /** Recompute the SPATIAL facet colouring from the current TARGET geometry (baseB): order the
+   *  colour facet's values along a 3D Hilbert curve over their centroids and paint each node its
+   *  value's ramp colour (field/spatial.ts). Called by setColorFacetSpatial and, while the mode is
+   *  active, by every retarget (finishRetarget) — the centroids move with the arrangement, so the
+   *  gradient must follow. O(n) + O(values·log values); an event cost, never per frame. */
+  const recolorSpatial = (): void => {
+    const facet = graph.facets[spatialFacet!]!;
+    spatialFacetColors(facet.data, facet.values.length, baseB, n, spatialRamp, colors);
+    node.colorAttr.needsUpdate = true;
+    writeLinkColors();
+  };
+
   /** mix(A, B, t) with exact endpoints — shared by basePositions and viewPositions
    *  (no `this`: the Field object must survive destructuring). */
   const basePositionsInto = (out?: Float32Array): Float32Array => {
@@ -701,9 +733,20 @@ export function createField(graph: Graph, opts: FieldOpts = {}): Field {
       colorFacet = key;
       colorColumn = null;
       densityRamp = null;
+      spatialFacet = null;
       paintColors(graph, colorFacet, n, colors);
       node.colorAttr.needsUpdate = true;
       writeLinkColors();
+    },
+
+    setColorFacetSpatial(key: string, ramp: RampLike = DEFAULT_RAMP): void {
+      if (!graph.facets[key]) throw new Error(`setColorFacetSpatial: "${key}" names no facet`);
+      spatialFacet = key;
+      spatialRamp = ramp;
+      colorFacet = null;
+      colorColumn = null;
+      densityRamp = null;
+      recolorSpatial(); // from the current baseB; recomputed on every retarget hereafter
     },
 
     setColorColumn(key: string, ramp: RampLike = DEFAULT_RAMP): void {
@@ -712,6 +755,7 @@ export function createField(graph: Graph, opts: FieldOpts = {}): Field {
       colorColumn = key;
       colorFacet = null;
       densityRamp = null;
+      spatialFacet = null;
       rampColors(col.data, n, ramp, colors); // rank-normalised — the sizeOf rank machinery
       node.colorAttr.needsUpdate = true;
       writeLinkColors();
@@ -720,6 +764,7 @@ export function createField(graph: Graph, opts: FieldOpts = {}): Field {
     setColorByDensity(ramp: RampLike = 'nebula'): void {
       colorColumn = null;
       colorFacet = null;
+      spatialFacet = null;
       densityRamp = ramp;
       recolorDensity(); // from the current baseB; recomputed on every retarget hereafter
     },
@@ -890,6 +935,7 @@ export function createField(graph: Graph, opts: FieldOpts = {}): Field {
         colorFacet,
         colorColumn,
         colorDensity: densityRamp !== null,
+        colorSpatialFacet: spatialFacet,
         shapeFacet,
         tonemap: { op: tonemapOp, exposure: tonemap.uniforms.exposure.value },
         morph: { t: tweens.get('morph'), active: tweens.active() },
