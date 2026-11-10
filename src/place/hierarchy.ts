@@ -38,8 +38,10 @@
  */
 
 import type { Graph } from '../core/types';
+import { hash } from '../core/hash';
 import { placeGroup } from './engine';
 import { getPreset } from './presets';
+import { getShape } from './registry';
 import type { PlacementSpec } from './types';
 
 /** Hard ceiling on `levels.length`. Placement itself has no depth limit by design (§3.4),
@@ -62,6 +64,44 @@ export interface SpinSpec {
   axis?: [number, number, number];
 }
 
+/** The curated shape set a `{ random: true }` level draws from, in no significant order (§3.3).
+ *  Real geometric manifolds with distinct silhouettes — a curve (`ring`, `helix`), surfaces
+ *  (`shell`, `disc`, `torus`) and volumes (`ball`, `box`, `cloud`) — each usable with the default
+ *  ordering and NO required params, so a group gets a recognisable shape whatever it is handed.
+ *  Presets are deliberately excluded: they bundle an ordering/density a bare per-group pick would
+ *  not feed. A level may override the set (`{ random: true, shapes: [...] }`). */
+export const RANDOM_SHAPES = [
+  'ring',
+  'helix',
+  'shell',
+  'disc',
+  'torus',
+  'ball',
+  'box',
+  'cloud',
+] as const;
+
+/** A per-group RANDOM arrangement for a level (§3.3, §10.1): instead of ONE shape for the whole
+ *  level, each group pivot the level fills draws a shape from `shapes` (default RANDOM_SHAPES)
+ *  chosen by `hash(groupPivotId, salt)` — fully DETERMINISTIC (no RNG, no clock), so the same
+ *  hierarchy + salt yields an identical assignment forever. Everything else the level does —
+ *  ordering, density, scatter, params, and the level's own spread (`radiusScale`) and `spin` —
+ *  is shared across groups through `base`; only the SHAPE varies. On the LEAF level each leaf
+ *  group lays its nodes out with its own shape; on an interior level each parent group lays its
+ *  child centres out with its own shape. */
+export interface RandomPlace {
+  /** The sentinel discriminant — must be the literal `true`. */
+  random: true;
+  /** Shape keys to pick from (each resolved and validated at compile time; an unknown key throws
+   *  naming the registered shapes). Default RANDOM_SHAPES. */
+  shapes?: readonly string[];
+  /** The shared knobs applied to EVERY group (ordering / density / densityAxis / scatter /
+   *  params) — a PlacementSpec without its `shape`, which the per-group pick supplies. A
+   *  `densityAxis` is clamped into each chosen shape's dimension (the shapes vary in dim, so an
+   *  axis valid for a volume would be out of range for a curve). Default `{}`. */
+  base?: Omit<PlacementSpec, 'shape'>;
+}
+
 /** One hierarchy level (§3.4). Interior levels carry `groupBy`; the last level is the
  *  leaf and must not. */
 export interface LevelSpec {
@@ -70,9 +110,10 @@ export interface LevelSpec {
    *  places, which is a spec typo, not a request). */
   groupBy?: string;
   /** How this level seats its children (child group centres, or nodes at the leaf):
-   *  a four-knob PlacementSpec, or a registered preset by name (`{ preset: 'spiralGalaxy' }`
-   *  — resolved through src/place/presets, unknown names throw at compile time). */
-  place: PlacementSpec | { preset: string };
+   *  a four-knob PlacementSpec, a registered preset by name (`{ preset: 'spiralGalaxy' }` —
+   *  resolved through src/place/presets, unknown names throw at compile time), or a per-group
+   *  RANDOM arrangement (`{ random: true }` — each group a different shape, see RandomPlace). */
+  place: PlacementSpec | { preset: string } | RandomPlace;
   /** Optional rotating frame about this level's group pivots (§3.5). */
   spin?: SpinSpec;
   /** Scale applied to this level's computed group radii — AFTER the `spacing × count^⅓`
@@ -164,10 +205,45 @@ function groupSalt(base: number, level: number, pivot: number): number {
   );
 }
 
-/** `place:` → a concrete PlacementSpec; `{ preset }` resolves through the preset registry
- *  (throws naming the known presets on a miss — at compile time, not mid-placement). */
+/** Is this level's `place` the per-group RANDOM form? (narrows to RandomPlace). */
+function isRandomPlace(place: LevelSpec['place']): place is RandomPlace {
+  return 'random' in place && place.random === true;
+}
+
+/** A non-random `place:` → a concrete PlacementSpec; `{ preset }` resolves through the preset
+ *  registry (throws naming the known presets on a miss — at compile time, not mid-placement).
+ *  RANDOM levels resolve PER GROUP instead (randomSpecFor), so they never reach here. */
 function resolvePlace(place: PlacementSpec | { preset: string }): PlacementSpec {
   return 'preset' in place ? getPreset(place.preset) : place;
+}
+
+/** Resolve the PlacementSpec for ONE group of a RANDOM level: hash the group pivot id into the
+ *  level's shape set and bolt the chosen shape onto the shared `base` knobs. Deterministic
+ *  (§10.1): `hash(groupPivot, salt)` with a shape-dedicated, level-decorrelated salt — same
+ *  hierarchy + base salt ⇒ same shape every time. `groupPivot` is the pivot the level is FILLING
+ *  (the parent whose children are being seated, or the leaf group whose nodes are being placed),
+ *  the same id the group's placement salt already keys on. */
+function randomSpecFor(
+  rp: RandomPlace,
+  groupPivot: number,
+  level: number,
+  salt: number,
+): PlacementSpec {
+  const set = rp.shapes ?? RANDOM_SHAPES;
+  // A stream distinct from the placement draws that reuse `salt`, so the shape choice does not
+  // correlate with where the members land. level-folded so the same pivot id at two levels differs.
+  const stream = (salt ^ Math.imul(level + 1, 0x27d4eb2f)) | 0;
+  const pick = (hash(groupPivot, stream) * set.length) | 0;
+  const shape = set[pick < set.length ? pick : set.length - 1]!;
+  const base = rp.base ?? {};
+  const spec: PlacementSpec = { ...base, shape };
+  if (base.densityAxis !== undefined) {
+    // the shapes vary in dim; clamp a shared densityAxis into the chosen shape's range so a
+    // volume-level axis does not throw on a curve/surface group.
+    const dim = getShape(shape).dim;
+    spec.densityAxis = Math.min(base.densityAxis, dim - 1) as 0 | 1 | 2;
+  }
+  return spec;
 }
 
 /* ------------------------------------------------------------------ the compiler */
@@ -220,7 +296,10 @@ export function compileHierarchy(
 
   /* ---- validate every level up front: a typo in level 5 must not come up only after
    * levels 0–4 placed half the field. Spin axes are normalised here, once per level. */
-  const placeSpecs: PlacementSpec[] = [];
+  /* placeSpecs[k] is the level's ONE resolved spec, or null when the level is RANDOM — then
+   * randomSpecs[k] holds the RandomPlace and the spec is resolved per group at placement. */
+  const placeSpecs: (PlacementSpec | null)[] = [];
+  const randomSpecs: (RandomPlace | null)[] = [];
   const radiusScaleOf = new Float64Array(L).fill(1);
   const spinAxis = new Float64Array(L * 3);
   const spinRate = new Float64Array(L);
@@ -249,7 +328,18 @@ export function compileHierarchy(
         );
       }
     }
-    placeSpecs.push(resolvePlace(lv.place));
+    if (isRandomPlace(lv.place)) {
+      const set = lv.place.shapes ?? RANDOM_SHAPES;
+      if (set.length === 0) {
+        throw new Error(`compileHierarchy: level ${k} random place has an empty shape set`);
+      }
+      for (const sk of set) getShape(sk); // validate every key now, naming the registered shapes
+      placeSpecs.push(null);
+      randomSpecs.push(lv.place);
+    } else {
+      placeSpecs.push(resolvePlace(lv.place));
+      randomSpecs.push(null);
+    }
     const rs = lv.radiusScale;
     if (rs !== undefined) {
       if (k === leafIndex && L > 1) {
@@ -429,7 +519,8 @@ export function compileHierarchy(
   const pivotIds = new Uint32Array(P);
   for (let p = 0; p < P; p++) pivotIds[p] = p;
   for (let k = 0; k < grouping; k++) {
-    const spec = placeSpecs[k]!;
+    const spec = placeSpecs[k];
+    const rp = randomSpecs[k];
     const lo = levelFirst[k]!;
     const hi = levelFirst[k + 1]!;
     let a = lo;
@@ -437,11 +528,14 @@ export function compileHierarchy(
       const par = parent[a]!;
       let b = a + 1;
       while (b < hi && parent[b]! === par) b++;
-      placeGroup(spec, {
+      // RANDOM level: the parent group being filled picks its own shape (hash(par, salt)); a
+      // plain level reuses its one resolved spec. Everything else about the call is identical.
+      const gSalt = groupSalt(baseSalt, k, par);
+      placeGroup(spec ?? randomSpecFor(rp!, par, k, gSalt), {
         members: pivotIds.subarray(a, b),
         count: b - a,
         graph: null,
-        salt: groupSalt(baseSalt, k, par),
+        salt: gSalt,
         radius: par < 0 ? rootRadius : radius[par]!,
         out: centre,
         outOffset: a * 3,
@@ -480,15 +574,18 @@ export function compileHierarchy(
     if (pCount[q]! > maxLeaf) maxLeaf = pCount[q]!;
   }
   const scratch = new Float32Array(maxLeaf * 3);
-  const leafSpec = placeSpecs[leafIndex]!;
+  const leafSpec = placeSpecs[leafIndex];
+  const leafRandom = randomSpecs[leafIndex];
   for (let q = leafLo; q < leafHi; q++) {
     const s = pStart[q]!;
     const c = pCount[q]!;
-    placeGroup(leafSpec, {
+    // RANDOM leaf: each leaf group lays its nodes out with a shape of its own (hash(q, salt)).
+    const gSalt = groupSalt(baseSalt, leafIndex, q);
+    placeGroup(leafSpec ?? randomSpecFor(leafRandom!, q, leafIndex, gSalt), {
       members: order.subarray(s, s + c),
       count: c,
       graph,
-      salt: groupSalt(baseSalt, leafIndex, q),
+      salt: gSalt,
       radius: radius[q]!,
       out: scratch,
       outOffset: 0,

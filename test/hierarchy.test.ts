@@ -737,3 +737,100 @@ describe('attachToAnchors: multi-source BFS pull (arrange.js bySubset, ported)',
     expect(() => attachToAnchors(HAND, Uint32Array.from([0, 99]))).toThrow(/out of range/);
   });
 });
+
+/* ------------------------------------------------------------------ RandomPlace (§3.3) */
+
+describe('place: { random } — a deterministic per-group shape', () => {
+  /* Eight groups of eight nodes, grouped by facet `g`, leaf = random per group: each leaf
+   *  group lays its nodes out with a shape hashed from its pivot id. A ring (dim 1, y ≡ 0)
+   *  and a ball (dim 3) place very differently, so distinct shapes are observable in the
+   *  positions without reaching into the private pick. */
+  const EIGHT = handGraph([8, 8, 8, 8, 8, 8, 8, 8]);
+  const randomLevels: LevelSpec[] = [
+    { groupBy: 'g', place: { shape: 'shell' } },
+    { place: { random: true } },
+  ];
+
+  it('same hierarchy + salt → byte-identical output (no RNG, no clock)', () => {
+    const a = compileHierarchy(EIGHT, randomLevels, { spacing: 1, salt: 3 });
+    const b = compileHierarchy(EIGHT, randomLevels, { spacing: 1, salt: 3 });
+    expect(fnv1a(b.positions)).toBe(fnv1a(a.positions));
+  });
+
+  it('a different base salt re-deals the shapes', () => {
+    const a = compileHierarchy(EIGHT, randomLevels, { spacing: 1, salt: 3 });
+    const b = compileHierarchy(EIGHT, randomLevels, { spacing: 1, salt: 4 });
+    expect(fnv1a(b.positions)).not.toBe(fnv1a(a.positions));
+  });
+
+  /** Per-group spread of the member positions along world y. A group's parent offset is
+   *  constant across its members, so this equals the LOCAL y spread of its shape: a planar
+   *  shape (ring, disc) is ~0, a volumetric/curved one (ball, box, shell, helix, …) is not. */
+  const yExtentByGroup = (h: CompiledHierarchy, n: number): Map<number, number> => {
+    const lo = new Map<number, number>();
+    const hi = new Map<number, number>();
+    for (let i = 0; i < n; i++) {
+      const g = h.nodePivot[i]!;
+      const y = h.positions[i * 3 + 1]!;
+      lo.set(g, Math.min(lo.get(g) ?? Infinity, y));
+      hi.set(g, Math.max(hi.get(g) ?? -Infinity, y));
+    }
+    const ext = new Map<number, number>();
+    for (const g of lo.keys()) ext.set(g, hi.get(g)! - lo.get(g)!);
+    return ext;
+  };
+
+  it('groups differ: not every leaf group drew the same shape', () => {
+    // Every leaf group has the same size (8), radius and ordering, so two groups that drew the
+    // SAME shape get a byte-identical local layout and thus the same y-spread; two different
+    // shapes get different y-spreads. More than one distinct y-spread across the eight groups
+    // therefore proves the per-group shape genuinely varies (and is not one shape for the level).
+    const h = compileHierarchy(EIGHT, randomLevels, { spacing: 1, salt: 3 });
+    const spreads = new Set([...yExtentByGroup(h, EIGHT.n).values()].map((e) => e.toFixed(3)));
+    expect(spreads.size).toBeGreaterThan(1);
+  });
+
+  it('respects a restricted shape set', () => {
+    // all-ring set: every leaf group is a ring, so every group has ~0 spread along world y
+    // (the ring lies in the XZ plane; only its parent's constant y offset remains).
+    const rings: LevelSpec[] = [
+      { groupBy: 'g', place: { shape: 'shell' } },
+      { place: { random: true, shapes: ['ring'] } },
+    ];
+    const h = compileHierarchy(EIGHT, rings, { spacing: 1, salt: 3 });
+    for (const ext of yExtentByGroup(h, EIGHT.n).values()) expect(ext).toBeLessThan(1e-4);
+  });
+
+  it('an unknown shape in the set throws at compile time, naming it', () => {
+    const bad: LevelSpec[] = [
+      { groupBy: 'g', place: { shape: 'shell' } },
+      { place: { random: true, shapes: ['ring', 'nope'] } },
+    ];
+    expect(() => compileHierarchy(EIGHT, bad, { spacing: 1 })).toThrow(/nope/);
+  });
+
+  it('an empty shape set throws', () => {
+    const bad: LevelSpec[] = [
+      { groupBy: 'g', place: { shape: 'shell' } },
+      { place: { random: true, shapes: [] } },
+    ];
+    expect(() => compileHierarchy(EIGHT, bad, { spacing: 1 })).toThrow(/empty shape set/);
+  });
+
+  it('an interior random level seats child centres and stays deterministic', () => {
+    // g (random interior) → leaf cloud. The interior level seats its group centres with a
+    // hashed shape; assert it compiles, every node is finite, and the output is reproducible.
+    const three = handGraph([16, 16, 16, 16]); // 4 top groups
+    const levels: LevelSpec[] = [
+      { groupBy: 'g', place: { random: true } },
+      { place: { shape: 'cloud' } },
+    ];
+    const h = compileHierarchy(three, levels, { spacing: 1, salt: 2 });
+    for (let i = 0; i < three.n; i++) {
+      expect(Number.isFinite(h.positions[i * 3]!)).toBe(true);
+    }
+    // determinism holds for the interior form too
+    const h2 = compileHierarchy(three, levels, { spacing: 1, salt: 2 });
+    expect(fnv1a(h2.positions)).toBe(fnv1a(h.positions));
+  });
+});
