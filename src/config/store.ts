@@ -233,8 +233,19 @@ export function createConfigStore(opts: ConfigStoreOptions = {}): ConfigStore {
       }
       applied[key] = v as ConfigValue;
     }
-    for (const k of Object.keys(defaults)) values[k] = defaults[k]!;
-    touched.clear();
+    /* Reset every NON-session key to its default, then overlay the diff. SESSION_KEYS
+       (linkBudget / renderScale / flatPx) are orthogonal to the LOOK: the corpus and device
+       chose them at boot (the §top invariant, "never ride a look"), and a look neither sets
+       them — overlay dropped them from the incoming diff above — NOR clears them here. Resetting
+       them to their 1:1 defaults on every applyPreset/applyLook silently DEFEATED the boot perf
+       notch: picking the nebula look reset linkBudget 0.04→1 and renderScale 0.5→1, so the
+       consumer's applyAll then drew all 3.9M links at dpr 2 and tanked the framerate zoomed in. */
+    for (const k of Object.keys(defaults)) {
+      if (!sessionKeys.has(k)) values[k] = defaults[k]!;
+    }
+    for (const k of [...touched]) {
+      if (!sessionKeys.has(k)) touched.delete(k);
+    }
     for (const k of Object.keys(applied)) {
       values[k] = applied[k]!;
       touched.add(k);

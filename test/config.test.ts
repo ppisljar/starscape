@@ -276,6 +276,26 @@ describe('presets, looks, and layering', () => {
     expect(store.touched.size).toBe(0);
   });
 
+  it('a look NEVER rides OR resets the session keys — the boot perf notch survives it', () => {
+    // The regression: applying a look reset the boot-derived session keys to their 1:1
+    // defaults, so the consumer then drew every link at native dpr and tanked the framerate
+    // zoomed in. Session keys are the corpus/device's, orthogonal to the visual look.
+    const { store } = fresh();
+    store.set('linkBudget', 0.04); // the 10⁶ boot notch
+    store.set('renderScale', 0.5);
+    store.set('flatPx', 9);
+    store.applyPreset('nebula'); // the look that must NOT touch them
+    expect(store.get('linkBudget')).toBe(0.04);
+    expect(store.get('renderScale')).toBe(0.5);
+    expect(store.get('flatPx')).toBe(9);
+    expect(store.get('blend')).toBe('additive'); // the look's own keys still land
+    // ...and a saved look is just as inert on them
+    store.saveLook('mine');
+    store.set('renderScale', 0.75);
+    expect(store.applyLook('mine')).toBe(true);
+    expect(store.get('renderScale')).toBe(0.75); // untouched by the look
+  });
+
   it('a saved look stores only the diff, round-trips, and forgets nothing it never touched', () => {
     const { store, map } = fresh();
     store.set('haloPx', 9);
