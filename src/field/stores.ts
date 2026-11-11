@@ -173,10 +173,13 @@ function packSlots(
 
 /** Default pivot-slot capacity (identity slot included) — the loud OVERFLOW ceiling,
  *  not an allocation: the texture is sized to the installed hierarchy (see
- *  createPivotStore), so raising this costs nothing per tick. The demo's two-level
- *  hierarchy compiles ~600 pivots — an order of magnitude of headroom before the loud
- *  error asks for more. */
-export const PIVOT_CAPACITY = 4096;
+ *  createPivotStore), so raising this costs nothing per tick — the per-tick sync is
+ *  O(live pivots), not O(capacity). It only grows the one-time scratch slabs (quat/offs,
+ *  capacity×4 + capacity×3 floats ≈ 2.8 MB at 100k) and the loud-overflow ceiling. Raised
+ *  to 100k so a fine-grained hierarchy (e.g. system×type, ~77.8k groups) can spin its
+ *  per-level frames; the real cost is the O(pivots) advance+sync that spinning that many
+ *  groups incurs whatever the cap. The demo's two-level hierarchy compiles ~600 pivots. */
+export const PIVOT_CAPACITY = 100_000;
 const PIV_TEX_WIDTH = 1024;
 const PIV_TEX_SHIFT = 10;
 
