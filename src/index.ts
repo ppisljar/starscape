@@ -189,6 +189,13 @@ export type { VisualPreset, VisualPresetName } from './theme/presets';
 export { createTonemap, tonemapRGB, EXPOSURE_DEFAULT, OP_INDEX, TONEMAP_OPS } from './field/tonemap';
 export type { TonemapOp, TonemapRig } from './field/tonemap';
 
+/* ---- the near-mesh real-3D LOD (DESIGN.md §5 tier-3 custom layer; §12 "mote → mesh"): an
+ * OPT-IN subsystem that draws genuine shaded, optionally textured 3D meshes for the few nodes
+ * large on screen (projected-size promotion), fading their billboards — the CLOSE look to the
+ * billboards' FAR look. Zero cost unless the consumer calls createNearMesh. */
+export { createNearMesh, generateNearTextures, NEAR_SHAPE_NAMES, NEAR_TEXTURE_NAMES, TEX_W, TEX_H } from './lod/nearmesh';
+export type { NearMesh, NearMeshOpts, NearShapeName, NearTextureName } from './lod/nearmesh';
+
 /* ---- the HDR bloom post-process (DESIGN.md §5 "tier-3 post-sum pass reusing the tonemap
  * curves"): a helper the CONSUMER installs — scene → additive HDR buffer → bloom → one post-sum
  * tonemap → screen — replacing renderer.render in the loop with post.render(). The library owns

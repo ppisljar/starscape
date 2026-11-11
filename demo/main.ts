@@ -43,6 +43,7 @@ import {
   createField,
   createFlycam,
   createLadder,
+  createNearMesh,
   createOrbitCam,
   createOverlay,
   createPanel,
@@ -102,6 +103,7 @@ import type {
   LadderCandidates,
   LadderView,
   LevelSpec,
+  NearMesh,
   PaletteName,
   ParamDesc,
   PlacementSpec,
@@ -514,6 +516,7 @@ async function main(): Promise<void> {
     camera.fov = v;
     camera.updateProjectionMatrix();
     field.setFov(v);
+    nearMesh?.setView(window.innerHeight, v); // projected-size promotion tracks the live fov
   });
 
   /* A pose tween the flycam does not provide: goTo/home deliberately RETREAT ALONG THE
@@ -591,6 +594,14 @@ async function main(): Promise<void> {
     viewdist: document.getElementById('viewdist') as HTMLInputElement,
     viewdistv: document.getElementById('viewdistv') as HTMLSpanElement,
     links: document.getElementById('links') as HTMLInputElement,
+    near: document.getElementById('near') as HTMLInputElement,
+    nearbox: document.getElementById('nearbox') as HTMLDivElement,
+    nearShape: document.getElementById('nearShape') as HTMLSelectElement,
+    nearTex: document.getElementById('nearTex') as HTMLSelectElement,
+    nearPromote: document.getElementById('nearPromote') as HTMLInputElement,
+    nearPromotev: document.getElementById('nearPromotev') as HTMLSpanElement,
+    nearCount: document.getElementById('nearCount') as HTMLInputElement,
+    nearCountv: document.getElementById('nearCountv') as HTMLSpanElement,
     home: document.getElementById('home') as HTMLButtonElement,
     tune: document.getElementById('tune') as HTMLButtonElement,
     search: document.getElementById('search') as HTMLInputElement,
@@ -2351,6 +2362,81 @@ async function main(): Promise<void> {
     camera.updateProjectionMatrix();
     field.resize(H);
     post.setSize(W, H); // the HDR/bloom targets track the renderer; this lands it same-frame
+    nearMesh?.setView(H, liveFov); // the near-mesh reasons in CSS px too (projected-size promotion)
+  });
+
+  /* ======================================================================================
+   * 3D NODES — the OPT-IN near-mesh LOD (library createNearMesh). Off by default: NOTHING is
+   * instantiated until the toggle is first switched on, so the default playground and the 10⁶
+   * path pay exactly zero. When on, nodes large on screen become genuine shaded / textured 3D
+   * meshes (fly up to one, or double-click to orbit it) while the field stays billboards — the
+   * two coexist, billboards fading as the mesh takes over. It cooperates with close-orbit for
+   * free: flying into a node makes it big on screen, which is exactly what promotes it.
+   * ====================================================================================== */
+  let nearMesh: NearMesh | null = null;
+  {
+    // populate the facet pickers from the live graph ('none' = default sphere / flat, no texture).
+    const facets = Object.keys(graph.facets);
+    for (const sel of [ui.nearShape, ui.nearTex]) {
+      const none = document.createElement('option');
+      none.value = 'none';
+      none.textContent = 'none';
+      sel.appendChild(none);
+      for (const f of facets) {
+        const o = document.createElement('option');
+        o.value = f;
+        o.textContent = f;
+        sel.appendChild(o);
+      }
+      sel.value = 'none';
+    }
+    // default shape-by 'type' (7 values → 7 shapes) so the first toggle-on already shows variety.
+    if (facets.includes('type')) ui.nearShape.value = 'type';
+  }
+  const nearShapeFacet = (): string | null =>
+    ui.nearShape.value === 'none' ? null : ui.nearShape.value;
+  const nearTexFacet = (): string | null => (ui.nearTex.value === 'none' ? null : ui.nearTex.value);
+  const ensureNear = (): NearMesh => {
+    if (nearMesh) return nearMesh;
+    nearMesh = createNearMesh(graph, field, {
+      count: Number(ui.nearCount.value) | 0,
+      promotePx: Number(ui.nearPromote.value),
+      shapeFacet: nearShapeFacet(),
+      textureFacet: nearTexFacet(),
+      heightCss: window.innerHeight,
+      fov: liveFov,
+    });
+    for (const o of nearMesh.objects) scene.add(o);
+    return nearMesh;
+  };
+  const disposeNear = (): void => {
+    if (!nearMesh) return;
+    for (const o of nearMesh.objects) scene.remove(o);
+    nearMesh.dispose();
+    nearMesh = null;
+  };
+  ui.near.addEventListener('change', () => {
+    const on = ui.near.checked;
+    ui.nearbox.classList.toggle('on', on);
+    if (on) ensureNear().setEnabled(true);
+    else nearMesh?.setEnabled(false);
+    updateStats();
+  });
+  ui.nearShape.addEventListener('change', () => nearMesh?.setShapeFacet(nearShapeFacet()));
+  ui.nearTex.addEventListener('change', () => nearMesh?.setTextureFacet(nearTexFacet()));
+  ui.nearPromote.addEventListener('input', () => {
+    ui.nearPromotev.textContent = `${ui.nearPromote.value} px`;
+    nearMesh?.setPromotePx(Number(ui.nearPromote.value));
+  });
+  ui.nearCount.addEventListener('input', () => {
+    ui.nearCountv.textContent = ui.nearCount.value;
+  });
+  ui.nearCount.addEventListener('change', () => {
+    // count sizes the per-pool buffers, so a change re-creates the layer (preserving on/off + pickers).
+    if (!nearMesh) return;
+    const wasOn = ui.near.checked;
+    disposeNear();
+    if (wasOn) ensureNear().setEnabled(true);
   });
 
   /* ======================================================================================
@@ -3180,7 +3266,8 @@ async function main(): Promise<void> {
       `open ${ladder.state.open >= 0 ? graph.labelOf(ladder.state.open) : '—'}` +
       `${ladder.state.suspended ? ' · suspended' : ''}` +
       `${field.select >= 0 ? ' · pinned' : ''}` +
-      ` · look ${store.preset}`;
+      ` · look ${store.preset}` +
+      `${nearMesh && ui.near.checked ? ` · 3D ${nearMesh.promoted} meshes / ${nearMesh.drawCalls} dc` : ''}`;
   }
 
   /* GLOW boot: the 'nebula' look implies the glow on (the signature look); any other persisted
@@ -3363,6 +3450,11 @@ async function main(): Promise<void> {
     overlayView.pinned = closeOrbit >= 0 ? -1 : field.select;
     ladderOverlay.update(ladderState, overlayView);
     updateRegionLabels();
+
+    // the OPT-IN near-mesh LOD (null unless the 3D-nodes toggle was switched on): promote the
+    // nodes large on screen to real meshes and fade their billboards. O(local); its cost shows
+    // honestly in jsFrameMs (it sits before the measurement close).
+    if (nearMesh) nearMesh.update(camera.position, dt);
 
     const c1 = performance.now();
     jsMs[jsCursor] = c1 - c0;

@@ -857,6 +857,23 @@ body.light .ss-cfg-r input[type='checkbox'] {
   display: flex;
 }
 
+/* ---- 3D NODES (near-mesh LOD) controls: shown only when the toggle is on, like the glow block -- */
+#nearbox {
+  display: none;
+  flex-direction: column;
+  gap: 4px;
+}
+#nearbox.on {
+  display: flex;
+}
+#nearbox .vd span {
+  width: 42px;
+  flex: none;
+  text-align: right;
+  color: #8fa4c8;
+  font-variant-numeric: tabular-nums;
+}
+
 /* ---- the top-level SCENE preset selector: the most global control, set apart from the rest -- */
 #panel #scenebox {
   font-weight: 600;

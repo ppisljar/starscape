@@ -341,3 +341,43 @@ reporting frame-chain depth and resident-set size the whole way down.
   decided post-v1.
 - VR/XR: nothing in the design precludes it (three.js carries it); explicitly out of scope
   until after stage 10.
+
+## 14. Near-mesh LOD — the close look (the first mote → mesh)
+
+The field draws every node as a billboard: the FAR look, two draw calls, 10⁶ flyable, unchanged.
+`createNearMesh(graph, field, opts)` (`src/lod/nearmesh.ts`, the `/layers` kind of §5 tier-3) adds
+the CLOSE look — the first concrete realization of §12's "mote → mesh". For the handful of nodes
+that have grown LARGE ON SCREEN it draws a genuine shaded, optionally textured 3D object (a planet
+you orbit), co-located with and cross-faded against its billboard so approaching a node is one
+continuous act from mote to oceans. It is a consumer-installed layer, exactly like the bloom
+helper: the core owns no part of it and the library stays self-contained.
+
+Three properties are load-bearing, and each is tested:
+
+- **Opt-in ⇒ zero cost when off.** A consumer that never calls `createNearMesh` instantiates
+  nothing — no objects, no buffers, no textures, no per-frame work. The 10⁶ path is byte-for-byte
+  today's (measured: 1M at the home framing, LOD off, renders at vsync with the same 3 draw calls
+  and the subsystem provably never constructed). The only per-frame addition a consumer who
+  *declines* the feature pays is the absence of the call.
+- **Promotion is by PROJECTED SIZE, never a fixed nearest-K.** A node becomes a mesh iff its
+  projected glyph radius (the same `glyphPx` the billboards and the zoom ladder already use)
+  exceeds `promotePx`; `count` is only a performance cap (the largest-on-screen win). So a small
+  graph seen whole stays all-billboards — every node is tiny, nothing promotes — and only flying
+  close, which makes a node and its neighbours big on screen, promotes them. The pick grid
+  (§6) finds LOCAL candidates cheaply (a per-cell max-size prune skips whole cells whose biggest
+  node cannot reach the threshold); the px test decides each survivor. Per-frame cost is O(local).
+- **Default sphere ⇒ one draw call; textures are procedural and opt-in.** With no shapeFacet every
+  promoted node is a sphere, so a single instanced pool (one draw call) covers the whole near set;
+  alternate shapes (10 built in: sphere, box, the four gem polyhedra, cylinder, cone, torus,
+  capsule) cost one pool each, created lazily only when a node of that shape actually promotes.
+  The material is self-lit (a fixed key light + hemisphere ambient baked into the TSL, no scene
+  lights). When `textureFacet` is null the shader never samples and NO texture is generated (flat
+  tinted shading); when set, the 10 planet textures (earth, mars, moon, jupiter, neptune, venus,
+  ice, lava, desert, star) are generated procedurally at runtime from the lib's own `hash` into one
+  DataArrayTexture — no external image (the Pages CSP blocks them), deterministic forever (§10.1).
+
+Live positions come from `frames.transformPoint` + spread + field-spin per promoted node (O(K)), so
+a mesh tracks the spinning/morphing field exactly and sits precisely where its billboard was; that
+billboard is faded (`iAlpha` → 0) while the node is a mesh and restored when it leaves the near set,
+so the two never double-draw. The grid buckets a view snapshot rebuilt on settle / throttled under
+motion — never per frame.

@@ -91,6 +91,34 @@
         </label>
       </details>
 
+      <!-- 3D NODES: the OPT-IN near-mesh LOD. Off by default (zero cost). When on, the few nodes
+           large on screen become genuine shaded / textured 3D meshes you can fly up to and orbit;
+           the distant field stays billboards. -->
+      <details class="grp">
+        <summary>3d nodes</summary>
+        <label class="row" title="OPT-IN: draw the few nodes large on screen as real 3D meshes (orbit a node as a planet). Zero cost when off."
+          ><span><input type="checkbox" id="near" /> real 3D nodes (near)</span>
+        </label>
+        <div id="nearbox" class="nearp">
+          <label title="which facet picks each node's SHAPE (none = every node the default sphere, 1 draw call)"
+            >shape by
+            <select id="nearShape"></select>
+          </label>
+          <label title="which facet picks each node's planet TEXTURE (none = flat tinted shading, no textures)"
+            >texture by
+            <select id="nearTex"></select>
+          </label>
+          <label class="row" title="a node becomes a 3D mesh when its on-screen glyph radius exceeds this many pixels — larger = promote later / closer"
+            >promote &gt;
+            <span class="vd"><input type="range" id="nearPromote" min="0" max="48" step="1" value="18" /><span id="nearPromotev">18 px</span></span>
+          </label>
+          <label class="row" title="performance cap: the most nodes that may be meshes at once (the largest-on-screen win)"
+            >max meshes
+            <span class="vd"><input type="range" id="nearCount" min="16" max="2000" step="16" value="128" /><span id="nearCountv">128</span></span>
+          </label>
+        </div>
+      </details>
+
       <!-- LOOK: the shipped visual presets, plus the HDR bloom (glow) post-process. -->
       <details class="grp" open>
         <summary>look</summary>
