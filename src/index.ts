@@ -138,7 +138,7 @@ export {
 export { getPreset, preset, presetKeys, registerPreset } from './place/presets';
 export { dendriteTiers } from './place/shapes';
 export { byAdjacency, byColumn, byFacet, byHash } from './place/orderings';
-export { exponential, gaussian, mixture, powerLaw } from './place/densities';
+export { beta, edges, exponential, gaussian, mixture, powerLaw, triangular } from './place/densities';
 export { probitApprox } from './place/stat';
 
 export { compileHierarchy, MAX_LEVELS, RANDOM_SHAPES } from './place/hierarchy';

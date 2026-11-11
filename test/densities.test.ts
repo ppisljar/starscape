@@ -59,6 +59,9 @@ const exponential = getDensity('exponential');
 const powerLaw = getDensity('powerLaw');
 const mixture = getDensity('mixture');
 const uniform = getDensity('uniform');
+const beta = getDensity('beta');
+const edges = getDensity('edges');
+const triangular = getDensity('triangular');
 
 /* ---------------------------------------------------------------- CDF agreement */
 
@@ -111,6 +114,81 @@ describe('empirical histogram matches the analytic CDF', () => {
   });
 });
 
+/* ---------------------------------------------------------------- new densities: CDF agreement
+ * beta/edges/triangular all have closed-form CDFs at the checkpoints below, so the empirical
+ * histogram of the warp must reproduce them (inverse-transform sampling is exact to 1/N). */
+
+describe('beta: empirical histogram matches the analytic Beta CDF', () => {
+  it('beta(1,1) is the uniform identity', () => {
+    for (const q of [0.05, 0.25, 0.5, 0.75, 0.95]) {
+      expect(Math.abs(beta.warp(q, { a: 1, b: 1 }) - q)).toBeLessThan(1e-3);
+    }
+  });
+
+  it('beta(2,1): CDF x² (warp = √q, the powerLaw(2) / disc-rim shape)', () => {
+    expectMatchesCdf(warped(beta, { a: 2, b: 1 }), (x) => x * x);
+    for (const q of [0.1, 0.4, 0.7, 0.95]) {
+      expect(Math.abs(beta.warp(q, { a: 2, b: 1 }) - Math.sqrt(q))).toBeLessThan(1e-4);
+    }
+  });
+
+  it('beta(1,2): CDF 2x − x² (crowds toward 0)', () => {
+    expectMatchesCdf(warped(beta, { a: 1, b: 2 }), (x) => 2 * x - x * x);
+  });
+
+  it('beta(2,2): CDF 3x² − 2x³ (a symmetric bell, median ½)', () => {
+    expectMatchesCdf(warped(beta, { a: 2, b: 2 }), (x) => 3 * x * x - 2 * x * x * x);
+    expect(Math.abs(beta.warp(0.5, { a: 2, b: 2 }) - 0.5)).toBeLessThan(1e-6);
+  });
+
+  it('beta(0.5,0.5): the arcsine U-shape, CDF (2/π)·asin(√x)', () => {
+    expectMatchesCdf(warped(beta, { a: 0.5, b: 0.5 }), (x) => (2 / Math.PI) * Math.asin(Math.sqrt(x)));
+  });
+});
+
+describe('edges (bathtub): the mirror of a centred gaussian', () => {
+  it('strength 2: CDF ½(1 + sign(2x−1)(2x−1)²)', () => {
+    const F = (x: number): number => {
+      const w = 2 * x - 1;
+      return 0.5 * (1 + Math.sign(w) * w * w);
+    };
+    expectMatchesCdf(warped(edges, { strength: 2 }), F);
+  });
+
+  it('crowds BOTH ends and empties the middle (opposite of gaussian)', () => {
+    const ws = warped(edges, { strength: 3 });
+    const nb = 20;
+    const counts = new Array<number>(nb).fill(0);
+    for (let k = 0; k < ws.length; k++) counts[Math.floor(ws[k]! * nb)]!++;
+    // both end buckets are the fullest; the centre bucket the emptiest
+    for (let b = 1; b < nb - 1; b++) {
+      expect(counts[0]!).toBeGreaterThanOrEqual(counts[b]!);
+      expect(counts[nb - 1]!).toBeGreaterThanOrEqual(counts[b]!);
+      expect(counts[10]!).toBeLessThanOrEqual(counts[b]! + 1);
+    }
+  });
+});
+
+describe('triangular: linear ramp to a peak', () => {
+  it('peak 0.5: symmetric tent, CDF 2x² then 1−2(1−x)²', () => {
+    const F = (x: number): number => (x <= 0.5 ? 2 * x * x : 1 - 2 * (1 - x) * (1 - x));
+    expectMatchesCdf(warped(triangular, { peak: 0.5 }), F);
+    expect(Math.abs(triangular.warp(0.5, { peak: 0.5 }) - 0.5)).toBeLessThan(1e-9);
+  });
+
+  it('peak 1: the ramp-up reduces to √q (powerLaw(2))', () => {
+    for (const q of [0.1, 0.4, 0.7, 0.95]) {
+      expect(Math.abs(triangular.warp(q, { peak: 1 }) - Math.sqrt(q))).toBeLessThan(1e-9);
+    }
+  });
+
+  it('peak 0: the ramp-down is its mirror, 1 − √(1−q)', () => {
+    for (const q of [0.1, 0.4, 0.7, 0.95]) {
+      expect(Math.abs(triangular.warp(q, { peak: 0 }) - (1 - Math.sqrt(1 - q)))).toBeLessThan(1e-9);
+    }
+  });
+});
+
 /* ---------------------------------------------------------------- §3.3 bunching */
 
 describe('ring + gaussian bunching (DESIGN §3.3)', () => {
@@ -154,6 +232,10 @@ describe('the warp contract: monotone, inside [0,1), f32-survivable', () => {
     ['exponential', exponential, { rate: 3 }],
     ['powerLaw', powerLaw, { alpha: 0.5 }],
     ['mixture', mixture, { m0: 0.3, s0: 0.1, w0: 1, m1: 0.8, s1: 0.06, w1: 0.5 }],
+    ['beta (bell)', beta, { a: 2, b: 2 }],
+    ['beta (U-shape)', beta, { a: 0.4, b: 0.4 }],
+    ['edges', edges, { strength: 2 }],
+    ['triangular', triangular, { peak: 0.35 }],
   ];
 
   for (const [name, d, params] of CASES) {
@@ -174,6 +256,10 @@ describe('the warp contract: monotone, inside [0,1), f32-survivable', () => {
       [exponential, { rate: -60 }],
       [powerLaw, { alpha: 1000 }], // q^(1/1000) → hugs 1
       [mixture, { m0: 1.5, s0: 0.1 }], // mean outside the axis
+      [beta, { a: 0.1, b: 0.1 }], // deep U → mass slammed against both ends
+      [beta, { a: 8, b: 0.3 }], // hard skew toward 1
+      [edges, { strength: 6 }], // deepest bathtub
+      [triangular, { peak: 1 }], // the degenerate right-triangle
     ];
     for (const [d, params] of HOSTILE) {
       for (const q of [1e-9, 0.001, 0.5, 0.999, (N - 0.5) / N, 1 - 2 ** -53]) {
@@ -199,6 +285,9 @@ describe('the warp contract: monotone, inside [0,1), f32-survivable', () => {
     expect(() => mixture.warp(0.5, {})).toThrowError(/no components/);
     expect(() => mixture.warp(0.5, { m0: 0.5, s0: 0 })).toThrowError(/s0 must be > 0/);
     expect(() => mixture.warp(0.5, { m0: 0.5, w0: -1 })).toThrowError(/w0 must be > 0/);
+    expect(() => beta.warp(0.5, { a: 0 })).toThrowError(/a must be > 0/);
+    expect(() => beta.warp(0.5, { b: -1 })).toThrowError(/b must be > 0/);
+    expect(() => edges.warp(0.5, { strength: 0 })).toThrowError(/strength must be > 0/);
   });
 });
 
@@ -278,5 +367,36 @@ describe('determinism goldens (DESIGN §10.9)', () => {
       expect(buf[i]!).toBeLessThan(1);
     }
     expect(fnv1a(buf)).toBe(GOLDEN_FNV);
+  });
+
+  // The new densities, pinned separately so they cannot drift the original digest above.
+  const NEW_GOLDEN_FNV = 2640551266;
+
+  function newGoldenRun(): Float32Array {
+    const specs: Array<[Density, Params]> = [
+      [beta, { a: 2, b: 5 }],
+      [beta, { a: 0.5, b: 0.5 }],
+      [edges, { strength: 2.5 }],
+      [triangular, { peak: 0.3 }],
+    ];
+    const buf = new Float32Array(specs.length * 64);
+    let i = 0;
+    for (const [d, params] of specs) {
+      for (let k = 0; k < 64; k++) buf[i++] = d.warp((k + 0.5) / 64, params);
+    }
+    return buf;
+  }
+
+  it('new densities: two runs byte-identical', () => {
+    expect(Array.from(newGoldenRun())).toEqual(Array.from(newGoldenRun()));
+  });
+
+  it('GOLDEN (new densities): fixed params + quantiles pin a recorded FNV-1a digest', () => {
+    const buf = newGoldenRun();
+    for (let i = 0; i < buf.length; i++) {
+      expect(buf[i]!).toBeGreaterThanOrEqual(0);
+      expect(buf[i]!).toBeLessThan(1);
+    }
+    expect(fnv1a(buf)).toBe(NEW_GOLDEN_FNV);
   });
 });

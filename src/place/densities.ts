@@ -213,9 +213,152 @@ const mixture: Density = {
   },
 };
 
+/* ------------------------------------------------------------------ beta
+ * The Beta(a, b) inverse CDF, by numeric inversion of the regularized incomplete beta Iₓ(a,b).
+ * Iₓ has no elementary closed form, so this mirrors `mixture`: a monotone CDF evaluated by a
+ * stable series (Lentz's continued fraction, the Numerical Recipes `betacf`) and inverted by
+ * bisection — deterministic, run once per compile, not per frame (§4). Beta(1,1) is uniform,
+ * Beta(2,2) a bell, a,b < 1 a U-shape, a ≠ b a skew; it subsumes powerLaw's x^(α−1) as the
+ * b = 1 edge, but earns its place on the two-sided shapes those cannot reach.
+ */
+
+/* ln Γ(x) — Lanczos g = 7, n = 9, the standard coefficient set (|rel err| < 1e-13 for x > 0,
+ * far inside the f32 parameter buffer). Pure: the incomplete beta needs the Beta normaliser. */
+const LG_C = [
+  0.99999999999980993, 676.5203681218851, -1259.1392167224028, 771.32342877765313,
+  -176.61502916214059, 12.507343278686905, -0.13857109526572012, 9.9843695780195716e-6,
+  1.5056327351493116e-7,
+];
+
+function lgamma(x: number): number {
+  let g = LG_C[0]!;
+  const xm1 = x - 1;
+  for (let i = 1; i < 9; i++) g += LG_C[i]! / (xm1 + i);
+  const tmp = xm1 + 7.5;
+  return 0.5 * Math.log(2 * Math.PI) + (xm1 + 0.5) * Math.log(tmp) - tmp + Math.log(g);
+}
+
+/* Lentz's continued fraction for Iₓ(a,b), Numerical Recipes §6.4 `betacf`. Converges for
+ * x < (a+1)/(a+b+2); the caller swaps to the complement past that so convergence is always fast. */
+const BETACF_ITMAX = 200;
+const BETACF_EPS = 3e-14;
+const BETACF_FPMIN = 1e-300;
+
+function betacf(a: number, b: number, x: number): number {
+  const qab = a + b;
+  const qap = a + 1;
+  const qam = a - 1;
+  let c = 1;
+  let d = 1 - (qab * x) / qap;
+  if (Math.abs(d) < BETACF_FPMIN) d = BETACF_FPMIN;
+  d = 1 / d;
+  let h = d;
+  for (let m = 1; m <= BETACF_ITMAX; m++) {
+    const m2 = 2 * m;
+    let aa = (m * (b - m) * x) / ((qam + m2) * (a + m2));
+    d = 1 + aa * d;
+    if (Math.abs(d) < BETACF_FPMIN) d = BETACF_FPMIN;
+    c = 1 + aa / c;
+    if (Math.abs(c) < BETACF_FPMIN) c = BETACF_FPMIN;
+    d = 1 / d;
+    h *= d * c;
+    aa = (-(a + m) * (qab + m) * x) / ((a + m2) * (qap + m2));
+    d = 1 + aa * d;
+    if (Math.abs(d) < BETACF_FPMIN) d = BETACF_FPMIN;
+    c = 1 + aa / c;
+    if (Math.abs(c) < BETACF_FPMIN) c = BETACF_FPMIN;
+    d = 1 / d;
+    const del = d * c;
+    h *= del;
+    if (Math.abs(del - 1) < BETACF_EPS) break;
+  }
+  return h;
+}
+
+/** Regularized incomplete beta Iₓ(a,b) ∈ [0,1] — the Beta(a,b) CDF, monotone in x. */
+function betai(a: number, b: number, x: number): number {
+  if (x <= 0) return 0;
+  if (x >= 1) return 1;
+  const lbeta = lgamma(a + b) - lgamma(a) - lgamma(b);
+  const bt = Math.exp(lbeta + a * Math.log(x) + b * Math.log(1 - x));
+  return x < (a + 1) / (a + b + 2) ? (bt * betacf(a, b, x)) / a : 1 - (bt * betacf(b, a, 1 - x)) / b;
+}
+
+/** `beta(a, b)`: the Beta(a, b) distribution on [0, 1), inverse CDF by bisection on Iₓ(a,b).
+ *  Defaults `a` 2, `b` 2 (a symmetric bell). a = b = 1 is uniform; a, b < 1 is U-shaped
+ *  (mass at both ends); a ≠ b skews (a < b toward 0, a > b toward 1). Both must be > 0 — the
+ *  distribution is not defined otherwise — anything else throws. */
+const beta: Density = {
+  key: 'beta',
+  params: [
+    { key: 'a', label: 'a', default: 2, min: 0.3, max: 8, step: 0.1 },
+    { key: 'b', label: 'b', default: 2, min: 0.3, max: 8, step: 0.1 },
+  ],
+  warp(q: number, params: Params): number {
+    const a = params['a'] ?? 2;
+    const b = params['b'] ?? 2;
+    if (!(a > 0)) throw new RangeError(`beta: a must be > 0, got ${a}`);
+    if (!(b > 0)) throw new RangeError(`beta: b must be > 0, got ${b}`);
+    // bisect Iₓ(a,b) = q on [0, 1]; 60 steps ⇒ interval < 2⁻⁶⁰, below the f32 buffer's step
+    let lo = 0;
+    let hi = 1;
+    for (let it = 0; it < 60; it++) {
+      const mid = 0.5 * (lo + hi);
+      if (betai(a, b, mid) < q) lo = mid;
+      else hi = mid;
+    }
+    return clampUnit(0.5 * (lo + hi));
+  },
+};
+
+/* ------------------------------------------------------------------ edges (bathtub)
+ * The OPPOSITE of gaussian: a U-shaped "bathtub" that crowds members toward BOTH ends of the
+ * axis and empties the middle. Closed form — a signed power of the centred quantile, so no
+ * inversion is needed. On a ring it gathers members at two antipodal poles; on a line it piles
+ * them at both tips. */
+
+/** `edges(strength)`: a symmetric bathtub inverse CDF, `warp(q) = ½(1 + sign(v)·|v|^(1/strength))`
+ *  with v = 2q − 1. Default `strength` 2 (density ∝ strength at each end, 0 at the centre).
+ *  strength = 1 is uniform; strength > 1 deepens the bathtub; strength must be > 0 (throws
+ *  otherwise). The mirror image of a centred gaussian, which empties the ends and fills the
+ *  middle. */
+const edges: Density = {
+  key: 'edges',
+  params: [{ key: 'strength', label: 'strength', default: 2, min: 1, max: 6, step: 0.25 }],
+  warp(q: number, params: Params): number {
+    const strength = params['strength'] ?? 2;
+    if (!(strength > 0)) throw new RangeError(`edges: strength must be > 0, got ${strength}`);
+    const v = 2 * q - 1;
+    const w = Math.sign(v) * Math.pow(Math.abs(v), 1 / strength);
+    return clampUnit(0.5 * (1 + w));
+  },
+};
+
+/* ------------------------------------------------------------------ triangular
+ * A linear ramp to a single peak at `peak`, zero density at both ends — the simplest
+ * asymmetric density, closed-form inverse CDF. peak toward 1 crowds the far end (a ramp up),
+ * toward 0 the near end (a ramp down), at 0.5 a symmetric tent. */
+
+/** `triangular(peak)`: the triangular distribution on [0, 1] with mode `peak` (default 0.5).
+ *  CDF F(peak) = peak, so `warp(q) = √(q·peak)` for q ≤ peak and `1 − √((1−q)(1−peak))` above —
+ *  continuous at the peak. `peak` is clamped to [0, 1] (peak = 1 recovers √q, the powerLaw(2)
+ *  ramp; peak = 0 its mirror). */
+const triangular: Density = {
+  key: 'triangular',
+  params: [{ key: 'peak', label: 'peak', default: 0.5, min: 0, max: 1, step: 0.05 }],
+  warp(q: number, params: Params): number {
+    const peak = Math.min(1, Math.max(0, params['peak'] ?? 0.5));
+    const w = q < peak ? Math.sqrt(q * peak) : 1 - Math.sqrt((1 - q) * (1 - peak));
+    return clampUnit(w);
+  },
+};
+
 registerDensity(gaussian);
 registerDensity(exponential);
 registerDensity(powerLaw);
 registerDensity(mixture);
+registerDensity(beta);
+registerDensity(edges);
+registerDensity(triangular);
 
-export { gaussian, exponential, powerLaw, mixture };
+export { gaussian, exponential, powerLaw, mixture, beta, edges, triangular };

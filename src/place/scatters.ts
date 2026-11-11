@@ -27,6 +27,9 @@ import type { Scatter } from './types';
 const GAUSS_SALT = 11; // gaussian uses +11, +12, +13 (one per axis)
 const DISC_SALT = 17; // discFalloff uses +17
 const NOISE_SALT = 23; // noiseField uses +23, +24, +25 (one per displacement component)
+const UNIFORM_SALT = 29; // uniform uses +29, +30, +31 (one per axis)
+const TURB_SALT = 37; // turbulence uses +37 + axis·16 + octave (axis ≤ 2, octave ≤ 7 ⇒ < 100)
+const SWIRL_SALT = 91; // swirl uses +91 (one rotation angle per member)
 
 /* ------------------------------------------------------------------ gaussian
  * Isotropic normal displacement: the predecessor's jitter ball (vault-site-3d arrange.js
@@ -166,6 +169,103 @@ const noiseField: Scatter = {
   },
 };
 
+/* ------------------------------------------------------------------ uniform
+ * Isotropic BOX jitter: each axis takes an independent uniform draw in [−amount, amount]·radius.
+ * Where `gaussian` scatter is a soft normal cloud with infinite tails, this is a hard-edged
+ * even fill of a cube — the plain "add a little evenly-spread fuzz" knob, with a magnitude that
+ * is a bound rather than a standard deviation.
+ *
+ * `params.amount` is the per-axis half-extent as a fraction of radius (default 0.1): each axis
+ * adds `(hash(member, salt + axis)·2 − 1) · amount · radius`, so |Δ| ≤ amount·radius per axis. */
+const uniformScatter: Scatter = {
+  key: 'uniform',
+  params: [{ key: 'amount', label: 'amount', default: 0.1, min: 0, max: 0.5, step: 0.01 }],
+  offset(_k, member, salt, radius, out, o, params): void {
+    const a = (params['amount'] ?? 0.1) * radius;
+    if (a === 0) return;
+    out[o]! += (hash(member, salt + UNIFORM_SALT) * 2 - 1) * a;
+    out[o + 1]! += (hash(member, salt + UNIFORM_SALT + 1) * 2 - 1) * a;
+    out[o + 2]! += (hash(member, salt + UNIFORM_SALT + 2) * 2 - 1) * a;
+  },
+};
+
+/* ------------------------------------------------------------------ turbulence
+ * Fractal value noise (fBm): the SAME spatial `valueNoise3` field as `noiseField`, but summed
+ * over several octaves — each octave twice the frequency and half the amplitude — so the
+ * displacement carries detail at many scales instead of one. Richer, wispier clumps; the
+ * cloud-vs-marble difference. Like noiseField it reads the already-placed point (read-after-
+ * shape), so it is a FIELD: neighbours move together.
+ *
+ * `params.scale`: base lattice cells across one radius (default 3, octave o runs at scale·2^o).
+ * `params.amp`: total displacement bound per axis as a fraction of radius (default 0.25).
+ * `params.octaves`: how many frequencies to stack (default 4, clamped to [1, 8]). The octave
+ * amplitudes are normalised by their sum (Σ 2^−o), so |Δ| ≤ amp·radius per axis for any count. */
+const turbulence: Scatter = {
+  key: 'turbulence',
+  params: [
+    { key: 'scale', label: 'scale', default: 3, min: 0.5, max: 12, step: 0.5 },
+    { key: 'amp', label: 'amp', default: 0.25, min: 0, max: 1, step: 0.05 },
+    { key: 'octaves', label: 'octaves', default: 4, min: 1, max: 8, step: 1 },
+  ],
+  offset(_k, _member, salt, radius, out, o, params): void {
+    const amp = (params['amp'] ?? 0.25) * radius;
+    if (amp === 0 || radius <= 0) return;
+    const octaves = Math.min(8, Math.max(1, Math.round(params['octaves'] ?? 4)));
+    const baseF = (params['scale'] ?? 3) / radius;
+    const px = out[o]!;
+    const py = out[o + 1]!;
+    const pz = out[o + 2]!;
+    // fBm per axis, normalised by the octave-amplitude sum so the per-axis bound is amp·radius
+    let norm = 0;
+    for (let oc = 0; oc < octaves; oc++) norm += 0.5 ** oc;
+    const k = amp / norm;
+    for (let axis = 0; axis < 3; axis++) {
+      let sum = 0;
+      let f = baseF;
+      let a = 1;
+      for (let oc = 0; oc < octaves; oc++) {
+        const s = salt + TURB_SALT + axis * 16 + oc;
+        sum += a * (valueNoise3(px * f, py * f, pz * f, s) * 2 - 1);
+        f *= 2;
+        a *= 0.5;
+      }
+      out[o + axis]! += sum * k;
+    }
+  },
+};
+
+/* ------------------------------------------------------------------ swirl
+ * A TANGENTIAL displacement: each member is rotated about the shape's axis (Y) by its own
+ * hashed angle, so members at one radius smear into an arc — a rotational shear rather than a
+ * blob. Chosen over the proposed `sphere` (a uniform-in-ball halo): with the new `uniform`
+ * box jitter already sitting next to the existing `gaussian` normal ball, a third isotropic
+ * blob would have read as a near-duplicate, whereas swirl adds a genuinely different motion
+ * and, being a pure rotation, it cannot push any member past the shape's radius bound.
+ *
+ * Written as a read-modify-ADD of the rotation delta (not an overwrite — the Scatter contract),
+ * so it still composes with whatever the shape wrote. `params.strength` is the maximum rotation
+ * in radians (default 0.5): the angle is `(hash(member, salt)·2 − 1)·strength`, and the world
+ * displacement grows with a member's distance from the Y axis (arc length ≈ ρ·angle). */
+const swirl: Scatter = {
+  key: 'swirl',
+  params: [{ key: 'strength', label: 'strength', default: 0.5, min: 0, max: Math.PI, step: 0.05 }],
+  offset(_k, member, salt, radius, out, o, params): void {
+    const strength = params['strength'] ?? 0.5;
+    if (strength === 0 || radius <= 0) return;
+    const d = (hash(member, salt + SWIRL_SALT) * 2 - 1) * strength;
+    const c = Math.cos(d);
+    const s = Math.sin(d);
+    const x = out[o]!;
+    const z = out[o + 2]!;
+    // ADD the rotation delta: (x·c − z·s − x, …) = the displacement of a rotation about Y
+    out[o]! += x * (c - 1) - z * s;
+    out[o + 2]! += x * s + z * (c - 1);
+  },
+};
+
 registerScatter(gaussianScatter);
 registerScatter(discFalloff);
 registerScatter(noiseField);
+registerScatter(uniformScatter);
+registerScatter(turbulence);
+registerScatter(swirl);

@@ -30,7 +30,15 @@ const zeros = (n: number): Float32Array => new Float32Array(n * 3);
 describe('scatter registry', () => {
   it('registers the full scatter family next to the built-in none', () => {
     const keys = scatterKeys();
-    for (const k of ['none', 'gaussian', 'discFalloff', 'noiseField']) {
+    for (const k of [
+      'none',
+      'gaussian',
+      'discFalloff',
+      'noiseField',
+      'uniform',
+      'turbulence',
+      'swirl',
+    ]) {
       expect(keys).toContain(k);
     }
   });
@@ -320,5 +328,167 @@ describe('noiseField', () => {
     for (let i = 0; i < base.length; i++) base[i] = (hash(i, 7) - 0.5) * 2 * R;
     const out = scattered(nf, base, { scale: 3, amp: 0.4 });
     expect(fnv1a(out)).toBe(NOISE_FIELD_GOLDEN_FNV);
+  });
+});
+
+describe('uniform (box jitter)', () => {
+  const u = getScatter('uniform');
+
+  it('is deterministic and keys off the MEMBER id, not the slot', () => {
+    const a = new Float32Array(3);
+    const b = new Float32Array(3);
+    u.offset(0, 42, SALT, R, a, 0, { amount: 0.2 });
+    u.offset(9, 42, SALT, R, b, 0, { amount: 0.2 }); // same member, different slot
+    expect(Array.from(a)).toEqual(Array.from(b));
+    expect(fnv1a(scattered(u, zeros(400), { amount: 0.2 }))).toBe(
+      fnv1a(scattered(u, zeros(400), { amount: 0.2 })),
+    );
+  });
+
+  it('respects the per-axis box bound |Δ| ≤ amount·radius, and fills it', () => {
+    const amount = 0.2;
+    const out = scattered(u, zeros(3000), { amount });
+    let maxAbs = 0;
+    for (let i = 0; i < out.length; i++) {
+      expect(Math.abs(out[i]!)).toBeLessThanOrEqual(amount * R + 1e-6);
+      maxAbs = Math.max(maxAbs, Math.abs(out[i]!));
+    }
+    expect(maxAbs).toBeGreaterThan(amount * R * 0.9); // a uniform box actually reaches its edges
+  });
+
+  it('is isotropic: the three axes share one spread (box, not a slab)', () => {
+    const out = scattered(u, zeros(3000), { amount: 0.2 });
+    const v = [0, 0, 0];
+    for (let k = 0; k < 3000; k++) for (let a = 0; a < 3; a++) v[a]! += out[3 * k + a]! ** 2;
+    for (const s of v) expect(s / 3000).toBeGreaterThan(0); // all axes move
+    expect(Math.max(...v) / Math.min(...v)).toBeLessThan(1.3); // and by roughly the same amount
+  });
+
+  it('amount 0 displaces nothing', () => {
+    const out = scattered(u, zeros(50), { amount: 0 });
+    for (let i = 0; i < out.length; i++) expect(out[i]).toBe(0);
+  });
+
+  const UNIFORM_GOLDEN_FNV = 29262312;
+  it('GOLDEN: pins a recorded FNV-1a digest', () => {
+    expect(fnv1a(scattered(u, zeros(300), { amount: 0.2 }))).toBe(UNIFORM_GOLDEN_FNV);
+  });
+});
+
+describe('turbulence (fBm)', () => {
+  const tb = getScatter('turbulence');
+
+  /** n members scattered through space (turbulence samples a field at the placed point). */
+  function cloud(n: number): Float32Array {
+    const base = new Float32Array(n * 3);
+    for (let i = 0; i < base.length; i++) base[i] = (hash(i, 55) - 0.5) * 2 * R;
+    return base;
+  }
+
+  it('is a FIELD: two members at the same position displace identically', () => {
+    const params = { scale: 3, amp: 0.4, octaves: 4 };
+    const a = new Float32Array([2, -1, 4]);
+    const b = new Float32Array([2, -1, 4]);
+    tb.offset(0, 17, SALT, R, a, 0, params);
+    tb.offset(5, 98765, SALT, R, b, 0, params); // different member, same spot
+    expect(Array.from(a)).toEqual(Array.from(b));
+  });
+
+  it('respects the per-axis bound |Δ| ≤ amp·radius (octave-amplitude normalised), and uses it', () => {
+    const params = { scale: 3, amp: 0.3, octaves: 5 };
+    const base = cloud(1000);
+    const out = scattered(tb, base, params);
+    let maxAbs = 0;
+    for (let k = 0; k < out.length; k++) {
+      const d = Math.abs(out[k]! - base[k]!);
+      expect(d).toBeLessThanOrEqual(params.amp * R + 1e-6);
+      maxAbs = Math.max(maxAbs, d);
+    }
+    expect(maxAbs).toBeGreaterThan(params.amp * R * 0.4);
+  });
+
+  it('adds detail over a single octave: more octaves changes the displacement', () => {
+    const base = cloud(400);
+    const one = scattered(tb, base, { scale: 3, amp: 0.3, octaves: 1 });
+    const four = scattered(tb, base, { scale: 3, amp: 0.3, octaves: 4 });
+    let moved = 0;
+    for (let k = 0; k < base.length; k++) if (Math.abs(one[k]! - four[k]!) > 1e-4) moved++;
+    expect(moved).toBeGreaterThan(base.length / 2);
+  });
+
+  it('octaves clamps (≥1): a 0 request behaves as a single octave, never a NaN', () => {
+    const base = cloud(100);
+    const a = scattered(tb, base, { scale: 3, amp: 0.3, octaves: 0 });
+    const b = scattered(tb, base, { scale: 3, amp: 0.3, octaves: 1 });
+    for (let k = 0; k < base.length; k++) expect(Number.isFinite(a[k]!)).toBe(true);
+    expect(fnv1a(a)).toBe(fnv1a(b));
+  });
+
+  it('amp 0 displaces nothing', () => {
+    const base = cloud(50);
+    const out = scattered(tb, base, { amp: 0 });
+    for (let k = 0; k < base.length; k++) expect(out[k]).toBe(base[k]);
+  });
+
+  const TURB_GOLDEN_FNV = 3543823139;
+  it('GOLDEN: pins a recorded FNV-1a digest', () => {
+    const base = cloud(300);
+    expect(fnv1a(scattered(tb, base, { scale: 3, amp: 0.4, octaves: 4 }))).toBe(TURB_GOLDEN_FNV);
+  });
+});
+
+describe('swirl (tangential shear)', () => {
+  const sw = getScatter('swirl');
+
+  /** n members off the Y axis (a rotation of an on-axis point does nothing). */
+  function ring(n: number): Float32Array {
+    const base = new Float32Array(n * 3);
+    for (let k = 0; k < n; k++) {
+      const th = k * 2.399963229728653;
+      const rho = (0.3 + 0.7 * ((k + 0.5) / n)) * R;
+      base[3 * k] = Math.cos(th) * rho;
+      base[3 * k + 1] = (hash(k, 3) - 0.5) * R; // some height, to prove y is untouched
+      base[3 * k + 2] = Math.sin(th) * rho;
+    }
+    return base;
+  }
+
+  it('is deterministic and keys off the member id', () => {
+    const a = new Float32Array([3, 1, 4]);
+    const b = new Float32Array([3, 1, 4]);
+    sw.offset(0, 77, SALT, R, a, 0, { strength: 0.8 });
+    sw.offset(6, 77, SALT, R, b, 0, { strength: 0.8 }); // same member, different slot
+    expect(Array.from(a)).toEqual(Array.from(b));
+  });
+
+  it('is a pure rotation about Y: |p| and y are preserved, x/z move', () => {
+    const base = ring(1000);
+    const out = scattered(sw, base, { strength: 0.6 });
+    let moved = 0;
+    for (let k = 0; k < 1000; k++) {
+      const before = Math.hypot(base[3 * k]!, base[3 * k + 1]!, base[3 * k + 2]!);
+      const after = Math.hypot(out[3 * k]!, out[3 * k + 1]!, out[3 * k + 2]!);
+      expect(after).toBeCloseTo(before, 3); // magnitude preserved (within f32)
+      expect(out[3 * k + 1]).toBe(base[3 * k + 1]); // y exactly untouched
+      if (Math.abs(out[3 * k]! - base[3 * k]!) > 1e-3) moved++;
+    }
+    expect(moved).toBeGreaterThan(900); // the shear is visible
+  });
+
+  it('reads the position the SHAPE wrote (an on-axis point cannot swirl)', () => {
+    const onAxis = new Float32Array([0, 5, 0]);
+    const out = scattered(sw, onAxis, { strength: 1.2 });
+    expect(Array.from(out)).toEqual([0, 5, 0]); // ρ = 0 ⇒ no tangential displacement
+  });
+
+  it('strength 0 displaces nothing', () => {
+    const base = ring(50);
+    const out = scattered(sw, base, { strength: 0 });
+    for (let k = 0; k < base.length; k++) expect(out[k]).toBe(base[k]);
+  });
+
+  const SWIRL_GOLDEN_FNV = 1063713914;
+  it('GOLDEN: pins a recorded FNV-1a digest', () => {
+    expect(fnv1a(scattered(sw, ring(300), { strength: 0.6 }))).toBe(SWIRL_GOLDEN_FNV);
   });
 });

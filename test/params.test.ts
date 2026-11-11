@@ -72,7 +72,17 @@ describe('param metadata — retrievability', () => {
     expect(shapeParams('torus').map((p) => p.key)).toEqual(['tube']);
     expect(shapeParams('box').map((p) => p.key)).toEqual(['aspectY', 'aspectZ']);
     expect(shapeParams('cloud').map((p) => p.key)).toEqual(['sigma']);
+    expect(shapeParams('torusKnot').map((p) => p.key)).toEqual(['p', 'q', 'tube']);
+    expect(shapeParams('superShape').map((p) => p.key)).toEqual(['m', 'n1', 'n2', 'n3']);
+    expect(shapeParams('phyllotaxis').map((p) => p.key)).toEqual(['jitter']);
+    expect(shapeParams('cone').map((p) => p.key)).toEqual(['aperture', 'hollow']);
     expect(densityParams('gaussian').map((p) => p.key)).toEqual(['center', 'sigma']);
+    expect(densityParams('beta').map((p) => p.key)).toEqual(['a', 'b']);
+    expect(densityParams('edges').map((p) => p.key)).toEqual(['strength']);
+    expect(densityParams('triangular').map((p) => p.key)).toEqual(['peak']);
+    expect(scatterParams('uniform').map((p) => p.key)).toEqual(['amount']);
+    expect(scatterParams('turbulence').map((p) => p.key)).toEqual(['scale', 'amp', 'octaves']);
+    expect(scatterParams('swirl').map((p) => p.key)).toEqual(['strength']);
     expect(densityParams('mixture').map((p) => p.key)).toEqual([
       'm0', 's0', 'w0', 'm1', 's1', 'w1', 'm2', 's2', 'w2', 'm3', 's3', 'w3',
     ]);
@@ -115,7 +125,7 @@ describe('THE DEFAULT CONTRACT — a param at its default equals omitting it', (
 
   it('densities: warp(q, {[key]: default}) equals warp(q, {}) across q', () => {
     const qs = [0.01, 0.17, 0.33, 0.5, 0.66, 0.83, 0.99];
-    for (const key of ['gaussian', 'exponential', 'powerLaw'] as const) {
+    for (const key of ['gaussian', 'exponential', 'powerLaw', 'beta', 'edges', 'triangular'] as const) {
       const d = getDensity(key);
       for (const p of densityParams(key)) {
         for (const q of qs) {
@@ -143,7 +153,7 @@ describe('THE DEFAULT CONTRACT — a param at its default equals omitting it', (
   });
 
   it('scatters: offset with {[key]: default} equals offset with {}', () => {
-    for (const key of ['gaussian', 'discFalloff', 'noiseField'] as const) {
+    for (const key of ['gaussian', 'discFalloff', 'noiseField', 'uniform', 'turbulence', 'swirl'] as const) {
       const s = getScatter(key);
       const seed = (): Float32Array => Float32Array.from([2.5, -1.25, 3.75]);
       for (const p of scatterParams(key)) {
