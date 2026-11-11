@@ -168,6 +168,68 @@ export const RAMPS = {
     [0.96, 0.6, 0.48],
     [0.71, 0.02, 0.15],
   ],
+  /* ---- perceptual maps (matplotlib / Google), decile anchors of the published LUTs ---------
+   * These are the modern perceptually-uniform colormaps: brightness rises monotonically along
+   * each, so they carry a numeric order honestly where a rainbow invents bands. Anchors sampled
+   * at tenths (cividis at its ten published waypoints); endpoints are the canonical LUT values. */
+  /* plasma — matplotlib (Nathaniel J. Smith & Stéfan van der Walt, 2015, CC0): dark blue-purple
+   * → magenta → orange → yellow. Canonical endpoints #0d0887 … #f0f921. */
+  plasma: [
+    [0.050383, 0.029803, 0.527975],
+    [0.254627, 0.013882, 0.615419],
+    [0.417642, 0.000564, 0.65839],
+    [0.562738, 0.051545, 0.641509],
+    [0.691009, 0.164393, 0.564951],
+    [0.798216, 0.280197, 0.469538],
+    [0.881443, 0.392529, 0.383229],
+    [0.949217, 0.517763, 0.295662],
+    [0.98826, 0.652325, 0.211364],
+    [0.988648, 0.809579, 0.145357],
+    [0.940015, 0.975158, 0.131326],
+  ],
+  /* magma — matplotlib (Smith & van der Walt, 2015, CC0): near-black → purple → red → warm
+   * cream. Canonical endpoints #000004 … #fcfdbf. */
+  magma: [
+    [0.001462, 0.000466, 0.013866],
+    [0.039608, 0.03109, 0.133515],
+    [0.113094, 0.065492, 0.276784],
+    [0.211718, 0.061992, 0.418647],
+    [0.316654, 0.07169, 0.48538],
+    [0.420491, 0.099874, 0.511562],
+    [0.550287, 0.161158, 0.505719],
+    [0.716387, 0.214982, 0.47529],
+    [0.868793, 0.287728, 0.409303],
+    [0.967671, 0.439703, 0.35981],
+    [0.987053, 0.991438, 0.749504],
+  ],
+  /* turbo — Google (Anton Mikhailov, 2019, Apache-2.0): an improved rainbow, dark blue → cyan →
+   * green → yellow → orange → dark red, with even brightness and no banding. Sampled anchors of
+   * the published 256-entry LUT; endpoints #30123b … #7a0403. */
+  turbo: [
+    [0.18995, 0.07176, 0.23217],
+    [0.27543, 0.38879, 0.8349],
+    [0.14238, 0.64281, 0.97023],
+    [0.20803, 0.86775, 0.54937],
+    [0.59919, 0.96621, 0.2278],
+    [0.92467, 0.75127, 0.14671],
+    [0.92624, 0.36535, 0.07163],
+    [0.4796, 0.01583, 0.01055],
+  ],
+  /* cividis — matplotlib (Jamie Nuñez, Chris Anderson & Sean Lau, 2018, CC0): a blue → grey →
+   * yellow map engineered to look the SAME under deuteranopia/protanopia as to full-colour
+   * vision. Its ten published hex waypoints #00224e … #fee838. */
+  cividis: [
+    [0.0, 0.133, 0.306],
+    [0.071, 0.208, 0.439],
+    [0.231, 0.286, 0.424],
+    [0.341, 0.365, 0.427],
+    [0.439, 0.443, 0.451],
+    [0.541, 0.529, 0.475],
+    [0.655, 0.616, 0.424],
+    [0.78, 0.725, 0.341],
+    [0.922, 0.827, 0.322],
+    [0.996, 0.91, 0.22],
+  ],
 } as const satisfies Record<string, RampStops>;
 
 export type RampName = keyof typeof RAMPS;
@@ -275,6 +337,47 @@ export const PALETTES = {
     hx(0x882255),
     hx(0xaa4499),
     hx(0xdddddd),
+  ],
+  /* Tableau 10 (Tableau Software's default 10-colour categorical sequence, the 2016 refresh):
+   * blue #4E79A7, orange #F28E2B, red #E15759, teal #76B7B2, green #59A14F, yellow #EDC948,
+   * purple #B07AA1, pink #FF9DA7, brown #9C755F, grey #BAB0AC. Not colourblind-safe — the
+   * everyday "ten clearly-different colours" workhorse. */
+  tableau10: [
+    hx(0x4e79a7),
+    hx(0xf28e2b),
+    hx(0xe15759),
+    hx(0x76b7b2),
+    hx(0x59a14f),
+    hx(0xedc948),
+    hx(0xb07aa1),
+    hx(0xff9da7),
+    hx(0x9c755f),
+    hx(0xbab0ac),
+  ],
+  /* ColorBrewer 2.0 "Set2" (Cynthia Brewer, colorbrewer2.org), 8 soft qualitative pastels:
+   * teal #66C2A5, orange #FC8D62, blue #8DA0CB, pink #E78AC3, green #A6D854, yellow #FFD92F,
+   * tan #E5C494, grey #B3B3B3. Gentler than the saturated sets — reads well on a light ground. */
+  set2: [
+    hx(0x66c2a5),
+    hx(0xfc8d62),
+    hx(0x8da0cb),
+    hx(0xe78ac3),
+    hx(0xa6d854),
+    hx(0xffd92f),
+    hx(0xe5c494),
+    hx(0xb3b3b3),
+  ],
+  /* neon — a hand-picked bright synthwave set (no external source; the canonical "outrun" neons):
+   * hot pink #FF2A6D, magenta #FF6AC1, electric orange #FF9F1C, acid yellow #FEE440, laser green
+   * #39FF14, cyan #05D9E8, violet #7B2FF7. Maximal saturation for a glowing dark-ground field. */
+  neon: [
+    hx(0xff2a6d),
+    hx(0xff6ac1),
+    hx(0xff9f1c),
+    hx(0xfee440),
+    hx(0x39ff14),
+    hx(0x05d9e8),
+    hx(0x7b2ff7),
   ],
 } as const satisfies Record<string, Palette>;
 

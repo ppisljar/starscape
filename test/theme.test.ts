@@ -100,6 +100,42 @@ describe('rampAt (predecessor sampler, values verbatim)', () => {
     expect(rampAt('viridis', 1)[0]).toBeGreaterThan(0.9); // hot yellow
     expect(rampAt('viridis', 1)[2]).toBeLessThan(0.3);
   });
+
+  it('ships plasma (matplotlib): dark blue-purple start → yellow end, canonical endpoints', () => {
+    expect(RAMP_NAMES).toContain('plasma');
+    expect(rampAt('plasma', 0)).toEqual([0.050383, 0.029803, 0.527975]); // #0d0887
+    const end = rampAt('plasma', 1);
+    expect(end[0]).toBeGreaterThan(0.9); // yellow end: red & green high…
+    expect(end[1]).toBeGreaterThan(0.9);
+    expect(end[2]).toBeLessThan(0.3); // …blue low
+    expect(rampAt('plasma', 0)[2]).toBeGreaterThan(rampAt('plasma', 0)[0]); // blue > red at start
+  });
+
+  it('ships magma (matplotlib): near-black start → warm-cream end', () => {
+    expect(RAMP_NAMES).toContain('magma');
+    for (const c of rampAt('magma', 0)) expect(c).toBeLessThan(0.05); // #000004-ish
+    const end = rampAt('magma', 1);
+    for (const c of end) expect(c).toBeGreaterThan(0.7); // light cream
+  });
+
+  it('ships turbo (Google): dark indigo start → dark red end (the improved rainbow)', () => {
+    expect(RAMP_NAMES).toContain('turbo');
+    const cool = rampAt('turbo', 0);
+    const hot = rampAt('turbo', 1);
+    expect(cool[2]).toBeGreaterThan(cool[0]); // indigo start: blue dominates red
+    expect(hot[0]).toBeGreaterThan(hot[2]); // dark-red end: red dominates blue
+    expect(hot[0]).toBeLessThan(0.6); // …and it is DARK red, not bright (turbo's tail)
+  });
+
+  it('ships cividis (matplotlib, colorblind-safe): blue start → yellow end', () => {
+    expect(RAMP_NAMES).toContain('cividis');
+    const cool = rampAt('cividis', 0);
+    const hot = rampAt('cividis', 1);
+    expect(cool[2]).toBeGreaterThan(cool[0]); // blue start
+    expect(hot[0]).toBeGreaterThan(0.9); // yellow end: red & green high
+    expect(hot[1]).toBeGreaterThan(0.8);
+    expect(hot[2]).toBeLessThan(0.3);
+  });
 });
 
 describe('categorical palettes (values pinned to their published sources)', () => {
@@ -139,6 +175,24 @@ describe('categorical palettes (values pinned to their published sources)', () =
     // tolMuted[0] = #332288 indigo, tolMuted[9] = #DDDDDD pale grey ("bad data")
     expect(PALETTES.tolMuted[0]).toEqual([0x33 / 255, 0x22 / 255, 0x88 / 255]);
     expect(PALETTES.tolMuted[9]).toEqual([0xdd / 255, 0xdd / 255, 0xdd / 255]);
+  });
+
+  it('pins Tableau 10 (10 colours, the 2016 refresh) and ColorBrewer Set2 (8 pastels)', () => {
+    expect(PALETTE_NAMES).toContain('tableau10');
+    expect(PALETTES.tableau10.length).toBe(10);
+    expect(PALETTES.tableau10[0]).toEqual([0x4e / 255, 0x79 / 255, 0xa7 / 255]); // #4E79A7 blue
+    expect(PALETTES.tableau10[1]).toEqual([0xf2 / 255, 0x8e / 255, 0x2b / 255]); // #F28E2B orange
+    expect(PALETTE_NAMES).toContain('set2');
+    expect(PALETTES.set2.length).toBe(8);
+    expect(PALETTES.set2[0]).toEqual([0x66 / 255, 0xc2 / 255, 0xa5 / 255]); // #66C2A5 teal
+  });
+
+  it('ships the bright synthwave neon set', () => {
+    expect(PALETTE_NAMES).toContain('neon');
+    expect(PALETTES.neon.length).toBe(7);
+    expect(PALETTES.neon[0]).toEqual([0xff / 255, 0x2a / 255, 0x6d / 255]); // #FF2A6D hot pink
+    // "bright": every entry has at least one near-maxed channel
+    for (const c of PALETTES.neon) expect(Math.max(...c)).toBeGreaterThan(0.9);
   });
 
   it('every shipped palette stays in [0, 1] (the shader consumes these raw)', () => {
