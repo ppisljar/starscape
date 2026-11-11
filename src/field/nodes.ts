@@ -9,8 +9,10 @@
  * the cheap flat branch under FLAT_PX. Stage 4 adds the predecessor's two focus channels:
  * iAlpha (selection dim: 1 lit, dimOthers dimmed) and iBoost (hover/selection size emphasis —
  * it scales the glyph AND its clamp bounds, so an emphasised node grows even when pinned at
- * NODE_MIN_PX/NODE_MAX_PX, which is most of a distant field). What waits: rim bubbles, sphere
- * shading and the full theming (stage 8).
+ * NODE_MIN_PX, the floor most of a distant field sits at). The UPPER cap is off by default
+ * (uMaxPx = NODE_MAX_PX_OFF): a node you approach grows without bound and fills the view —
+ * the clamp holds only the lower rail. What waits: rim bubbles, sphere shading and the full
+ * theming (stage 8).
  *
  * Stage 6: the node POSITION is no longer an instanced attribute — it is pulled from the
  * shared GpuTransform at `instanceIndex` (DESIGN §4): morph mix, frame chain and spread all
@@ -60,7 +62,7 @@ import {
   FLAT_PX,
   HALO_GAIN,
   HALO_PX,
-  NODE_MAX_PX,
+  NODE_MAX_PX_OFF,
   NODE_MIN_PX,
   NODE_SCALE,
 } from './constants';
@@ -117,9 +119,10 @@ export interface NodeLayer {
     haloGain: { value: number };
     /** How much the bright centre burns toward white (default CORE_HOT). */
     coreHot: { value: number };
-    /** Projected radius lower clamp, CSS px (default NODE_MIN_PX). */
+    /** Projected radius lower clamp, CSS px (default NODE_MIN_PX). Always applied. */
     minPx: { value: number };
-    /** Projected radius upper clamp, CSS px (default NODE_MAX_PX). */
+    /** OPTIONAL projected-radius upper cap, CSS px. OFF by default (NODE_MAX_PX_OFF) — the node
+     *  grows without bound as you approach; a finite value re-imposes a cap. */
     maxPx: { value: number };
     /** Perspective bend on projected size; 1 = true projection (default FALLOFF). */
     falloff: { value: number };
@@ -141,7 +144,7 @@ export interface NodeStyle {
   coreHot?: number;
   /** Projected radius lower clamp, CSS px. */
   minPx?: number;
-  /** Projected radius upper clamp, CSS px. */
+  /** Optional projected-radius upper cap, CSS px. Omit for uncapped (NODE_MAX_PX_OFF). */
   maxPx?: number;
   /** Perspective bend on projected size; 1 = true projection. */
   falloff?: number;
@@ -211,7 +214,10 @@ export function buildNodeLayer(
   const uHaloGain = uniform(s.haloGain ?? HALO_GAIN);
   const uCoreHot = uniform(s.coreHot ?? CORE_HOT);
   const uMinPx = uniform(s.minPx ?? NODE_MIN_PX);
-  const uMaxPx = uniform(s.maxPx ?? NODE_MAX_PX);
+  /* The upper cap is OPTIONAL and OFF by default (NODE_MAX_PX_OFF, a sentinel past any real
+     viewport): a node is clamped only from BELOW, so it grows without bound as you approach and
+     fills the frame — no "pushing". A finite cap re-imposed via setNodeStyle({maxPx}) binds again. */
+  const uMaxPx = uniform(s.maxPx ?? NODE_MAX_PX_OFF);
   const uFalloff = uniform(s.falloff ?? FALLOFF);
 
   /* ---- vertex stage: world radius → projected px → clamp → world radius at this depth.
@@ -234,7 +240,13 @@ export function buildNodeLayer(
   const rw = iSize.mul(NODE_SCALE).mul(iBoost);
   const base = rw.mul(uHalfH).div(uTanHalf.mul(uDRef));
   const px = base.mul(pow(uDRef.div(depth), uFalloff));
-  const pxc = clamp(px, iBoost.mul(uMinPx), iBoost.mul(uMaxPx));
+  /* The LOWER clamp always applies (a distant page stays ≥ NODE_MIN_PX, a mote). The UPPER clamp
+     is OPTIONAL: `min(px, iBoost·uMaxPx)` with uMaxPx defaulting to the "off" sentinel, so by
+     default it is a no-op and px (hence the drawn world radius) grows without bound as depth→0 —
+     at falloff 1, pxc reduces to the true projection and rWorld back to the node's real world
+     radius, so approaching it simply makes it bigger on screen. A finite uMaxPx re-arms the cap. */
+  const pxFloored = max(px, iBoost.mul(uMinPx));
+  const pxc = min(pxFloored, iBoost.mul(uMaxPx));
   const rWorld = pxc.mul(uTanHalf).mul(depth).div(uHalfH);
 
   /* Varyings: computed per vertex, constant across the quad (so interpolation is a no-op). */

@@ -75,11 +75,29 @@ describe('decimalsOf / formatValue', () => {
   it('every shipped range default round-trips through its own format', () => {
     for (const row of SCHEMA) {
       if (row.kind !== 'range') continue;
+      // An optional-cap row whose default sits at/above offAt reads "off" by design — a
+      // display-only word the panel never parses back (it writes the slider's number), so it
+      // is exempt from the numeric round-trip. It must actually SAY "off".
+      if (row.offAt !== undefined && row.default >= row.offAt) {
+        expect(formatValue(row, row.default)).toBe('off');
+        continue;
+      }
       // formatting the default then parsing it back must not move the value: the panel
       // writes what it shows, and a lossy readout would mark untouched knobs as touched
       const printed = formatValue(row, row.default);
       expect(Number(printed)).toBeCloseTo(row.default, 6);
     }
+  });
+
+  it('an optional-cap row prints "off" at/above offAt and a number below it', () => {
+    const cap: RangeRow = {
+      group: 'g', key: 'k', label: 'k', kind: 'range',
+      min: 40, max: 2000, step: 10, default: 2000, offAt: 2000, unit: 'px',
+    };
+    expect(formatValue(cap, 2000)).toBe('off');
+    expect(formatValue(cap, 5000)).toBe('off');
+    expect(formatValue(cap, 1990)).toBe('1990');
+    expect(formatValue(cap, 400)).toBe('400');
   });
 });
 

@@ -77,6 +77,9 @@ export function decimalsOf(step: number): number {
  *  read "0.15000000000000002"); selects and toggles print verbatim. */
 export function formatValue(row: SchemaRow, value: ConfigValue): string {
   if (row.kind === 'range' && typeof value === 'number') {
+    // An optional-cap row reads "off" at or above its offAt (the slider's top detent) rather
+    // than a huge number — the control says "no cap", not "2000 px".
+    if (row.offAt !== undefined && value >= row.offAt) return 'off';
     return value.toFixed(decimalsOf(row.step));
   }
   return String(value);

@@ -40,7 +40,6 @@ import {
 import {
   FALLOFF,
   LINK_BASE_ALPHA,
-  NODE_MAX_PX,
   NODE_MIN_PX,
 } from '../src/field/constants';
 import { DIM_OTHERS, LINK_FOCUS_ALPHA, LINK_HOVER_ALPHA } from '../src/field/focus';
@@ -76,7 +75,11 @@ describe('schema → defaults derivation', () => {
     expect(DEFAULTS['labelDwell']).toBe(DWELL_MS);
     // node channel ← src/field/constants
     expect(DEFAULTS['nodeMinPx']).toBe(NODE_MIN_PX);
-    expect(DEFAULTS['nodeMaxPx']).toBe(NODE_MAX_PX);
+    // the size cap ships OFF: its default sits at the slider's top "off" detent (offAt), so an
+    // unconfigured node grows without bound as you approach (the shader's uncapped default).
+    const maxRow = SCHEMA.find((r) => r.key === 'nodeMaxPx');
+    expect(maxRow?.kind === 'range' && maxRow.offAt).toBeDefined();
+    expect(DEFAULTS['nodeMaxPx']).toBe(maxRow?.kind === 'range' ? maxRow.offAt : undefined);
     expect(DEFAULTS['falloff']).toBe(FALLOFF);
     // link alphas ← src/field/constants + src/field/focus
     expect(DEFAULTS['linkBase']).toBe(LINK_BASE_ALPHA);

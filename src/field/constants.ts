@@ -19,8 +19,19 @@ export const NODE_SCALE = 1.15;
 /** A node's projected radius never falls below this many CSS px — a distant page stays a mote. */
 export const NODE_MIN_PX = 2.2;
 
-/** …and never exceeds this many CSS px — a near page must not swallow the viewport. */
+/** A FINITE upper px cap, used as a reference ceiling (the picker's hit-radius bound, the
+ *  cap-slider's usable band). It is NOT the shipped shader default: the default is uncapped
+ *  (NODE_MAX_PX_OFF) so a node you fly up to grows without bound and fills the frame. */
 export const NODE_MAX_PX = 260;
+
+/** The "no upper cap" sentinel for a node's projected-px clamp — the SHIPPED DEFAULT. A node's
+ *  drawn size is bounded only BELOW (NODE_MIN_PX keeps a distant page a mote); it is free to
+ *  grow without limit as the camera closes, so flying up to ANY node fills the view with no
+ *  "pushing" wall (a finite cap holds screen size constant by shrinking the world radius as
+ *  depth→0, which reads as the node backing away — exactly what we are removing). A finite cap
+ *  can still be re-imposed via `setNodeStyle({ maxPx })` / the cap slider. 1e7 CSS px is past
+ *  any real viewport, so the optional `min(px, uMaxPx)` against it never binds. */
+export const NODE_MAX_PX_OFF = 1e7;
 
 /** Under this projected radius (CSS px) the glyph draws the cheap flat branch: one flat colour,
  *  no halo, no smoothsteps, no form test. At that size the shape channel is not readable and

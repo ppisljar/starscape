@@ -25,7 +25,6 @@ import {
   LINK_BASE_ALPHA,
   LINK_LEN_FLOOR,
   LINK_LEN_SOFT,
-  NODE_MAX_PX,
   NODE_MIN_PX,
   NODE_SCALE,
   SIZE_CURVE,
@@ -89,6 +88,12 @@ export interface RangeRow extends RowBase {
    *  would poison persistence and crash every subsequent boot. Most rows have none:
    *  min/max stay panel rails a deliberate paste may overshoot (store.ts validValue). */
   floor?: number;
+  /** OPTIONAL-CAP rows: at or above this value the control is "off" (no cap) rather than a
+   *  number — the panel readout prints "off". The slider's TOP detent is this value (= the
+   *  shipped default), so the knob reads as an optional cap you drag DOWN to impose; the
+   *  consumer maps the off state to its subsystem's uncapped sentinel (nodeMaxPx → the node
+   *  shader's NODE_MAX_PX_OFF). Omitted on ordinary rows, which always print a number. */
+  offAt?: number;
 }
 
 export interface SelectRow extends RowBase {
@@ -181,11 +186,15 @@ export const SCHEMA: readonly SchemaRow[] = [
   { group: 'nodes', key: 'nodeScale', label: 'node size', kind: 'range', min: 0.05, max: 4, step: 0.05, default: NODE_SCALE, unit: 'none' },
   { group: 'nodes', key: 'sizeCurve', label: 'size contrast', kind: 'range', min: 0.15, max: 3, step: 0.05, default: SIZE_CURVE, unit: 'none' },
   { group: 'nodes', key: 'nodeMinPx', label: 'never smaller than', kind: 'range', min: 0.2, max: 10, step: 0.1, default: NODE_MIN_PX, unit: 'px' },
-  /* nodeMaxPx rail runs to 8000, not 600: the upper clamp is what stops a node ever filling the
-     frame, and a consumer flying nose-to a focused node wants it to grow PAST the screen (the
-     close-orbit "fill the view" gesture). The default (NODE_MAX_PX) is unchanged — a distant
-     field still must not have a near page swallow the viewport; the high rail is opt-in. */
-  { group: 'nodes', key: 'nodeMaxPx', label: 'never larger than', kind: 'range', min: 10, max: 8000, step: 10, default: NODE_MAX_PX, unit: 'px' },
+  /* An OPTIONAL upper size cap, OFF by default. The old finite clamp was what stopped a node
+     ever filling the frame — approach it and, once projected px hit the cap, the shader held
+     screen size constant by shrinking the world radius, so the node appeared to "push" / back
+     away. So the shipped default is uncapped — the slider's TOP detent (default === offAt) reads
+     "off": fly up to ANY node and it grows without bound and fills the view. Drag the slider DOWN
+     to re-impose a finite cap (CSS px). The consumer maps the "off" detent to the node shader's
+     NODE_MAX_PX_OFF sentinel (Field.setNodeStyle({maxPx})); the shader's own unstyled default is
+     that same sentinel, so an unconfigured field is uncapped too. */
+  { group: 'nodes', key: 'nodeMaxPx', label: 'size cap', kind: 'range', min: 40, max: 2000, step: 10, default: 2000, offAt: 2000, unit: 'px' },
   { group: 'nodes', key: 'falloff', label: 'shrink with distance', kind: 'range', min: 0, max: 2.5, step: 0.05, default: FALLOFF, unit: 'none' },
   { group: 'nodes', key: 'bodyR', label: 'solid part', kind: 'range', min: 0.15, max: 1, step: 0.01, default: BODY_R, unit: 'none' },
   { group: 'nodes', key: 'haloPx', label: 'halo width', kind: 'range', min: 0, max: 24, step: 0.5, default: HALO_PX, unit: 'px' },
