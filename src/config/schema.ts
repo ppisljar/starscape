@@ -28,6 +28,7 @@ import {
   NODE_MIN_PX,
   NODE_SCALE,
   SIZE_CURVE,
+  SPHERE,
 } from '../field/constants';
 import {
   DIM_OTHERS,
@@ -183,7 +184,7 @@ export const SCHEMA: readonly SchemaRow[] = [
   /* Which facet binds the node glyph SHAPE (setShapeFacet). 'none' = all discs; a panel widens
      the options from the live graph's facets. Best read at a larger node size / lower density. */
   { group: 'nodes', key: 'shapeFacet', label: 'shape by', kind: 'select', options: SHAPE_FACETS, default: 'none', unit: 'none' },
-  { group: 'nodes', key: 'nodeScale', label: 'node size', kind: 'range', min: 0.05, max: 4, step: 0.05, default: NODE_SCALE, unit: 'none' },
+  { group: 'nodes', key: 'nodeScale', label: 'node size', kind: 'range', min: 0.05, max: 10, step: 0.05, default: NODE_SCALE, unit: 'none' },
   { group: 'nodes', key: 'sizeCurve', label: 'size contrast', kind: 'range', min: 0.15, max: 3, step: 0.05, default: SIZE_CURVE, unit: 'none' },
   { group: 'nodes', key: 'nodeMinPx', label: 'never smaller than', kind: 'range', min: 0.2, max: 10, step: 0.1, default: NODE_MIN_PX, unit: 'px' },
   /* An OPTIONAL upper size cap, OFF by default. The old finite clamp was what stopped a node
@@ -197,6 +198,10 @@ export const SCHEMA: readonly SchemaRow[] = [
   { group: 'nodes', key: 'nodeMaxPx', label: 'size cap', kind: 'range', min: 40, max: 2000, step: 10, default: 2000, offAt: 2000, unit: 'px' },
   { group: 'nodes', key: 'falloff', label: 'shrink with distance', kind: 'range', min: 0, max: 2.5, step: 0.05, default: FALLOFF, unit: 'none' },
   { group: 'nodes', key: 'bodyR', label: 'solid part', kind: 'range', min: 0.15, max: 1, step: 0.01, default: BODY_R, unit: 'none' },
+  /* Fake-sphere shading: 0 = a flat disc (the shipped look), 1 = the body reads as a lit ball
+     (a hemisphere normal + Lambert + soft specular, faked per-fragment — no geometry). The paper
+     look turns it on; the dark looks keep it at 0, so they are visually unchanged. */
+  { group: 'nodes', key: 'sphere', label: 'sphere shading', kind: 'range', min: 0, max: 1, step: 0.05, default: SPHERE, unit: 'none' },
   { group: 'nodes', key: 'haloPx', label: 'halo width', kind: 'range', min: 0, max: 24, step: 0.5, default: HALO_PX, unit: 'px' },
   { group: 'nodes', key: 'haloGain', label: 'halo strength', kind: 'range', min: 0, max: 2, step: 0.05, default: HALO_GAIN, unit: 'none' },
   { group: 'nodes', key: 'coreHot', label: 'core burns to white', kind: 'range', min: 0, max: 1, step: 0.02, default: CORE_HOT, unit: 'none' },

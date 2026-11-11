@@ -62,6 +62,12 @@ export const HALO_GAIN = 0.4;
 /** How much the small bright centre burns toward white. */
 export const CORE_HOT = 0.6;
 
+/** Fake-sphere shading strength (0..1). 0 = a flat disc (the shipped default — the dark looks
+ *  are unchanged); 1 = the body is shaded as a lit billboard "ball" (a hemisphere normal, a
+ *  Lambert term lit from the upper-left, a soft specular). No geometry — the two-draw-call path
+ *  is untouched; the shade is faked per-fragment. The `paper` look turns it on. */
+export const SPHERE = 0;
+
 /** Perspective bend on projected size. 1 = the true projection; below 1 distant pages stay
  *  larger than they should (field reads flat); above 1 depth is exaggerated. */
 export const FALLOFF = 1.0;

@@ -914,6 +914,7 @@ export function createField(graph: Graph, opts: FieldOpts = {}): Field {
       set(u.minPx, style.minPx);
       set(u.maxPx, style.maxPx);
       set(u.falloff, style.falloff);
+      set(u.sphere, style.sphere);
     },
 
     setLinkStyle(style: LinkStyle): void {

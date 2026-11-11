@@ -2619,6 +2619,7 @@ async function main(): Promise<void> {
       minPx: num('nodeMinPx'),
       maxPx: cap >= nodeCapOffAt ? NODE_MAX_PX_OFF : cap,
       falloff: num('falloff'),
+      sphere: num('sphere'),
     });
   };
   /* -- link style: the long-edge fade. `lenSoft` is a FRACTION of the field diagonal (the
@@ -2656,6 +2657,7 @@ async function main(): Promise<void> {
     nodeMinPx: applyNodeStyle,
     nodeMaxPx: applyNodeStyle,
     falloff: applyNodeStyle,
+    sphere: applyNodeStyle,
     lenSoft: applyLinkStyle,
     lenFloor: applyLinkStyle,
     colorMode: applyColors,

@@ -53,13 +53,20 @@ export const VISUAL_PRESETS = {
       // FULLY solid body (1.0): the soft antialiased edge of a sub-solid dot blends toward the cream
       // ground, washing small dots out to pastel — a solid body keeps every dot a crisp ink blob.
       bodyR: 1,
+      // Shade the body as a lit BALL (fake-sphere, nodes.ts): the reference's nodes read as little
+      // spheres, not flat discs. The Lambert term also deepens the shaded side, which recovers
+      // saturation the light-ground output lift washes out. Off (0) on every dark look.
+      sphere: 1,
       // Bold, legible dots on paper (was 1.5 / 1.8): the reference draws ink blobs, not specks, so
-      // the field reads as a hand-set diagram rather than a faint spray. Links stay thin.
+      // the field reads as a hand-set diagram rather than a faint spray.
       nodeScale: 2.1,
       nodeMinPx: 2.8,
-      linkBase: 0.14,
+      // Coloured links that actually read on the cream ground (was 0.14): links take their
+      // endpoints' facet colour, so raising the resting alpha draws the network like the reference —
+      // visible and coloured, but still thin enough not to overpower the dots.
+      linkBase: 0.3,
       lenSoft: 0.5,
-      lenFloor: 0.3,
+      lenFloor: 0.35,
     },
   },
 

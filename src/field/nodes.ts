@@ -35,6 +35,7 @@ import {
   If,
   attribute,
   clamp,
+  dot,
   float,
   instanceIndex,
   int,
@@ -46,6 +47,7 @@ import {
   pow,
   select,
   smoothstep,
+  sqrt,
   uniform,
   uv,
   varying,
@@ -65,6 +67,7 @@ import {
   NODE_MAX_PX_OFF,
   NODE_MIN_PX,
   NODE_SCALE,
+  SPHERE,
 } from './constants';
 
 /** The seven glyph families the node fragment shader renders, in `iShape` index order
@@ -126,6 +129,8 @@ export interface NodeLayer {
     maxPx: { value: number };
     /** Perspective bend on projected size; 1 = true projection (default FALLOFF). */
     falloff: { value: number };
+    /** Fake-sphere body shading, 0..1 (default SPHERE = 0 flat disc). */
+    sphere: { value: number };
   };
   dispose(): void;
 }
@@ -148,6 +153,8 @@ export interface NodeStyle {
   maxPx?: number;
   /** Perspective bend on projected size; 1 = true projection. */
   falloff?: number;
+  /** Fake-sphere body shading, 0..1 (0 = flat disc, 1 = a lit billboard "ball"). */
+  sphere?: number;
 }
 
 /** Build the instanced node quad. `transform` is the shared GPU transform the position is
@@ -219,6 +226,10 @@ export function buildNodeLayer(
      fills the frame — no "pushing". A finite cap re-imposed via setNodeStyle({maxPx}) binds again. */
   const uMaxPx = uniform(s.maxPx ?? NODE_MAX_PX_OFF);
   const uFalloff = uniform(s.falloff ?? FALLOFF);
+  /* Fake-sphere shading strength, GLOBAL. 0 = today's flat disc (the dark looks are unchanged);
+     1 = the body reads as a lit ball. The shade is faked per-fragment from a hemisphere normal —
+     no geometry, so the two-draw-call billboard path is untouched. */
+  const uSphere = uniform(s.sphere ?? SPHERE);
 
   /* ---- vertex stage: world radius → projected px → clamp → world radius at this depth.
      The clamp is done from the REAL projection, so it is exact rather than an approximation
@@ -334,7 +345,25 @@ export function buildNodeLayer(
          hotter, so emphasis reads in colour as well as size. */
       const hot = smoothstep(0.0, uBodyR.mul(0.5), r).oneMinus();
       const c = mix(vColor, vec3(1.0), hot.mul(uCoreHot).mul(min(vBoost, 1.6)));
-      out.assign(vec4(c, a));
+
+      /* Fake-sphere body shading (uSphere): the camera-facing billowy body reads as a lit BALL,
+         not a flat disc. A hemisphere normal over the disc (nz = sqrt(1 - ring²), ring the radial
+         distance), a Lambert diffuse lit from the UPPER-LEFT (L and the half-vector H are the
+         precomputed unit directions below) that keeps a 0.6 ambient floor so the shaded side stays
+         matte ink rather than black, plus a soft specular glint. All faked in-fragment — NO
+         geometry, so the two-draw-call path is untouched. uSphere lerps flat → shaded; at 0 this is
+         the exact disc the dark looks ship, so field/nebula/space4 are unchanged. */
+      const nx = p.x.mul(2.0);
+      const ny = p.y.mul(2.0);
+      const nz = sqrt(max(float(1.0).sub(ring.mul(ring)), 0.0));
+      const N = vec3(nx, ny, nz);
+      const ndl = max(dot(N, vec3(-0.3932, 0.4423, 0.8061)), 0.0); // L: upper-left, toward camera
+      const diffuse = float(0.6).add(ndl.mul(0.4)); // 0.6 (shaded) .. 1.0 (fully lit)
+      const ndh = max(dot(N, vec3(-0.2069, 0.2327, 0.9503)), 0.0); // H = normalize(L + view)
+      const spec = pow(ndh, 18.0).mul(0.4); // a soft white glint upper-left
+      const cSphere = c.mul(diffuse).add(vec3(spec));
+      const cShaded = mix(c, cSphere, uSphere);
+      out.assign(vec4(cShaded, a));
     });
 
     /* Stage 8 (§7): the highlight roll-off, in-fragment behind one selectable uniform —
@@ -370,6 +399,7 @@ export function buildNodeLayer(
       minPx: uMinPx,
       maxPx: uMaxPx,
       falloff: uFalloff,
+      sphere: uSphere,
     },
     dispose() {
       geo.dispose();
