@@ -209,6 +209,7 @@ const clampP = (p: number): number => (p < P_MIN ? P_MIN : p > P_MAX ? P_MAX : p
 const cloud: Shape = {
   key: 'cloud',
   dim: 3,
+  params: [{ key: 'sigma', label: 'sigma', default: 1 / 3, min: 0.05, max: 1, step: 0.05 }],
   place(u, radius, count, out, outOffset, params): void {
     const sigma = radius * (params['sigma'] ?? 1 / 3);
     for (let k = 0; k < count; k++) {

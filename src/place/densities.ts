@@ -56,6 +56,10 @@ const clampP = (p: number): number => (p < P_MIN ? P_MIN : p > P_MAX ? P_MAX : p
  *  it up against the boundary. */
 const gaussian: Density = {
   key: 'gaussian',
+  params: [
+    { key: 'center', label: 'center', default: 0.5, min: 0, max: 1, step: 0.02 },
+    { key: 'sigma', label: 'sigma', default: 0.15, min: 0.01, max: 0.5, step: 0.01 },
+  ],
   warp(q: number, params: Params): number {
     const center = params['center'] ?? 0.5;
     const sigma = params['sigma'] ?? 0.15;
@@ -78,6 +82,7 @@ const gaussian: Density = {
  *  is answered exactly as the identity. */
 const exponential: Density = {
   key: 'exponential',
+  params: [{ key: 'rate', label: 'rate', default: 3, min: -8, max: 8, step: 0.25 }],
   warp(q: number, params: Params): number {
     const rate = params['rate'] ?? 3;
     if (!Number.isFinite(rate)) throw new RangeError(`exponential: rate must be finite, got ${rate}`);
@@ -97,6 +102,7 @@ const exponential: Density = {
  *  distribution is not normalisable otherwise) — anything else throws. */
 const powerLaw: Density = {
   key: 'powerLaw',
+  params: [{ key: 'alpha', label: 'alpha', default: 0.5, min: 0.1, max: 4, step: 0.05 }],
   warp(q: number, params: Params): number {
     const alpha = params['alpha'] ?? 0.5;
     if (!(alpha > 0)) throw new RangeError(`powerLaw: alpha must be > 0, got ${alpha}`);
@@ -156,6 +162,26 @@ function mixCdf(x: number, nc: number): number {
  *  axes; put means safely inside [0, 1] so each bump keeps its mass). */
 const mixture: Density = {
   key: 'mixture',
+  /* Up to 4 gaussian components. Component i EXISTS only when `m<i>` is present (presence is
+   * the toggle — there is no "off" numeric value), with `s<i>` (sigma, default 0.1) and
+   * `w<i>` (weight, default 1) read only then. So `m<i>` defaults are REPRESENTATIVE means a
+   * panel seeds when the user turns a component ON, not omit-at-default fallbacks (omitting
+   * m0 throws — a mixture needs at least one component). `s<i>`/`w<i>` ARE plain `?? default`
+   * params (0.1 / 1), read when their component is present. */
+  params: [
+    { key: 'm0', label: 'm0·mean', default: 0, min: 0, max: 1, step: 0.02 },
+    { key: 's0', label: 's0·sigma', default: 0.1, min: 0.01, max: 0.5, step: 0.01 },
+    { key: 'w0', label: 'w0·wt', default: 1, min: 0.05, max: 4, step: 0.05 },
+    { key: 'm1', label: 'm1·mean', default: 0.35, min: 0, max: 1, step: 0.02 },
+    { key: 's1', label: 's1·sigma', default: 0.1, min: 0.01, max: 0.5, step: 0.01 },
+    { key: 'w1', label: 'w1·wt', default: 1, min: 0.05, max: 4, step: 0.05 },
+    { key: 'm2', label: 'm2·mean', default: 0.65, min: 0, max: 1, step: 0.02 },
+    { key: 's2', label: 's2·sigma', default: 0.1, min: 0.01, max: 0.5, step: 0.01 },
+    { key: 'w2', label: 'w2·wt', default: 1, min: 0.05, max: 4, step: 0.05 },
+    { key: 'm3', label: 'm3·mean', default: 1, min: 0, max: 1, step: 0.02 },
+    { key: 's3', label: 's3·sigma', default: 0.1, min: 0.01, max: 0.5, step: 0.01 },
+    { key: 'w3', label: 'w3·wt', default: 1, min: 0.05, max: 4, step: 0.05 },
+  ],
   warp(q: number, params: Params): number {
     let nc = 0;
     for (let i = 0; i < MIX_MAX; i++) {

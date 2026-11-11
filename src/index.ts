@@ -111,6 +111,7 @@ export { placeGroup } from './place/engine';
 export type {
   Density,
   Ordering,
+  ParamDesc,
   Params,
   PlaceInput,
   PlacementSpec,
@@ -119,6 +120,7 @@ export type {
 } from './place/types';
 export {
   densityKeys,
+  densityParams,
   getDensity,
   getOrdering,
   getScatter,
@@ -129,7 +131,9 @@ export {
   registerScatter,
   registerShape,
   scatterKeys,
+  scatterParams,
   shapeKeys,
+  shapeParams,
 } from './place/registry';
 export { getPreset, preset, presetKeys, registerPreset } from './place/presets';
 export { dendriteTiers } from './place/shapes';

@@ -18,6 +18,34 @@ import type { Graph } from '../core/types';
  *  params bag can feed all four knobs of a preset without cross-talk. */
 export type Params = Record<string, number>;
 
+/** Self-describing metadata for ONE numeric param a knob reads (DESIGN §7 — a param is a
+ *  schema row). The knob declares its `params: ParamDesc[]` so a panel can enumerate and
+ *  render a control per param WITHOUT hardcoding the knob's internals — the registry's
+ *  `shapeParams`/`densityParams`/`scatterParams` getters hand these back by key.
+ *
+ *  THE DEFAULT CONTRACT: `default` MUST equal the knob's own inline `params[key] ?? default`
+ *  fallback, so a param left at its declared default produces byte-identical output to
+ *  omitting it entirely — the panel can seed every control at `default` and the untouched
+ *  scene is unchanged. A few knobs read a param whose fallback is not a plain constant
+ *  (ball's `radialPower` defaults to a `cbrt`, dendrite's `tiers` to a count-derived auto,
+ *  mixture's `m<i>` are presence flags); those declare a REPRESENTATIVE default and the
+ *  caller omits a param equal to its default rather than sending it (each knob's doc says
+ *  so). */
+export interface ParamDesc {
+  /** The `params` key the knob reads (e.g. `'arms'`, `'sigma'`, `'tube'`). */
+  key: string;
+  /** Short human label for a panel (often the same as `key`). */
+  label: string;
+  /** The value the knob uses when the param is absent — see THE DEFAULT CONTRACT above. */
+  default: number;
+  /** Suggested slider/number minimum (advisory — the knob still validates its own domain). */
+  min: number;
+  /** Suggested slider/number maximum (advisory). */
+  max: number;
+  /** Suggested slider/number step (advisory). */
+  step: number;
+}
+
 /** One group's placement job: everything the engine (and the knobs it drives) may know about
  *  the group. The engine writes **LOCAL** positions — the group's centre is the origin; the
  *  hierarchy compiler (§3.4) adds the parent transform. Nothing in here is retained past the
@@ -64,6 +92,9 @@ export interface Shape {
   /** Dimension of parameter space U: 1 for curves, 2 for surfaces, 3 for volumes. The
    *  engine builds `dim` parameter axes per member. */
   dim: 1 | 2 | 3;
+  /** Self-describing metadata for the numeric params `place` reads (see `ParamDesc`).
+   *  Optional — a shape with no tunable params (ring, line, shell) omits it. */
+  params?: ParamDesc[];
   /**
    * Optional: axis 0 is FOLDED into `folds(params)` equal segments — `floor(u0 · folds)`
    * picks the segment (a spiral's arm) and the fraction within it is the segment's own
@@ -140,6 +171,9 @@ export interface Ordering {
 export interface Density {
   /** Registry key, e.g. `'uniform'`, `'gaussian'`, `'powerLaw'`. */
   key: string;
+  /** Self-describing metadata for the numeric params `warp` reads (see `ParamDesc`).
+   *  Optional — `uniform` (the identity) omits it. */
+  params?: ParamDesc[];
   /**
    * The inverse CDF on `[0, 1)`: monotone non-decreasing — OR circular-monotone, a
    * monotone lift taken `mod 1` (`gaussian` wraps its tails this way, because whether an
@@ -161,6 +195,9 @@ export interface Density {
 export interface Scatter {
   /** Registry key, e.g. `'none'`, `'gaussian'`, `'discFalloff'`. */
   key: string;
+  /** Self-describing metadata for the numeric params `offset` reads (see `ParamDesc`).
+   *  Optional — `none` omits it. */
+  params?: ParamDesc[];
   /**
    * ADD a displacement to one already-placed member — read-modify-write on the three slots,
    * never overwrite, so scatter composes with whatever the shape wrote.

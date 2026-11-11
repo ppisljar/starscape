@@ -11,7 +11,7 @@
  * throwing on collision — would make every hot-reload a crash.
  */
 
-import type { Shape, Ordering, Density, Scatter } from './types';
+import type { Shape, Ordering, Density, Scatter, ParamDesc } from './types';
 
 /** One knob kind's registry: a Map plus the error message that names it. */
 function makeRegistry<T extends { key: string }>(kind: string) {
@@ -46,6 +46,9 @@ export const registerShape = (s: Shape): void => shapes.register(s);
 export const getShape = (key: string): Shape => shapes.get(key);
 /** The registered shape keys, sorted. */
 export const shapeKeys = (): string[] => shapes.keys();
+/** The declared numeric params of a shape (empty when it declares none); throws on an
+ *  unknown key, like `getShape`. For panels enumerating a key's tunable params (§7). */
+export const shapeParams = (key: string): ParamDesc[] => shapes.get(key).params ?? [];
 
 /** Register an ordering under its own `key` (overwrites an existing registration). */
 export const registerOrdering = (o: Ordering): void => orderings.register(o);
@@ -60,6 +63,9 @@ export const registerDensity = (d: Density): void => densities.register(d);
 export const getDensity = (key: string): Density => densities.get(key);
 /** The registered density keys, sorted. */
 export const densityKeys = (): string[] => densities.keys();
+/** The declared numeric params of a density (empty when it declares none — `uniform`);
+ *  throws on an unknown key, like `getDensity`. */
+export const densityParams = (key: string): ParamDesc[] => densities.get(key).params ?? [];
 
 /** Register a scatter under its own `key` (overwrites an existing registration). */
 export const registerScatter = (s: Scatter): void => scatters.register(s);
@@ -67,3 +73,6 @@ export const registerScatter = (s: Scatter): void => scatters.register(s);
 export const getScatter = (key: string): Scatter => scatters.get(key);
 /** The registered scatter keys, sorted. */
 export const scatterKeys = (): string[] => scatters.keys();
+/** The declared numeric params of a scatter (empty when it declares none — `none`); throws
+ *  on an unknown key, like `getScatter`. */
+export const scatterParams = (key: string): ParamDesc[] => scatters.get(key).params ?? [];

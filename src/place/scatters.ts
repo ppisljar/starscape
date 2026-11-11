@@ -38,6 +38,7 @@ const NOISE_SALT = 23; // noiseField uses +23, +24, +25 (one per displacement co
  * streams, so the displacement is an isotropic 3D gaussian with σ = thickness·radius. */
 const gaussianScatter: Scatter = {
   key: 'gaussian',
+  params: [{ key: 'thickness', label: 'thickness', default: 0.1, min: 0, max: 0.5, step: 0.01 }],
   offset(_k, member, salt, radius, out, o, params): void {
     const t = (params['thickness'] ?? 0.1) * radius;
     if (t === 0) return;
@@ -69,6 +70,7 @@ const DISC_FLOOR = 0.02;
 
 const discFalloff: Scatter = {
   key: 'discFalloff',
+  params: [{ key: 'h', label: 'h·thick', default: 0.12, min: 0, max: 0.5, step: 0.01 }],
   offset(_k, member, salt, radius, out, o, params): void {
     const h = params['h'] ?? 0.12;
     // READ the already-placed point (shape ran first — see the module header contract).
@@ -147,6 +149,10 @@ export function valueNoise3(x: number, y: number, z: number, salt: number): numb
  * 0.25); each axis adds `(noise*2 - 1) * amp * radius`, so |Δ| ≤ amp·radius per axis. */
 const noiseField: Scatter = {
   key: 'noiseField',
+  params: [
+    { key: 'scale', label: 'scale', default: 3, min: 0.5, max: 12, step: 0.5 },
+    { key: 'amp', label: 'amp', default: 0.25, min: 0, max: 1, step: 0.05 },
+  ],
   offset(_k, _member, salt, radius, out, o, params): void {
     const amp = (params['amp'] ?? 0.25) * radius;
     if (amp === 0 || radius <= 0) return;

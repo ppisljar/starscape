@@ -78,6 +78,10 @@ const line: Shape = {
 const helix: Shape = {
   key: 'helix',
   dim: 1,
+  params: [
+    { key: 'turns', label: 'turns', default: 3, min: 0.5, max: 12, step: 0.5 },
+    { key: 'coil', label: 'coil', default: 0.4, min: 0.05, max: 1, step: 0.05 },
+  ],
   place(u, radius, count, out, outOffset, params): void {
     const turns = params['turns'] ?? 3;
     const coil = params['coil'] ?? 0.4;
@@ -131,6 +135,12 @@ const helix: Shape = {
 const spiralArm: Shape = {
   key: 'spiralArm',
   dim: 1,
+  params: [
+    { key: 'arms', label: 'arms', default: 2, min: 1, max: 8, step: 1 },
+    { key: 'swirl', label: 'swirl', default: 2.5, min: 0, max: 10, step: 0.25 },
+    { key: 'bar', label: 'bar', default: 0, min: 0, max: 0.95, step: 0.05 },
+    { key: 'radialPower', label: 'radialPwr', default: 0.5, min: 0.1, max: 2, step: 0.05 },
+  ],
   folds(params): number {
     return Math.max(1, Math.round(params['arms'] ?? 2));
   },
@@ -239,6 +249,18 @@ const dw = new Float64Array(15);
 const dendrite: Shape = {
   key: 'dendrite',
   dim: 1,
+  /* `tiers` default 0 is the REPRESENTATIVE "auto" sentinel: the real fallback is
+   * `dendriteTiers(count)` (count-derived), which no constant can match. A caller OMITS
+   * `tiers` (the default-equals-0 omit rule) to get the auto depth, and sends 1..9 to
+   * override; note the shape itself reads a literally-sent 0 as ~1 tier (`0 ?? x` is 0),
+   * so 0 means "auto" only by omission, never by value. The other three are plain `??
+   * default` params. */
+  params: [
+    { key: 'tiers', label: 'tiers·0=auto', default: 0, min: 0, max: 9, step: 1 },
+    { key: 'shrink', label: 'shrink', default: 0.77, min: 0.05, max: 0.95, step: 0.01 },
+    { key: 'split', label: 'split', default: 0.4, min: 0, max: 1.5, step: 0.05 },
+    { key: 'twist', label: 'twist', default: 0.26, min: 0, max: 1.5, step: 0.02 },
+  ],
   place(u, radius, count, out, outOffset, params): void {
     const tiers = Math.max(1, Math.min(16, Math.round(params['tiers'] ?? dendriteTiers(count))));
     const shrink = Math.min(0.95, Math.max(0.05, params['shrink'] ?? 0.77));
@@ -336,6 +358,7 @@ const shell: Shape = {
 const disc: Shape = {
   key: 'disc',
   dim: 2,
+  params: [{ key: 'radialPower', label: 'radialPwr', default: 0.5, min: 0.1, max: 2, step: 0.05 }],
   place(u, radius, count, out, outOffset, params): void {
     const pow = params['radialPower'] ?? 0.5;
     for (let k = 0; k < count; k++) {
@@ -364,6 +387,7 @@ const disc: Shape = {
 const torus: Shape = {
   key: 'torus',
   dim: 2,
+  params: [{ key: 'tube', label: 'tube', default: 0.25, min: 0.02, max: 0.5, step: 0.01 }],
   place(u, radius, count, out, outOffset, params): void {
     const tube = Math.min(0.5, Math.max(1e-6, params['tube'] ?? 0.25));
     const spine = radius * (1 - tube);
@@ -401,6 +425,14 @@ const torus: Shape = {
 const ball: Shape = {
   key: 'ball',
   dim: 3,
+  /* `radialPower` default ⅓ is REPRESENTATIVE: the real fallback when the param is ABSENT is
+   * `Math.cbrt(t)` (the volume-uniform cube root), which `Math.pow(t, 1/3)` does not reproduce
+   * bit-for-bit. A caller OMITS `radialPower` (the default-equals-⅓ omit rule) to keep the
+   * exact cbrt, and sends a value to switch to `pow`. `aspectY` is a plain `?? 1` param. */
+  params: [
+    { key: 'radialPower', label: 'radialPwr', default: 1 / 3, min: 0.1, max: 2, step: 0.05 },
+    { key: 'aspectY', label: 'aspectY', default: 1, min: 0.1, max: 3, step: 0.1 },
+  ],
   place(u, radius, count, out, outOffset, params): void {
     const rp = params['radialPower'];
     const ay = params['aspectY'] ?? 1;
@@ -431,6 +463,10 @@ const ball: Shape = {
 const box: Shape = {
   key: 'box',
   dim: 3,
+  params: [
+    { key: 'aspectY', label: 'aspectY', default: 1, min: 0.1, max: 3, step: 0.1 },
+    { key: 'aspectZ', label: 'aspectZ', default: 1, min: 0.1, max: 3, step: 0.1 },
+  ],
   place(u, radius, count, out, outOffset, params): void {
     const hy = radius * (params['aspectY'] ?? 1);
     const hz = radius * (params['aspectZ'] ?? 1);
