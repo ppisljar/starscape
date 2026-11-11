@@ -2008,8 +2008,13 @@ async function main(): Promise<void> {
       return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT';
     };
     if (ev.key === 'Escape') {
+      const cm = document.getElementById('codemodal');
+      if (cm && !cm.hasAttribute('hidden')) {
+        cm.setAttribute('hidden', ''); // Escape closes the export-code modal first
+        return;
+      }
       if (!legendEl.hasAttribute('hidden')) {
-        toggleLegend(false); // Escape closes the keys legend first
+        toggleLegend(false); // then the keys legend
         return;
       }
       // close + retreat + unpin (retreatFrom carries the demo's shrink-back rule)
@@ -2665,6 +2670,249 @@ async function main(): Promise<void> {
   document.body.appendChild(panel.el);
   panel.setInert(inertKeys()); // seed palette/ramp AND center-size greying from the booted config
   ui.tune.addEventListener('click', () => panel.toggle());
+
+  /* ======================================================================================
+   * EXPORT AS CODE — serialize the LIVE scene (the config store + the level-editor rows) into a
+   * runnable TypeScript snippet a visitor can paste into their own app. Everything is read fresh
+   * on open, so the code changes when the settings change. Pure demo-side serializer (no library
+   * change): it reuses buildPlace (the compiler's own level→spec step) so a level's exported place
+   * is byte-identical to what the field is drawing, and mirrors applySpins' shifted spin mapping.
+   * ====================================================================================== */
+  const r4 = (x: number): number => Math.round(x * 1e4) / 1e4;
+  const defOf = (key: string): ConfigValue | undefined => schema.find((row) => row.key === key)?.default;
+  /** Drop a place's default-valued knobs so an untouched level reads as `{ shape: 'shell' }`. */
+  const stripPlaceDefaults = (p: Record<string, unknown>): Record<string, unknown> => {
+    const o: Record<string, unknown> = { ...p };
+    if (o['ordering'] === 'byIndex') delete o['ordering'];
+    if (o['density'] === 'uniform') delete o['density'];
+    if (o['scatter'] === 'none') delete o['scatter'];
+    if (o['densityAxis'] === 0) delete o['densityAxis'];
+    if (o['params'] && typeof o['params'] === 'object' && Object.keys(o['params'] as object).length === 0) {
+      delete o['params'];
+    }
+    if (o['base'] && typeof o['base'] === 'object') {
+      o['base'] = stripPlaceDefaults(o['base'] as Record<string, unknown>);
+    }
+    return o;
+  };
+
+  const generateCode = (): string => {
+    const ss = ['generateSynth', 'buildGraph', 'createField']; // starscape imports (grown below)
+    const body: string[] = [];
+
+    // 1. data — the synthetic corpus the playground runs on, reproducible from (n, seed).
+    body.push('// 1. data — swap generateSynth for your own buildGraph({ n, positions, links, columns, facets }) input');
+    body.push(`const input = generateSynth({ n: ${synthN}, seed: ${synthSeed} });`);
+    body.push('const graph = buildGraph(input);');
+    body.push('');
+
+    // 2. renderer + camera + field (two draw calls, WebGL2 fallback) — README's compose pattern.
+    body.push('// 2. renderer, camera, field');
+    body.push('const renderer = new WebGPURenderer({ antialias: true });');
+    body.push('await renderer.init();');
+    body.push('document.body.appendChild(renderer.domElement);');
+    body.push(
+      `const camera = new PerspectiveCamera(${DEFAULT_FOV}, window.innerWidth / window.innerHeight, 0.1, 1e7);`,
+    );
+    const fieldOpts: string[] = [`heightCss: window.innerHeight`, `fov: ${DEFAULT_FOV}`];
+    const sizeCh = str('sizeChannel');
+    if (sizeCh !== 'degree') fieldOpts.push(`sizeColumn: '${sizeCh}'`);
+    if (str('blend') === 'additive') fieldOpts.push(`blend: 'additive'`);
+    body.push(`const field = createField(graph, { ${fieldOpts.join(', ')} });`);
+    body.push('const scene = new Scene();');
+    body.push('scene.background = new Color(field.background);');
+    body.push('for (const o of field.objects) scene.add(o);');
+    body.push('');
+
+    // 3. arrangement — the per-level hierarchy the custom editor compiles (custom mode only).
+    if (mode === 'custom' && rows.length > 0) {
+      ss.push('compileHierarchy');
+      const L = rows.length;
+      const override = num('levelSpin');
+      const rowRate = (k: number): number => {
+        const row = rows[k];
+        const base = row && row.spin ? row.spinRate || 0 : 0;
+        return override > 0 ? override : base;
+      };
+      const rowAxisArr = (k: number): [number, number, number] => {
+        const a = axisUnit(rows[k]?.spinAxis ?? [0, 1, 0]);
+        return [r4(a[0]), r4(a[1]), r4(a[2])];
+      };
+      const levels = rows.map((row, k): Record<string, unknown> => {
+        const isLeaf = k === L - 1;
+        const o: Record<string, unknown> = {};
+        if (!isLeaf) o['groupBy'] = row.groupBy;
+        o['place'] = stripPlaceDefaults(buildPlace(row) as unknown as Record<string, unknown>);
+        if (L === 1) {
+          if (row.spread !== 1) o['radiusScale'] = r4(row.spread);
+        } else if (!isLeaf) {
+          const cs = rows[k + 1]?.spread;
+          if (cs !== undefined && cs !== 1) o['radiusScale'] = r4(cs);
+        }
+        // the shifted spin mapping (applySpins): a grouping level k's pivots are driven by row k+1
+        if (!isLeaf) {
+          const rt = rowRate(k + 1);
+          if (rt !== 0) o['spin'] = { rate: r4(rt), axis: rowAxisArr(k + 1) };
+        }
+        return o;
+      });
+      const spacing = r4(arrangeSpacing);
+      const rootRadiusScale = r4(Math.min(10, Math.max(0.25, rows[0]?.spread ?? 1)));
+      body.push('// 3. arrangement — the per-level hierarchy (shapes, ordering, density, scatter, spin)');
+      body.push(`const levels = ${JSON.stringify(levels, null, 2)};`);
+      body.push(
+        `const hierarchy = compileHierarchy(graph, levels, { spacing: ${spacing}, rootRadiusScale: ${rootRadiusScale} });`,
+      );
+      body.push('field.setHierarchy(hierarchy);');
+      // row 0 drives the FIELD-GLOBAL rotation (no pivot sits above it)
+      const fieldRate = rowRate(0);
+      if (fieldRate !== 0) {
+        const a = rowAxisArr(0);
+        body.push(`field.setFieldSpin(${r4(fieldRate)}, [${a[0]}, ${a[1]}, ${a[2]}]);`);
+      }
+      body.push('');
+    } else {
+      body.push('// 3. arrangement — frozen: the generated layout as-is (no hierarchy compiled)');
+      body.push('');
+    }
+
+    // 4. visuals — only what differs from the library defaults (keep it clean).
+    const vis: string[] = [];
+    // colour
+    const cmode = str('colorMode');
+    const ramp = str('ramp');
+    const facet = str('colorFacet');
+    if (cmode === 'column') {
+      vis.push(`field.setColorColumn('degree', '${ramp}');`);
+    } else if (cmode === 'density') {
+      vis.push(`field.setColorByDensity('${ramp}');`);
+    } else if (cmode === 'facet' && str('colorOrder') === 'spatial') {
+      vis.push(`field.setColorFacetSpatial('${facet}', '${ramp}');`);
+    } else if (cmode === 'facet' && facet !== 'type') {
+      // value-order facet colour: the library binds the facet; the playground additionally paints a
+      // custom palette (palette = '${str('palette')}') into the iColor buffer — see demo/main.ts applyColors
+      vis.push(`field.setColorFacet('${facet}');`);
+    }
+    // shape-by-facet
+    const shapeFacet = str('shapeFacet');
+    if (shapeFacet !== 'none') vis.push(`field.setShapeFacet('${shapeFacet}');`);
+    // node glyph style — only the keys the user moved off their default
+    const nodeStyle: string[] = [];
+    const pushIf = (cfgKey: string, libKey: string): void => {
+      const v = num(cfgKey);
+      if (v !== defOf(cfgKey)) nodeStyle.push(`${libKey}: ${r4(v)}`);
+    };
+    pushIf('bodyR', 'bodyR');
+    pushIf('haloPx', 'haloPx');
+    pushIf('haloGain', 'haloGain');
+    pushIf('coreHot', 'coreHot');
+    pushIf('nodeMinPx', 'minPx');
+    pushIf('falloff', 'falloff');
+    if (num('nodeMaxPx') !== defOf('nodeMaxPx')) nodeStyle.push(`maxPx: ${r4(num('nodeMaxPx'))}`); // a finite px cap
+    if (nodeStyle.length > 0) vis.push(`field.setNodeStyle({ ${nodeStyle.join(', ')} });`);
+    // link style
+    const linkStyle: string[] = [];
+    if (num('lenSoft') !== defOf('lenSoft')) linkStyle.push(`lenSoft: ${r4(num('lenSoft'))}`);
+    if (num('lenFloor') !== defOf('lenFloor')) linkStyle.push(`lenFloor: ${r4(num('lenFloor'))}`);
+    if (linkStyle.length > 0) vis.push(`field.setLinkStyle({ ${linkStyle.join(', ')} });`);
+    // spread
+    if (num('spread') !== 1) vis.push(`field.setSpread(${r4(num('spread'))});`);
+    // view distance
+    const vd = Math.min(20, Math.max(0.5, Number(ui.viewdist.value) || 1));
+    if (vd !== 1) vis.push(`field.setViewDistance(${r4(vd)});`);
+    // projection
+    if (field.projection === '2d') vis.push(`field.setProjection('2d');`);
+    // tone curve (when glow is OFF the field owns the roll-off; with glow it moves to the post chain)
+    if (!glow.on && str('tonemap') !== 'none') {
+      vis.push(`field.setTonemap('${str('tonemap')}', ${r4(num('exposure'))});`);
+    }
+    if (vis.length > 0) {
+      body.push('// 4. visuals (only what differs from the library defaults)');
+      body.push(...vis);
+      body.push('');
+    }
+
+    // 5. glow — the HDR bloom post-process (only when enabled).
+    if (glow.on) {
+      ss.push('createPostProcess');
+      body.push('// 5. glow — HDR bloom: render additively, bloom the sum, tonemap once post-sum');
+      const tm = str('tonemap');
+      body.push(
+        `const post = createPostProcess(renderer, scene, camera, {\n` +
+          `  bloom: { strength: ${r4(glow.strength)}, radius: ${r4(glow.radius)}, threshold: ${r4(glow.threshold)} },\n` +
+          `  tonemap: '${tm === 'none' ? 'reinhard' : tm}', exposure: ${r4(num('exposure'))}, resolutionScale: 1,\n` +
+          `});`,
+      );
+      if (num('compression') !== 0) body.push(`post.setCompression(${r4(num('compression'))});`);
+      body.push('// render loop: call post.render() instead of renderer.render(scene, camera)');
+      body.push('');
+    }
+
+    body.push('// camera + zoom-ladder wiring (createFlycam + createLadder + createOverlay): see demo/main.ts');
+
+    const importThree = `import { Color, PerspectiveCamera, Scene, WebGPURenderer } from 'three/webgpu';`;
+    const importStar = `import {\n  ${ss.join(',\n  ')},\n} from 'starscape';`;
+    return `${importStar}\n${importThree}\n\n${body.join('\n')}\n`;
+  };
+
+  /* ---- the export-as-code modal: reuse the legend overlay conventions (Esc + click-outside to
+     close), a scrollable <pre>, and a Copy button that writes to the clipboard and flips to a
+     confirmation for ~1.5 s (falling back to selecting the text when clipboard is unavailable). */
+  const codeModal = document.getElementById('codemodal')!;
+  const codeOut = document.getElementById('codeout')!;
+  const codeCopy = document.getElementById('codecopy') as HTMLButtonElement;
+  const openCode = (): void => {
+    codeOut.textContent = generateCode();
+    codeModal.removeAttribute('hidden');
+  };
+  const closeCode = (): void => codeModal.setAttribute('hidden', '');
+  document.getElementById('code')!.addEventListener('click', openCode);
+  // backdrop click closes; clicks inside the card (selecting code) do not
+  codeModal.addEventListener('click', (ev) => {
+    if (ev.target === codeModal) closeCode();
+  });
+  let copyTimer = 0;
+  codeCopy.addEventListener('click', () => {
+    const text = codeOut.textContent ?? '';
+    const flip = (): void => {
+      codeCopy.textContent = 'copied ✓';
+      codeCopy.classList.add('ok');
+      window.clearTimeout(copyTimer);
+      copyTimer = window.setTimeout(() => {
+        codeCopy.textContent = 'Copy';
+        codeCopy.classList.remove('ok');
+      }, 1500);
+    };
+    // clipboard unavailable / denied / hung: select the <pre> so the user can Cmd/Ctrl-C.
+    const selectFallback = (): void => {
+      const range = document.createRange();
+      range.selectNodeContents(codeOut);
+      const sel = window.getSelection();
+      sel?.removeAllRanges();
+      sel?.addRange(range);
+      flip();
+    };
+    // resolve exactly once: success flips; reject or a stalled write (no user gesture / blurred
+    // document — some embedded contexts never settle writeText) falls back within 500 ms.
+    let done = false;
+    const win = (): void => {
+      if (done) return;
+      done = true;
+      flip();
+    };
+    const fail = (): void => {
+      if (done) return;
+      done = true;
+      selectFallback();
+    };
+    const clip = navigator.clipboard;
+    if (clip && typeof clip.writeText === 'function') {
+      clip.writeText(text).then(win, fail);
+      window.setTimeout(fail, 500);
+    } else {
+      fail();
+    }
+  });
 
   for (const name of Object.keys(VISUAL_PRESETS)) {
     const opt = document.createElement('option');
