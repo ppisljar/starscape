@@ -34,21 +34,30 @@ export const VISUAL_PRESETS = {
 
   paper: {
     label: 'paper',
-    note: 'ink on paper: light ground, matte solid dots, zero glow — normal blend because blending is a property of the ground (§5)',
+    note: 'ink on paper: light ground, bold matte SOLID dots in saturated categorical ink, zero glow — normal blend because blending is a property of the ground (§5)',
     set: {
       background: 'light',
       blend: 'normal',
       tonemap: 'none',
-      // On a light ground a white-hot core is invisible and a halo is just haze, so both go
-      // to zero: these dots are ink, not light (the predecessor's "single biggest difference
-      // between the two looks, and it is not the palette").
+      // Saturated categorical INK, not pale pastel: the vaultLayer set (theme/palettes.ts) is the
+      // reference's own layer palette — deep guide-green / course-gold / handbook-blue / tool-purple
+      // / term-rust — which reads as proper ink on a cream ground, where the golden-angle generator
+      // drifts toward washed mid-tones. (A categorical set, so it binds in facet mode by value.)
+      palette: 'vaultLayer',
+      // On a light ground a white-hot core is invisible and a halo is just haze, so both go to zero:
+      // these dots are ink, not light (the predecessor's "single biggest difference between the two
+      // looks, and it is not the palette"). haloGain 0 = pure matte, no haze.
       coreHot: 0,
-      haloGain: 0.08,
+      haloGain: 0,
       haloPx: 1,
-      bodyR: 0.88,
-      nodeScale: 1.5,
-      nodeMinPx: 1.8,
-      linkBase: 0.16,
+      // FULLY solid body (1.0): the soft antialiased edge of a sub-solid dot blends toward the cream
+      // ground, washing small dots out to pastel — a solid body keeps every dot a crisp ink blob.
+      bodyR: 1,
+      // Bold, legible dots on paper (was 1.5 / 1.8): the reference draws ink blobs, not specks, so
+      // the field reads as a hand-set diagram rather than a faint spray. Links stay thin.
+      nodeScale: 2.1,
+      nodeMinPx: 2.8,
+      linkBase: 0.14,
       lenSoft: 0.5,
       lenFloor: 0.3,
     },

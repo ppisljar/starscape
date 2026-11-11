@@ -543,6 +543,212 @@ body.light #regionlabels .rl b {
   color: #3a4254;
 }
 
+/* ===========================================================================================
+ * PAPER-MODE PANELS — in the `paper` look applyGround adds body.light and global text flips to
+ * dark ink; without these both the sidebar (#panel) and the library tune panel (.ss-cfg) keep
+ * their dark backgrounds, so their labels become dark-on-dark. Give both a light "paper" theme:
+ * warm off-white cards, dark ink text, light borders, legible inputs — matching the reference's
+ * ink-on-paper chrome. Everything is scoped to body.light, so switching back to a dark look
+ * (which removes the class) restores the dark chrome with no leftovers.
+ * =========================================================================================== */
+/* the sidebar card + its header */
+body.light #panel {
+  background: rgba(250, 248, 242, 0.95);
+  border-color: #d7cfbe;
+  color: #333a44;
+}
+body.light #panel h3 {
+  color: #5f6a82;
+}
+body.light #panel label {
+  color: #3a4150;
+}
+body.light #panel select,
+body.light #panel input[type='number'] {
+  background: #fffdf8;
+  color: #2a3040;
+  border-color: #c9c0ad;
+}
+body.light #panel input[type='range'] {
+  accent-color: #3d6ea3;
+}
+body.light #panel .vd #viewdistv {
+  color: #6b7488;
+}
+body.light #panel button {
+  background: #eee9dd;
+  color: #4a5160;
+  border-color: #cfc6b2;
+}
+body.light #panel button:hover,
+body.light #panel #keys.on {
+  color: #1c2330;
+  border-color: #3d6ea3;
+  background: #e4ddcc;
+}
+/* the top-level scene selector */
+body.light #panel #scenebox {
+  border-bottom-color: #d7cfbe;
+}
+body.light #panel #scenebox select {
+  color: #1c2330;
+  border-color: #bcb29a;
+}
+/* collapsible groups */
+body.light #panel details.grp {
+  background: rgba(255, 253, 248, 0.55);
+  border-color: #e0d9c9;
+}
+body.light #panel details.grp > summary {
+  color: #5f6a82;
+}
+body.light #panel details.grp > summary::before {
+  color: #938c7b;
+}
+/* find-a-node box + hits dropdown */
+body.light #find #search {
+  background: #fffdf8;
+  color: #2a3040;
+  border-color: #c9c0ad;
+}
+body.light #find #search:focus {
+  border-color: #3d6ea3;
+}
+body.light #find #hits {
+  background: rgba(252, 250, 244, 0.98);
+  border-color: #d7cfbe;
+}
+body.light #find #hits button {
+  color: #333a44;
+}
+body.light #find #hits button:hover {
+  background: #ece7db;
+}
+body.light #find #hits button b,
+body.light #regions .reg b {
+  color: #938c7b;
+}
+/* the level editor rows */
+body.light #levels .lv {
+  border-color: #d7cfbe;
+  background: rgba(255, 253, 248, 0.6);
+}
+body.light #levels .lvh {
+  color: #5f6a82;
+}
+body.light #levels .lvh b {
+  color: #3d6ea3;
+}
+body.light #levels .lvh .lv-n,
+body.light #levels .lvrow > i,
+body.light #levels .lv-rv,
+body.light #levels .pp > span {
+  color: #938c7b;
+}
+body.light #levels input[type='range'] {
+  accent-color: #3d6ea3;
+}
+body.light #levels .pp.pp-cb,
+body.light #levels .pp.pp-cb > span {
+  color: #5f6a82;
+}
+body.light #levelsbox #levelsreset {
+  color: #938c7b;
+  border-bottom-color: #938c7b;
+}
+body.light #levelsbox #levelsreset:hover {
+  color: #1c2330;
+}
+body.light #pivotwarn {
+  color: #8a6a10;
+  border-color: rgba(180, 130, 20, 0.5);
+  background: rgba(250, 240, 210, 0.7);
+}
+body.light #pivotwarn.err {
+  color: #b23b32;
+  border-color: rgba(180, 40, 30, 0.5);
+  background: rgba(250, 225, 220, 0.7);
+}
+/* regions list */
+body.light #regions h4 {
+  color: #938c7b;
+}
+body.light #regions .reg {
+  color: #4a5160;
+}
+body.light #regions .reg:hover {
+  background: #ece7db;
+  color: #1c2330;
+}
+/* the selected-node side panel (kept coherent with the paper chrome) */
+body.light #selpanel {
+  background: rgba(250, 248, 242, 0.98);
+  border-color: #d7cfbe;
+}
+body.light #selpanel .s-h {
+  color: #1c2330;
+}
+body.light #selpanel .s-s {
+  color: #4a5160;
+}
+body.light #selpanel .chip {
+  background: #eee9dd;
+  color: #4a5160;
+  border-color: #cfc6b2;
+}
+body.light #selpanel .chip:hover {
+  color: #1c2330;
+  border-color: #3d6ea3;
+}
+
+/* the library's injected tune panel (.ss-cfg, from src/panel/panel.ts) — overridden here at
+ * higher specificity (body.light …) so paper mode gets a light panel without touching panel.ts. */
+body.light .ss-cfg {
+  background: rgba(250, 248, 242, 0.96);
+  color: #333a44;
+  border-color: #d7cfbe;
+}
+body.light .ss-cfg-t {
+  color: #5f6a82;
+}
+body.light .ss-cfg button {
+  background: #eee9dd;
+  color: #4a5160;
+  border-color: #cfc6b2;
+}
+body.light .ss-cfg button:hover {
+  color: #1c2330;
+  border-color: #3d6ea3;
+}
+body.light .ss-cfg-note {
+  color: #938c7b;
+}
+body.light .ss-cfg select,
+body.light .ss-cfg input[type='text'] {
+  background: #fffdf8;
+  color: #2a3040;
+  border-color: #c9c0ad;
+}
+body.light .ss-cfg-g {
+  color: #6b6a5a;
+  border-bottom-color: #e0d9c9;
+}
+body.light .ss-cfg-l {
+  color: #3a4150;
+}
+body.light .ss-cfg-v {
+  color: #1c2330;
+}
+body.light .ss-cfg-u {
+  color: #938c7b;
+}
+body.light .ss-cfg input[type='range'] {
+  accent-color: #3d6ea3;
+}
+body.light .ss-cfg-r input[type='checkbox'] {
+  accent-color: #3d6ea3;
+}
+
 /* ---- the wiki page body inside an open card (provider.ts builds .pg) ------------------- */
 .pg {
   font: 12.5px/1.6 ui-sans-serif, -apple-system, 'Segoe UI', sans-serif;
