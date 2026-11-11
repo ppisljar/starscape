@@ -5,8 +5,13 @@ through like a game — nested rotating hierarchies of galaxies and systems, lev
 resolve from a mote to a readable page as you approach, deterministic placement, and two draw
 calls at every scale.
 
-**Status: design stage.** Read [`DESIGN.md`](DESIGN.md) — it is the contract everything else
-follows. The proven predecessor this rebuilds (and its measurements) lives in
+**[▶ Playground](https://ppisljar.github.io/starscape/playground/)** · **[Docs](https://ppisljar.github.io/starscape/docs/)** · **[API reference](https://ppisljar.github.io/starscape/api/)**
+
+The core is implemented and measured: the field renderer, the N-level placement engine, cameras,
+the distance-driven zoom ladder, the schema-driven tuning panel, HDR bloom, and a deterministic
+synthetic-corpus generator. [`DESIGN.md`](DESIGN.md) is the contract everything follows;
+[`SCALE.md`](SCALE.md) has the measured numbers (10⁴ at 120 fps, 10⁶ flyable at 40–67 fps, three
+draw calls at every scale). The proven predecessor this rebuilds lives in
 `SecondBrain/tools/vault-site-3d`.
 
 - TypeScript, three.js `WebGPURenderer` + TSL materials (automatic WebGL2 fallback)
