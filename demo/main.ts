@@ -1,36 +1,43 @@
-/* The stage-6 demo: the two-draw-call field under real cameras with the full §4 transform
- * pipeline live — GPU morph between arrangements, frame chains spinning per level, spread,
- * 2d/3d projection — driven from the ARRANGE panel, consuming the library exactly as an
- * external user would (DESIGN.md §8). `?n=100000` overrides the corpus size; `?cam=orbit`
- * swaps the flycam; `?blend=additive` opts into the glow look; `?pull=texture` forces the
- * DataTexture pull path even on WebGPU (the ./stores seam, testable from the URL).
+/* The starscape PLAYGROUND (DESIGN.md §8) — the library consumed exactly as an external user
+ * would, on a FULLY SYNTHETIC corpus generated client-side from (n, seed) alone: no external
+ * dataset, no fetch, nothing but the library and three. It is the public GitHub-Pages demo and
+ * the dev demo in one artifact (vite.config.ts: `root: 'demo'`).
  *
- * House rules honoured: no wall clock in anything that produces geometry — rAF deltas
- * drive cameras, tweens and frames (§10.1); the boot path surfaces rejections in the UI
- * (§10.5); `window.__starscape` is the debug handle and the overlay shows hidden states —
- * room, damping, budgets, morph t, inside-frame, jsFrameMs (§10.7); cameras fly to the
- * LIVE target extent, never a stored one (§10.8).
+ * It exposes the library's FULL control surface:
+ *   - a DATA/size selector (1k / 10k / 100k / 1M synthetic nodes — the universe scales with n so
+ *     density stays constant), seeded by ?seed, state in the query string so it survives reloads;
+ *   - a per-level HIERARCHY editor (the custom arrange mode): per level a clustering facet, a
+ *     shape/placement-preset, ordering, density + scatter each with their ParamDesc sub-params,
+ *     a spread (the library radiusScale) and a spin (rate + axis) — every option list enumerated
+ *     at runtime from the library's own registries (shapeKeys / presetKeys / densityKeys /
+ *     scatterKeys / orderingKeys) and the live graph's facets, nothing hardcoded;
+ *   - colour controls (colour-by-facet with a facet picker, colour ORDER value-vs-spatial,
+ *     palette + ramp), shape-by-facet, the full node-glyph + link style knobs;
+ *   - a GLOW (HDR bloom) panel (strength / radius / threshold / compression), a view-distance /
+ *     far-plane control, a close-orbit camera mode (double-click a node to fly up and circle it),
+ *     and a card-attention centre-gate — all on top of the schema tuning panel + visual presets.
  *
- * Picking and the ladder under motion (DESIGN §6): the grid is rebuilt on SETTLE — never
- * per frame — and, while spins keep the field from ever settling, lazily on a drift
- * budget (the predecessor's ensureGrid: the error is TRACKED, walks widen by it, and the
- * O(n) rebuild is rate-limited off the steady frame clock). A MORPH suppresses picking
- * and the candidate pass outright (base positions are mid-flight; the dwell hysteresis
- * absorbs the 0.9 s gap), but a SPINNING field stays fully alive: every resident node the
- * candidate walk visits is re-transformed through the live frame chain (O(1) per node,
- * frames.transformPoint — §4's "per-frame CPU is O(pivots + active), never O(n)"), so
- * labels, cards, open and select all work with all spins on — §9's 10⁶ acceptance row is
- * measured in exactly that state.
- */
+ * Structure and the non-obvious rules follow the library's own stage-9 demo — grid rebuilt on
+ * settle and lazily under drift, hover suppressed mid-morph, refreshViewOf composing the live
+ * frame chain for exactly the nodes the ladder touches. gatherCandidates is the simple exhaustive
+ * loop (every node, every frame): at 10⁶ it costs a few ms/frame, visible honestly in jsFrameMs.
+ * House rules kept: boot failures surface in the UI (§10.5), `window.__starscape` is the debug
+ * handle and the stats line shows hidden states (§10.7), the camera fits the LIVE extent (§10.8),
+ * budgets are reported (§10.4), and nothing producing geometry reads the wall clock (§10.1). */
 
-import { Color, Matrix4, PerspectiveCamera, Scene, Vector3, WebGPURenderer } from 'three/webgpu';
+import {
+  Color,
+  Matrix4,
+  PerspectiveCamera,
+  Quaternion,
+  Scene,
+  Vector3,
+  WebGPURenderer,
+} from 'three/webgpu';
 import type { BufferAttribute, InstancedBufferAttribute, LineSegments, Mesh } from 'three/webgpu';
 import {
-  attachToAnchors,
   bootQuality,
-  buildGraph,
   buildGrid,
-  cellMaxOf,
   compileHierarchy,
   createConfigStore,
   createField,
@@ -39,35 +46,50 @@ import {
   createOrbitCam,
   createOverlay,
   createPanel,
+  createPostProcess,
   createTweens,
+  cubicInOut,
+  densityKeys,
+  densityParams,
   facetPalette,
-  fnv1a,
   fovPxOf,
+  getPreset,
+  getShape,
   injectPanelStyles,
   injectStyles,
   localStorageAdapter,
   makeSynthProvider,
+  namedPaletteBuffer,
   nearestDistance,
+  neighbours,
+  orderingKeys,
   paintFacetColors,
   paletteBuffer,
   pickRay,
+  presetKeys,
   projectedPx,
+  scatterKeys,
+  scatterParams,
+  shapeKeys,
+  shapeParams,
   sizesFromColumn,
-  standoffOf,
   uniformSizes,
+  BG_BLACK,
   BG_LIGHT,
-  BOOST_HOVER,
-  BOOST_SELECT,
   DEFAULT_FOV,
   D_REF_FRACTION,
   FALLOFF,
   FLYCAM_DEFAULTS,
   HOME_MARGIN,
+  MAX_LEVELS,
   NODE_MAX_PX,
+  NODE_MAX_PX_OFF,
   NODE_MIN_PX,
   NODE_SCALE,
   ORBIT_DEFAULTS,
   PALETTES,
+  PIVOT_CAPACITY,
+  SCHEMA,
   UNIFORM_RGB,
   VISUAL_PRESETS,
 } from '../src/index';
@@ -81,57 +103,148 @@ import type {
   LadderView,
   LevelSpec,
   PaletteName,
+  ParamDesc,
+  PlacementSpec,
+  PostProcess,
   RampName,
+  RandomPlace,
+  SchemaRow,
   TonemapOp,
 } from '../src/index';
-import { generateSynth } from '../src/synth/generate';
+import { loadSynth } from './synthdata';
+import type { SynthData } from './synthdata';
 
 const statsEl = document.getElementById('stats')!;
 const errorEl = document.getElementById('error')!;
 
-/** The four non-frozen arrangements: the 2-level type>galaxy hierarchy with this leaf.
- *  `galaxy`, not `system`: since the synth generator's constant-density rescale the system
- *  facet carries ~n^⅔ values (10,000 at 10⁶ — 7×10,000 pivots would overflow the pivot
- *  store AND break §3.5's "rotation work is one quaternion per pivot, hundreds"), while
- *  galaxies grow as ~n^⅓ (100 at 10⁶ → ~700 pivots). */
-const LEAVES: Record<string, LevelSpec['place']> = {
-  galaxies: { preset: 'spiralGalaxy' },
-  ring: { shape: 'ring', scatter: 'gaussian', params: { thickness: 0.06 } },
-  globe: { shape: 'shell' },
-  random: { shape: 'cloud' },
-};
-
-/** The candidate pass's frustum margins, in NDC (the predecessor's ±1.25 / ±1.3). ONE copy:
- *  the reach slack in gatherCandidates is DERIVED from these, so widening the gate widens the
- *  grid-walk sphere with it — two literal copies meant a gate change silently under-sized the
- *  walk and labels popped in late at the frustum edge (§10: constants exported once). */
+/** Candidate-pass frustum margins, NDC (the ladder names things slightly off-screen so
+ *  labels do not pop at the edge) — the predecessor's ±1.25 / ±1.3. */
 const NDC_MARGIN_X = 1.25;
 const NDC_MARGIN_Y = 1.3;
 
+/** The dataset schema: the shipped rows with two option lists widened from the live corpus —
+ *  exactly the extension point schema.ts documents ("a panel extends this list from the live
+ *  graph"). The size-channel options are the columns the ACTIVE dataset actually carries
+ *  (vault: the pre-baked sizes.bin 'size' + meta3's words/rank; synth: degree/words), never a
+ *  hardcoded vault list. 'vault' palette = the dataset's layer colours by name through
+ *  namedPaletteBuffer (synth supplies the library's own vaultLayer stops). */
+function vaultSchema(columns: readonly string[], facets: readonly string[]): SchemaRow[] {
+  const sizeOptions = ['size', 'degree', 'words', 'rank'].filter((c) => columns.includes(c));
+  sizeOptions.push('uniform');
+  const sizeDefault = sizeOptions.includes('size') ? 'size' : 'degree';
+  // colour/shape facets are WIDENED from the live graph (the schema ships only the universals):
+  // colorFacet picks which facet colours the nodes in 'facet' mode; shapeFacet binds the node
+  // glyph to a facet ('none' = all discs). Defaults preserve today's look (colour by 'type').
+  const colorDefault = facets.includes('type') ? 'type' : (facets[0] ?? 'type');
+  /* The 'colour order' control (F1): in colorMode='facet', 'value' keeps today's categorical
+     palette by value index; 'spatial' colours each facet-value cluster by its centroid's position
+     along a 3D Hilbert curve through the chosen ramp (library Field.setColorFacetSpatial), so
+     spatially-adjacent clusters share hue. Not in the shipped library schema — it is this
+     consumer's knob over the library API — so it is inserted next to 'colour facet' here. */
+  const colorOrderRow: SchemaRow = {
+    group: 'colour',
+    key: 'colorOrder',
+    label: 'colour order',
+    kind: 'select',
+    options: ['value', 'spatial'],
+    default: 'value',
+    unit: 'none',
+  };
+  /* CARD ATTENTION (this consumer's knob over the library ladder's `attentionGateRadiusPx`): where
+     a card is ALLOWED to open. 'cursor' (default — today's behaviour) feeds the ladder the live
+     cursor→node distance as cursorPx and leaves the gate at Infinity, so the cursor only RE-RANKS
+     (boosts) and a card can open on any close-enough node. 'center' feeds the SCREEN-CENTRE→node
+     distance as cursorPx AND sets the gate to `centerSize`, so a card opens ONLY on nodes inside
+     the centre region (labels still appear off-centre; a pinned node still opens anywhere). The
+     library ladder never learns which anchor is in play — the site decides by what it passes. */
+  const cardAttentionRow: SchemaRow = {
+    group: 'ladder',
+    key: 'cardAttention',
+    label: 'card attention',
+    kind: 'select',
+    options: ['cursor', 'center'],
+    default: 'cursor',
+    unit: 'none',
+  };
+  /* CENTER SIZE = the centre-region radius in CSS px: how much of the screen counts as "centre"
+     when card attention is 'center'. Inert (greyed) in cursor mode. The canvas centre and this
+     radius are both CSS px, consistent with how the cursor distance is already measured, so no
+     devicePixelRatio factor enters. */
+  const centerSizeRow: SchemaRow = {
+    group: 'ladder',
+    key: 'centerSize',
+    label: 'center size',
+    kind: 'range',
+    min: 40,
+    max: 600,
+    step: 10,
+    default: 160,
+    unit: 'px',
+  };
+  const out = SCHEMA.map((row): SchemaRow => {
+    if (row.key === 'sizeChannel' && row.kind === 'select') {
+      return { ...row, options: sizeOptions, default: sizeDefault };
+    }
+    if (row.key === 'colorFacet' && row.kind === 'select') {
+      return { ...row, options: facets.length ? facets : row.options, default: colorDefault };
+    }
+    if (row.key === 'shapeFacet' && row.kind === 'select') {
+      return { ...row, options: ['none', ...facets], default: 'none' };
+    }
+    if (row.key === 'palette' && row.kind === 'select') {
+      return { ...row, options: ['vault', ...row.options], default: 'vault' };
+    }
+    return row;
+  });
+  // insert 'colour order' right after 'colour facet' so the panel keeps the colour group contiguous
+  const at = out.findIndex((r) => r.key === 'colorFacet');
+  out.splice(at < 0 ? out.length : at + 1, 0, colorOrderRow);
+  // append the two card-attention rows to the END of the ladder group (after its last shipped row,
+  // 'lockH') so the panel keeps the ladder group contiguous and the shipped order unchanged.
+  const ladderEnd = out.findIndex((r) => r.key === 'lockH');
+  out.splice(ladderEnd < 0 ? out.length : ladderEnd + 1, 0, cardAttentionRow, centerSizeRow);
+  return out;
+}
+
 async function main(): Promise<void> {
   const params = new URLSearchParams(location.search);
-  const n = Math.max(1, Number(params.get('n') ?? 10000) | 0);
-  const seed = Number(params.get('seed') ?? 42) | 0;
   const camMode = params.get('cam') === 'orbit' ? 'orbit' : 'fly';
+  const boot = (msg: string): void => {
+    statsEl.textContent = msg;
+  };
 
-  statsEl.textContent = `generating synth corpus n=${n}…`;
+  /* ---- the dataset: a synthetic corpus of ?n nodes at ?seed (default 10000 @ 42). State lives
+     in the query string so a chosen size survives reloads; the DATA select below writes it and
+     reloads. The universe scales with n inside generateSynth, so density stays constant across
+     sizes — 1k and 1M look like the same field at different zooms. */
+  const synthN = Math.max(1, Math.min(2_000_000, Number(params.get('n') ?? 10000) | 0));
+  const synthSeed = Number(params.get('seed') ?? 42) | 0;
+
   const t0 = performance.now();
-  const input = generateSynth({ n, seed });
-  const graph = buildGraph(input, { orderByFacet: 'system' });
+  // generateSynth(10⁶) is synchronous and takes seconds: paint the message FIRST (rAF runs
+  // before paint, the macrotask after it — one yielded frame between message and work).
+  boot(`generating ${synthN.toLocaleString('en-US')} synthetic nodes…`);
+  await new Promise<void>((resolve) => {
+    requestAnimationFrame(() => setTimeout(resolve, 0));
+  });
+  const V: SynthData = loadSynth(synthN, synthSeed, boot);
+  const graph = V.graph;
+  const n = graph.n;
   const tGraph = performance.now();
 
-  /* ---- stage 8: the config store. Loaded BEFORE the field exists, because the boot-routed
-     keys (blend, size channel, the focus alphas) are read at createField(). Only touched keys
-     were persisted (store rules), the presets are the six theme looks, and the load warnings
-     are returned — surfaced on the debug handle, never console.warn'd by the library. */
-  const store = createConfigStore({ storage: localStorageAdapter(), presets: VISUAL_PRESETS });
+  /* ---- config store, loaded before the field exists (boot-routed keys). Keys are
+     app-versioned so this viewer and the library demo never trade localStorage blobs — and
+     mode-scoped, so a size channel tuned for the vault ('size') can never leak into a synth
+     session whose graph has no such column, or vice versa. */
+  const schema = vaultSchema(Object.keys(graph.columns), Object.keys(graph.facets));
+  const store = createConfigStore({
+    schema,
+    storage: localStorageAdapter(),
+    presets: VISUAL_PRESETS,
+    configKey: 'starscape-playground:cfg:v1',
+    looksKey: 'starscape-playground:looks:v1',
+  });
   const configWarnings = store.load();
-  /* Stage 9: the boot quality notch — the corpus picks the starting budgets, every load,
-     like a game detecting the hardware once at startup (quality.ts: the ported predecessor
-     policy, no feedback loop). Written INTO the session-scoped config keys, so the panel
-     shows what is actually drawn and the user overrides by dragging the same knobs; the
-     store never persists them (schema SESSION_KEYS), so a budget tuned for 10⁶ pages can
-     never silently survive into a 10³ session. */
   const quality = bootQuality(n, window.devicePixelRatio || 1);
   store.set('linkBudget', quality.linkFraction);
   store.set('renderScale', quality.renderScale);
@@ -140,10 +253,8 @@ async function main(): Promise<void> {
   const str = (k: string): string => store.get(k) as string;
   const bool = (k: string): boolean => store.get(k) === true;
 
-  /* ---- renderer. The ONE place devicePixelRatio is handled; everything the field reasons
-     about stays in CSS px. WebGPURenderer falls back to WebGL2 automatically when WebGPU is
-     unavailable — and the position-store pull mode follows the backend that actually booted
-     (the ./stores seam): storage buffers on WebGPU, DataTexture texelFetch on WebGL2. */
+  /* ---- renderer: the ONE place devicePixelRatio lives; the field reasons in CSS px. */
+  boot('starting the renderer');
   const renderer = new WebGPURenderer({ antialias: true });
   renderer.setPixelRatio(window.devicePixelRatio);
   renderer.setSize(window.innerWidth, window.innerHeight);
@@ -154,17 +265,14 @@ async function main(): Promise<void> {
     (renderer.backend as unknown as { isWebGPUBackend?: boolean }).isWebGPUBackend === true
       ? 'webgpu'
       : 'webgl2';
-  const pullMode =
-    params.get('pull') === 'texture' ? 'texture' : backendName === 'webgpu' ? 'storage' : 'texture';
 
   const field = createField(graph, {
     heightCss: window.innerHeight,
     fov: DEFAULT_FOV,
     blend: str('blend') === 'additive' ? 'additive' : 'normal',
-    sizeColumn: str('sizeChannel') === 'uniform' ? 'uniform' : 'degree',
-    pull: pullMode,
-    /* BOOT-routed keys (see the routing table below): the focus alphas are baked into the
-       focus state at creation — a live change persists and lands on the next reload. */
+    sizeColumn: str('sizeChannel') === 'uniform' ? 'uniform' : str('sizeChannel'),
+    colorFacet: 'type',
+    pull: backendName === 'webgpu' ? 'storage' : 'texture',
     focus: {
       linkBase: num('linkBase'),
       dimOthers: num('dimOthers'),
@@ -178,10 +286,9 @@ async function main(): Promise<void> {
   scene.background = new Color(field.background);
   for (const o of field.objects) scene.add(o);
 
-  /* The per-instance channel buffers, reached through the PUBLIC three.js objects
-     (field.objects is [links, nodes] — field.ts). The iSize/iColor arrays ARE the field's own
-     channel buffers (field.sizeOf reads the same Float32Array), so a demo rewrite keeps the
-     shader, the picker and the ladder agreeing about every node — the one-pixel-unit rule. */
+  /* Per-instance channel buffers through the PUBLIC objects (field.objects = [links, nodes]):
+     the iSize/iColor arrays ARE the field's own channel buffers, so rewriting them keeps the
+     shader, the picker and the ladder agreeing about every node. */
   const linkLines = field.objects[0] as LineSegments;
   const nodeMesh = field.objects[1] as Mesh;
   const sizeAttr = nodeMesh.geometry.getAttribute('iSize') as InstancedBufferAttribute;
@@ -189,66 +296,45 @@ async function main(): Promise<void> {
   const linkColorAttr = linkLines.geometry.getAttribute('lColor') as BufferAttribute;
 
   const positions = graph.positions!;
-  const fnvFrozen = fnv1a(positions); // the §4 round-trip pin: basePositions must return here
   const { centre, radius, diagonal } = field.extent;
-  const dRef = diagonal * D_REF_FRACTION; // the same falloff pivot the node shader uses
+  const dRef = diagonal * D_REF_FRACTION;
+  /** The ladder's unit: the layout build's own measured page spacing (meta3.spacing), the
+   *  predecessor's convention — "a card appears two pages away" keeps meaning across looks.
+   *  A synth corpus measures nothing (spacing 0): derive it the way the library demo does,
+   *  radius/∛n over the LIVE extent. */
+  const spacing = V.spacing > 0 ? V.spacing : radius / Math.cbrt(Math.max(n, 1));
+  /** Arrangement spacing: fill the frozen volume (the demo's rule). */
+  const arrangeSpacing = radius / Math.cbrt(Math.max(n, 1));
 
-  /* ---- picking: ONE grid per field, over the view snapshot — rebuilt on settle, on a
-     morph landing, and lazily under spin once the tracked drift passes a third of a cell
-     (see the header). */
+  /* ---- picking: one grid over the view snapshot — rebuilt on settle / morph landing /
+     lazily under spin drift, never per frame. */
   const viewBuf = new Float32Array(n * 3);
   viewBuf.set(positions);
   let grid = buildGrid(viewBuf, n);
-  /* Drift bookkeeping, stage 9: `driftTotal` is MONOTONE (never reset) so a structure pinned
-     to an older grid — the far candidate sweep below survives rebuilds — can widen by exactly
-     the drift since ITS grid was built; `gridDrift` (drift since the CURRENT grid) derives
-     from it. `lastRebuildMs` is telemetry: the rebuild is the one O(n) cost left on the
-     spinning path, and §10.7 says hidden costs are shown, not implied. */
-  let driftTotal = 0;
-  let gridDriftBase = 0;
-  let gridDrift = 0; // ≡ driftTotal − gridDriftBase, kept unrolled for the hot paths
-  let gridCooldown = 0; // seconds until the next in-spin rebuild (the port's 250 ms limiter)
-  let lastRebuildMs = 0;
-  /* Per-cell max of the size channel — the far sweep's cell-level pruning bound (pick/grid
-     cellMaxOf). Follows the grid (rebuilds) AND the channel (applySizes): both events. */
-  let gridCellMax = cellMaxOf(grid, (i) => field.sizeOf(i));
-  let roomValid = false; // the roomAt cache below — invalidated by every rebuild
+  let gridDrift = 0;
+  let gridCooldown = 0;
   const rebuildGrid = (): void => {
-    const r0 = performance.now();
     field.viewPositions(viewBuf);
     grid = buildGrid(viewBuf, n);
-    // Reuse the cellMax slab UNLESS the far sweep has it pinned (sweepCellMax below): a
-    // sweep mid-generation keeps pruning against ITS grid, and rewriting its bound array in
-    // place would silently mismatch bounds to cells. The guard costs one allocation per
-    // rebuild only while a sweep is actually in flight.
-    gridCellMax = cellMaxOf(
-      grid,
-      (i) => field.sizeOf(i),
-      gridCellMax === sweepCellMax ? undefined : gridCellMax,
-    );
-    gridDriftBase = driftTotal;
     gridDrift = 0;
-    roomValid = false;
-    lastRebuildMs = performance.now() - r0;
   };
 
-  /* The CPU mirror of the shader's BASE endpoints (mix(A,B,t), parked), refreshed when a
-     morph lands. refreshViewOf() composes the live frame chain + spread on top of it for
-     ONE node — exactly the vertex-shader arithmetic — so the ladder, the overlay and the
-     orbit target can follow a SPINNING field with O(active) work, never O(n) (§4; the
-     predecessor recomposed all n on the CPU every spinning frame, the flaw this design
-     removes). Valid whenever no morph is rewriting the base. */
+  /* CPU mirror of the shader's BASE endpoints; refreshViewOf composes the live frame chain +
+     spread for ONE node — the vertex-shader arithmetic — so ladder/overlay/select follow a
+     SPINNING field with O(active) work (§4). */
   const baseBuf = new Float32Array(n * 3);
   baseBuf.set(positions);
-  let morphing = false; // a retarget tween is rewriting the base endpoints right now
-  let fieldSettledNow = true; // field.settled() this frame: frames parked, no field tween
-  /* Worst-case node speed under the live spins, world units/s before spread — drives the
-     drift bound. Stage 9: from PIVOT RADII (|rate| × lever, summed down the chain), not
-     0.5 × diagonal: the old bound over-reported drift ~5× at 10⁶ (systems are small), and
-     every walk pays the widening. Set by applySpins. */
+  let morphing = false;
+  let fieldSettledNow = true;
   let spinDriftRate = 0;
-  const spreadC: [number, number, number] = [0, 0, 0]; // live spread centre, synced per frame
+  const spreadC: [number, number, number] = [0, 0, 0];
   let spreadK = 1;
+  /* The field-global root-frame rotation, mirrored for the CPU view transform (the shader's
+     last stage): a quaternion xyzw about spreadC (the centroid — the same centre spread uses),
+     refreshed in the loop while the field is live, gated by fieldDisplaced like spreadK gates
+     spread. Keeps picking / ladder / selection on the rotating field under a top-row spin. */
+  const fieldQ: [number, number, number, number] = [0, 0, 0, 1];
+  let fieldDisplaced = false;
   const refreshViewOf = (i: number): void => {
     const o = i * 3;
     const f = field.frames;
@@ -264,243 +350,1305 @@ async function main(): Promise<void> {
       viewBuf[o + 1] = spreadC[1] + (viewBuf[o + 1]! - spreadC[1]) * spreadK;
       viewBuf[o + 2] = spreadC[2] + (viewBuf[o + 2]! - spreadC[2]) * spreadK;
     }
+    if (fieldDisplaced) {
+      // v' = c + q ⊗ (v − c), t = 2 q×v — the stores.ts / morph.fieldSpinPoint kernel
+      const qx = fieldQ[0], qy = fieldQ[1], qz = fieldQ[2], qw = fieldQ[3];
+      const x = viewBuf[o]! - spreadC[0];
+      const y = viewBuf[o + 1]! - spreadC[1];
+      const z = viewBuf[o + 2]! - spreadC[2];
+      const tx = 2 * (qy * z - qz * y);
+      const ty = 2 * (qz * x - qx * z);
+      const tz = 2 * (qx * y - qy * x);
+      viewBuf[o] = spreadC[0] + x + qw * tx + (qy * tz - qz * ty);
+      viewBuf[o + 1] = spreadC[1] + y + qw * ty + (qz * tx - qx * tz);
+      viewBuf[o + 2] = spreadC[2] + z + qw * tz + (qx * ty - qy * tx);
+    }
   };
 
-  /* ---- cameras. Flycam by default (?cam=orbit for the simple one). */
+  /* ---- cameras: flycam by default, ?cam=orbit for diagnostics. ------------------------- */
   const camera = new PerspectiveCamera(
     DEFAULT_FOV,
     window.innerWidth / window.innerHeight,
     Math.max(0.05, radius * 0.001),
-    (radius + diagonal) * 20, // headroom for spread×3 arrangements
+    (radius + diagonal) * 20,
   );
   let liveFov = DEFAULT_FOV;
 
-  const roomPos = { x: 0, y: 0, z: 0 }; // one reusable probe — no per-frame allocation
-  /* roomAt, stage 9: CACHED by displacement. The flycam probes twice per frame (current
-     position + step destination) and nearestDistance costs ~0.35 ms per probe at 10⁶ from
-     the home framing — 0.7 ms of a 1 ms §9 frame-CPU budget for a number that cannot have
-     changed while the camera is parked. The cache returns a safe LOWER bound instead: the
-     nearest node can have approached by at most (probe displacement + node drift since the
-     walk), so cached − slack is correct for the flycam's damping whatever happened — and the
-     real walk is re-paid only once the slack passes half a cell. Parked on the home framing
-     the probe is free; flying fast re-pays it, which SCALE.md reports. Rebuilds invalidate
-     (roomValid, rebuildGrid above). */
-  let roomX = 0;
-  let roomY = 0;
-  let roomZ = 0;
-  let roomVal = Infinity;
-  let roomDriftAt = 0;
+  /* Close-orbit (double-click) state, hoisted here because the flycam's injected zoomRange /
+     softStop / roomAt closures read it and run at BOOT (cam.home → zoomRange), long before the
+     ladder section where close-orbit is otherwise wired. -1 = not orbiting. While set, a single
+     node is the orbit PIVOT (dragging circles it) and its reading card is held suspended. With
+     the node px cap gone globally (library default uncapped), close-orbit no longer touches node
+     SIZE — growth is global, this is only a re-target, so the damp and dolly behave identically
+     whether or not you are orbiting (Fix 3: one consistent behavior). */
+  let closeOrbit = -1;
+
+  /** Leave close-orbit (any exit: new select, Escape, wiki-navigate, or the leash in the loop).
+   *  A function declaration so every earlier handler can call it. */
+  function leaveCloseOrbit(): void {
+    if (closeOrbit < 0) return;
+    closeOrbit = -1;
+  }
+
+  const roomPos = { x: 0, y: 0, z: 0 };
   const roomAt = (p: readonly [number, number, number]): number => {
-    if (roomValid) {
-      const dx = p[0] - roomX;
-      const dy = p[1] - roomY;
-      const dz = p[2] - roomZ;
-      const slack = Math.sqrt(dx * dx + dy * dy + dz * dz) + (driftTotal - roomDriftAt);
-      if (slack < grid.cellMax * 0.5) {
-        return roomVal === Infinity ? Infinity : Math.max(roomVal - slack, 0);
-      }
-    }
     roomPos.x = p[0];
     roomPos.y = p[1];
     roomPos.z = p[2];
-    const d = nearestDistance(grid, roomPos, { drift: gridDrift });
-    roomX = p[0];
-    roomY = p[1];
-    roomZ = p[2];
-    roomVal = d;
-    roomDriftAt = driftTotal;
-    roomValid = true;
-    return d;
+    return nearestDistance(grid, roomPos, { drift: gridDrift });
   };
-  const softStop = (): number => radius * 0.02;
-  const zoomRange = (): readonly [number, number] => [radius * 0.01, diagonal * 4];
+  /* softStop is the proximity-damp SCALE (flycam.ts): approaching the nearest node, the W/S step
+     eases toward a floor once the room AHEAD falls under ~2.5× this — a SMOOTH soft-landing ramp
+     (the damp never gates to zero, so you can still push through) that brings you to a gentle
+     creep right at the node and lets you release-to-hover rather than blowing through its centre.
+     Scaled to NODE SPACING (× the live spread), NOT the whole-field radius, so the brake zone is
+     "about one node away" at every zoom and every spread — the lever that fixes BOTH the old
+     "block" (a field-radius scale made the ramp too abrupt) and the "zoom past" (close-orbit used
+     to switch the damp off). ~0.35 spacing: the ramp spans ahead ∈ [0.4·stop, 2.5·stop] ≈ 0.7 of
+     a spacing, so you decelerate over roughly one node-gap — gentle, not a crawl-to-halt, not off.
+     This works WITHOUT selecting: any nearby node slows you, because roomAt measures the nearest
+     node's distance regardless of selection. */
+  const SOFT_STOP_SPACINGS = 0.35;
+  const softStop = (): number => Math.max(spacing * field.spread * SOFT_STOP_SPACINGS, radius * 0.004);
+  /* Min dolly radius (zoomRange lo) is relative to NODE SPACING (× the live spread): that is what
+     lets the flycam get right up to a SINGLE node and circle it. Lowered GLOBALLY (not just in
+     close-orbit) to ~0.01 of a node-spacing — nose-to-node — so a plain wheel-in on any target
+     fills the view with NO select/orbit step, with a small absolute floor that still clears the
+     adaptive near plane (render loop), which shrinks to < radius so nothing clips. The far end is
+     unchanged. One floor for every mode (Fix 3). */
+  const zoomRange = (): readonly [number, number] => [
+    Math.max(spacing * field.spread * 0.01, 0.012),
+    diagonal * 4,
+  ];
 
-  /* The flycam reads its config object LIVE every frame (flycam.ts: "so a panel can mutate
-     the object") — the flight group of the routing table writes into this one reference. */
   const flyCfg: FlycamConfig = { ...FLYCAM_DEFAULTS };
   let fly: Flycam | null = null;
   let cam: CameraController;
   if (camMode === 'fly') {
     fly = createFlycam(camera, flyCfg, { roomAt, softStop, zoomRange });
-    fly.spin = bool('cameraDrift'); // the idle turntable is a config knob now (motion group)
+    fly.spin = bool('cameraDrift');
     cam = fly;
   } else {
     cam = createOrbitCam(camera, { ...ORBIT_DEFAULTS }, { zoomRange });
   }
   cam.attach(canvas);
-  cam.home({ center: centre, radius }); // the LIVE extent, never a stored one (§10.8)
+  cam.home({ center: centre, radius }); // the LIVE extent, never meta3.home (§10.8)
 
-  /* ---- demo-side tweens: camera FOV for the 2d/3d flip (field tweens live inside the
-     field; the camera is the demo's). Driven by the same rAF dt. */
-  const demoTweens = createTweens();
-  demoTweens.set('fov', DEFAULT_FOV);
-  demoTweens.onChange('fov', (v) => {
+  /* ---- the HDR bloom post-process (DESIGN §5 tier-3): render additively into a half-float
+     buffer → bloom → ONE post-sum tonemap → screen. Installed as the consumer helper it is —
+     the loop calls post.render() instead of renderer.render() when GLOW is on. Default OFF, so
+     nothing regresses; the 'nebula' look turns it on. Created eagerly (cheap — the render
+     targets allocate lazily on the first post.render), tuned live via the glow controls.
+
+     THE DOUBLE-TONEMAP SEAM: when glow is on the field's IN-MATERIAL roll-off is set to 'none'
+     and the post applies the curve once over the accumulated sum; when glow is off the field
+     keeps its own roll-off and the post is never rendered. applyTonemap (below) owns that seam. */
+  const GLOW_KEY = 'starscape-playground:glow:v1';
+  interface GlowState { on: boolean; strength: number; radius: number; threshold: number; }
+  // Defaults tuned on 1M synth against the reference nebula: a moderate strength, a TIGHT radius
+  // (a wide radius weights the coarse bloom mips and washes the whole screen grey — the nebula
+  // wants local glow), and a threshold that blooms only the dense cores (so the sparse field and
+  // the negative space between clusters stay black while the hubs blaze).
+  const glow: GlowState = { on: false, strength: 1.3, radius: 0.4, threshold: 1.0 };
+  try {
+    const raw = localStorage.getItem(GLOW_KEY);
+    if (raw !== null) {
+      const s = JSON.parse(raw) as Partial<GlowState>;
+      if (typeof s.on === 'boolean') glow.on = s.on;
+      const fin = (v: unknown, d: number): number =>
+        typeof v === 'number' && Number.isFinite(v) ? v : d;
+      glow.strength = Math.min(3, Math.max(0, fin(s.strength, glow.strength)));
+      glow.radius = Math.min(1, Math.max(0, fin(s.radius, glow.radius)));
+      glow.threshold = Math.min(2, Math.max(0, fin(s.threshold, glow.threshold)));
+    }
+  } catch {
+    /* storage denied/corrupt: the defaults (glow off) are a safe session */
+  }
+  const post: PostProcess = createPostProcess(renderer, scene, camera, {
+    bloom: { strength: glow.strength, radius: glow.radius, threshold: glow.threshold },
+    tonemap: (str('tonemap') as TonemapOp) ?? 'reinhard',
+    exposure: num('exposure'),
+    // Full-res bloom (resolutionScale 1): BloomNode defaults to 0.5× (half-res), whose coarse
+    // mip pyramid smears bright energy screen-wide into a grey haze over the negative space.
+    // Full-res keeps the glow LOCAL to the clusters — the nebula's black space needs it, and at
+    // 1M it still holds vsync (the per-frame cost is the candidate loop, not the bloom).
+    resolutionScale: 1.0,
+  });
+  const saveGlow = (): void => {
+    try {
+      localStorage.setItem(GLOW_KEY, JSON.stringify(glow));
+    } catch {
+      /* storage full/blocked — the control still works this session */
+    }
+  };
+
+  const appTweens = createTweens();
+  appTweens.set('fov', DEFAULT_FOV);
+  appTweens.onChange('fov', (v) => {
     liveFov = v;
     camera.fov = v;
     camera.updateProjectionMatrix();
     field.setFov(v);
   });
 
-  /** Fly the camera to frame the current TARGET extent — the cameras-module home() framing
-   *  (radius / tan(fov/2) × HOME_MARGIN, the cameras' own exported constant), tweened via
-   *  goTo on the flycam. */
+  /* A pose tween the flycam does not provide: goTo/home deliberately RETREAT ALONG THE
+     CURRENT APPROACH (cameras/flycam.ts), which is right everywhere except the 2d flatten —
+     a camera that was inside the field sees the flattened plane edge-on, i.e. a line. The
+     predecessor's 2d button "brings the camera round"; this is that move, app-side: tween
+     position AND orientation to a stated pose (top-down over the plane, north up). */
+  const pose = {
+    active: false,
+    t: 0,
+    ms: 900,
+    p0: new Vector3(),
+    p1: new Vector3(),
+    q0: new Quaternion(),
+    q1: new Quaternion(),
+    g: new Vector3(),
+  };
+  const POSE_M = new Matrix4();
+  const flyPoseTo = (p1: Vector3, look: Vector3, ms = 900): void => {
+    if (!fly) {
+      cam.home({ center: [look.x, look.y, look.z], radius });
+      return;
+    }
+    fly.cancel();
+    pose.p0.copy(camera.position);
+    pose.q0.copy(camera.quaternion);
+    // looking straight down −y: use −z as up (north-up map view; world-up is degenerate)
+    POSE_M.lookAt(p1, look, new Vector3(0, 0, -1));
+    pose.q1.setFromRotationMatrix(POSE_M);
+    pose.p1.copy(p1);
+    pose.g.copy(look);
+    pose.t = 0;
+    pose.ms = ms;
+    pose.active = true;
+  };
+
   const flyHome = (fovDeg: number): void => {
     const e = field.targetExtent();
     const c = new Vector3(e.centre[0], e.centre[1], e.centre[2]);
     const dist =
       (Math.max(e.radius, radius * 0.05) / Math.tan((fovDeg * Math.PI) / 360)) * HOME_MARGIN;
-    if (fly) fly.goTo(c, dist, 900);
-    else cam.home({ center: e.centre, radius: e.radius });
+    if (field.projection === '2d') {
+      // top-down over the flattened plane (flatAxis 1 = y), or the home is an edge-on line
+      flyPoseTo(new Vector3(c.x, c.y + dist, c.z), c, 900);
+    } else if (fly) {
+      pose.active = false;
+      fly.goTo(c, dist, 900);
+    } else {
+      cam.home({ center: e.centre, radius: e.radius });
+    }
   };
 
-  /* ---- the ARRANGE panel ------------------------------------------------------------- */
+  /* ---- the rail ------------------------------------------------------------------------- */
   const ui = {
-    arrangement: document.getElementById('arrangement') as HTMLSelectElement,
-    spin0: document.getElementById('spin0') as HTMLInputElement,
-    rate0: document.getElementById('rate0') as HTMLInputElement,
-    spin1: document.getElementById('spin1') as HTMLInputElement,
-    rate1: document.getElementById('rate1') as HTMLInputElement,
+    data: document.getElementById('data') as HTMLSelectElement,
+    mode: document.getElementById('mode') as HTMLSelectElement,
+    levelsbox: document.getElementById('levelsbox') as HTMLDivElement,
+    hpreset: document.getElementById('hpreset') as HTMLSelectElement,
+    levels: document.getElementById('levels') as HTMLDivElement,
+    addlevel: document.getElementById('addlevel') as HTMLButtonElement,
+    levelsreset: document.getElementById('levelsreset') as HTMLAnchorElement,
+    pivotwarn: document.getElementById('pivotwarn') as HTMLDivElement,
     proj: document.getElementById('proj') as HTMLSelectElement,
-    pull: document.getElementById('pull') as HTMLInputElement,
+    look: document.getElementById('look') as HTMLSelectElement,
+    glow: document.getElementById('glow') as HTMLInputElement,
+    glowStrength: document.getElementById('glowStrength') as HTMLInputElement,
+    glowStrengthv: document.getElementById('glowStrengthv') as HTMLSpanElement,
+    glowRadius: document.getElementById('glowRadius') as HTMLInputElement,
+    glowRadiusv: document.getElementById('glowRadiusv') as HTMLSpanElement,
+    glowThreshold: document.getElementById('glowThreshold') as HTMLInputElement,
+    glowThresholdv: document.getElementById('glowThresholdv') as HTMLSpanElement,
+    glowCompression: document.getElementById('glowCompression') as HTMLInputElement,
+    glowCompressionv: document.getElementById('glowCompressionv') as HTMLSpanElement,
+    viewdist: document.getElementById('viewdist') as HTMLInputElement,
+    viewdistv: document.getElementById('viewdistv') as HTMLSpanElement,
+    links: document.getElementById('links') as HTMLInputElement,
+    home: document.getElementById('home') as HTMLButtonElement,
+    tune: document.getElementById('tune') as HTMLButtonElement,
+    search: document.getElementById('search') as HTMLInputElement,
+    hits: document.getElementById('hits') as HTMLDivElement,
+    regionsBox: document.getElementById('regions') as HTMLDivElement,
+    regionList: document.getElementById('regionlist') as HTMLDivElement,
+    regionLabels: document.getElementById('regionlabels') as HTMLDivElement,
+    selpanel: document.getElementById('selpanel') as HTMLDivElement,
   };
+
+  /* ---- the DATA select: reflect the booted dataset, and write the choice into the query
+     string + reload on change (state survives reloads — the predecessor's CORPUS picker). */
+  {
+    const want = String(synthN);
+    if (!Array.from(ui.data.options).some((o) => o.value === want)) {
+      // a hand-typed ?n= that is not one of the shipped sizes still shows truthfully
+      const opt = document.createElement('option');
+      opt.value = want;
+      opt.textContent = `${synthN.toLocaleString('en-US')} nodes`;
+      ui.data.appendChild(opt);
+    }
+    ui.data.value = want;
+  }
+  ui.data.addEventListener('change', () => {
+    const q = new URLSearchParams(location.search);
+    q.set('n', ui.data.value);
+    const qs = q.toString();
+    location.href = location.pathname + (qs ? `?${qs}` : '');
+  });
 
   let hierarchy: CompiledHierarchy | null = null;
-  const spacing = radius / Math.cbrt(Math.max(n, 1)); // arrangements fill the frozen volume
+  /** True when the live hierarchy's level 0 groups by 'region' — the only arrangements in
+   *  which a region HAS a place (centre + radius) to label and fly to. Frozen counts too:
+   *  meta3's measured region centres are the frozen layout's own. */
+  let regionHierarchy = false;
 
-  /** Lazily build the 'pull' facet: every node BFS-attached (attachToAnchors) to the
-   *  top-degree anchor of its nearest `type` group — forcing the anchors onto a shape
-   *  blooms the rest around them (§3.4 pull). Deterministic: anchors are argmax degree,
-   *  ties to the lowest id. */
-  let pullReady = false;
-  const buildPullFacet = (): void => {
-    if (pullReady) return;
-    const typeFacet = graph.facets['type']!;
-    const deg = graph.columns['degree']!.data;
-    const nv = typeFacet.values.length;
-    const best = new Int32Array(nv).fill(-1);
-    for (let i = 0; i < n; i++) {
-      const v = typeFacet.data[i]!;
-      const b = best[v]!;
-      if (b < 0 || deg[i]! > deg[b]!) best[v] = i;
-    }
-    const anchors: number[] = [];
-    for (let v = 0; v < nv; v++) if (best[v]! >= 0) anchors.push(best[v]!);
-    anchors.sort((a, b) => a - b);
-    const att = attachToAnchors(graph, Uint32Array.from(anchors));
-    const ordinal = new Map<number, number>();
-    for (let k = 0; k < anchors.length; k++) ordinal.set(anchors[k]!, k);
-    const data = new Uint16Array(n);
-    for (let i = 0; i < n; i++) data[i] = ordinal.get(att.anchorOf[i]!)!;
-    graph.facets['pull'] = {
-      key: 'pull',
-      values: anchors.map((a) => graph.labelOf(a)),
-      data,
-    };
-    pullReady = true;
+  /** Live spin rates into the pivot table (the FrameSet reads `rate` fresh every advance)
+   *  PLUS the field-global root-frame rate, and the drift bound from both.
+   *
+   *  THE SHIFTED MAPPING — the exact parallel of the (already-shifted) spread mapping
+   *  (rootRadiusScale ← row0, level-k radiusScale ← row k+1). A row's spin now rotates its
+   *  groups about their PARENT, so the CHILD row drives the parent frame: pivot level `lv`
+   *  reads row `lv+1`. Row 0 has no pivot above it, so it drives the FIELD-GLOBAL rotation
+   *  (its top-level groups orbit the centroid together — the new root frame). The leaf row is
+   *  the deepest child and now turns the innermost groupBy groups' contents (it is live, not
+   *  grayed). The field rotation does NOT touch the pivot store, so row 0 spins the field even
+   *  when the pivots overflow (no FrameSet installs and per-pivot rates are inert then). */
+  /** The three canonical spin axes the per-level axis select offers, and the label of a
+   *  (possibly persisted/arbitrary) axis — its dominant component. */
+  const AXES: Record<string, [number, number, number]> = {
+    X: [1, 0, 0],
+    Y: [0, 1, 0],
+    Z: [0, 0, 1],
+  };
+  const axisLabel = (a: [number, number, number]): string => {
+    const ax = Math.abs(a[0]);
+    const ay = Math.abs(a[1]);
+    const az = Math.abs(a[2]);
+    return ax >= ay && ax >= az ? 'X' : az >= ay ? 'Z' : 'Y';
+  };
+  /** Unit axis (the FrameSet requires unit length; the field spin normalises too). Falls back
+   *  to canonical up for a degenerate zero axis. */
+  const axisUnit = (a: [number, number, number]): [number, number, number] => {
+    const len = Math.hypot(a[0], a[1], a[2]);
+    return len > 1e-9 ? [a[0] / len, a[1] / len, a[2] / len] : [0, 1, 0];
   };
 
-  /** Write the live spin toggles into the pivot table — the FrameSet reads `rate` fresh
-   *  every advance (frames.ts), so no recompile: a parked frame resumes from its angle.
-   *  The config's `levelSpin` knob OVERRIDES when > 0: every pivot at every level turns at
-   *  that one rate (the schema ships one knob; per-level rates stay the ARRANGE panel's).
-   *  In the frozen layout no frames exist, so the knob idles — exactly the schema's note. */
   const applySpins = (): void => {
     if (!hierarchy) {
       spinDriftRate = 0;
+      field.setFieldSpin(0);
       return;
     }
     const override = num('levelSpin');
     const pv = hierarchy.pivots;
-    const on = [ui.spin0.checked, ui.spin1.checked];
-    const rates = [Number(ui.rate0.value) || 0, Number(ui.rate1.value) || 0];
-    /* ONE pass sets the live rates AND accumulates the drift bound. A node riding pivot p
-       moves at ≤ |rate_p| × (lever about p) ≤ |rate_p| × radius_p, and the levers of a
-       chain ADD — so Σ over levels of max(|rate| × radius) bounds every node's speed.
-       ×1.5 margin: scatter may place a member a little outside its group sphere. (Per-level
-       maxima, summed; the demo's hierarchies carry spin on at most L0/L1 + the override.) */
-    let d0 = 0;
-    let d1 = 0;
-    let dRest = 0;
+    const rowRate = (k: number): number => (rows[k]?.spin ? rows[k]!.spinRate || 0 : 0);
+    // the axis DRIVING a pivot/field frame follows the same shifted mapping as the rate: the
+    // field frame is row 0's axis, a pivot at level `lv` is driven by row `lv + 1`.
+    const rowAxis = (k: number): [number, number, number] =>
+      axisUnit(rows[k]?.spinAxis ?? [0, 1, 0]);
+    const fieldRate = override > 0 ? override : rowRate(0); // row 0 → the whole field turns
+    field.setFieldSpin(fieldRate, rowAxis(0));
+    if (pivotOverflow) {
+      // pivot frames are inert (no FrameSet), but the field rotation still lives — drift from it
+      spinDriftRate = Math.abs(fieldRate) * radius * 1.5;
+      return;
+    }
+    const maxSpeed = rows.map(() => 0);
     for (let p = 0; p < pv.count; p++) {
       const lv = pv.level[p]!;
-      const base = lv <= 1 && on[lv] ? rates[lv]! : 0;
-      const r = override > 0 ? override : base;
+      const r = override > 0 ? override : rowRate(lv + 1); // the child row drives this frame
       pv.rate[p] = r;
+      // the FrameSet re-reads `axis` each advance (it must stay unit) — write the driving
+      // row's axis live, parallel to the rate, so an axis change tilts without a recompile.
+      const [axx, axy, axz] = rowAxis(lv + 1);
+      pv.axis[p * 3] = axx;
+      pv.axis[p * 3 + 1] = axy;
+      pv.axis[p * 3 + 2] = axz;
       const speed = Math.abs(r) * pv.radius[p]!;
-      if (lv === 0) {
-        if (speed > d0) d0 = speed;
-      } else if (lv === 1) {
-        if (speed > d1) d1 = speed;
-      } else if (speed > dRest) {
-        dRest = speed;
-      }
+      if (speed > (maxSpeed[lv] ?? 0)) maxSpeed[lv] = speed;
     }
-    spinDriftRate = (d0 + d1 + dRest) * 1.5;
+    // drift bound: each level's fastest node motion (the frame spins its own contents about
+    // its own centre) PLUS the field rotation sweeping the whole field about the centroid
+    // (up to ~the extent radius out). The render loop scales this by the live spread.
+    let sum = Math.abs(fieldRate) * radius;
+    for (const s of maxSpeed) sum += s;
+    spinDriftRate = sum * 1.5;
   };
 
-  const applyArrangement = (): void => {
-    const name = ui.arrangement.value;
-    morphing = true; // every branch below retargets — the base is in flight until t = 1
-    if (name === 'frozen') {
-      hierarchy = null;
-      field.setHierarchy(null);
-      applySpins(); // spinRateSum → 0: no frames exist in the frozen layout
-    } else {
-      const leaf = LEAVES[name]!;
-      let levels: LevelSpec[];
-      if (ui.pull.checked) {
-        buildPullFacet();
-        levels = [
-          { groupBy: 'pull', place: { shape: 'shell' }, spin: { rate: 0 } },
-          { place: leaf },
-        ];
-      } else {
-        levels = [
-          { groupBy: 'type', place: { shape: 'shell' }, spin: { rate: 0 } },
-          { groupBy: 'galaxy', place: { shape: 'cloud' }, spin: { rate: 0 } },
-          { place: leaf },
-        ];
-      }
-      hierarchy = compileHierarchy(graph, levels, { spacing });
-      field.setHierarchy(hierarchy);
-      applySpins();
-    }
-    flyHome(liveFov);
-    updateOverlay();
+  /* ======================================================================================
+   * THE LEVELS EDITOR — the custom arrange mode. Every option list is enumerated AT
+   * RUNTIME from the library's own registries (shapeKeys / presetKeys / densityKeys /
+   * scatterKeys) and from the ACTIVE graph's facets — nothing hardcoded, so a registered
+   * extension or a new dataset facet shows up here for free. The editor is the source of
+   * truth: the "preset hierarchy" select only POPULATES it with shipped starting points
+   * (the old fixed arrangements, now just default level configs). Per level: clustering
+   * (groupBy), arrangement (shape or placement preset), distribution (density + its main
+   * param + the axis it warps when the shape has more than one), scatter (+ thickness
+   * param), spread (the library's per-level radiusScale) and spin (live rates through the
+   * FrameSet plumbing — applySpins above). The config persists per dataset mode.
+   * ====================================================================================== */
+
+  /** A per-level placement recipe. The four knobs (shape/ordering/density/scatter) plus a
+   *  numeric-override map per knob (empty = every declared param at its library default, so
+   *  an untouched row compiles byte-identically to the shipped behaviour). `ordering` +
+   *  `orderFacet`/`orderColumn` feed the library's `ordering` + `stringParams`; `spinAxis`
+   *  feeds the spin frame's axis. */
+  interface LevelRow {
+    groupBy: string | null; // null = the leaf row (always last)
+    place: string; // shape key, 'preset:<name>', or a per-group sentinel
+    ordering: string; // ordering key ('byIndex' default = today's implicit behaviour)
+    orderFacet: string | null; // byFacet's facet key (null until chosen)
+    orderColumn: string | null; // byColumn's numeric-column key
+    density: string;
+    densityAxis: number;
+    scatter: string;
+    shapeP: Record<string, number>; // shape param overrides (key → value); empty = defaults
+    densP: Record<string, number>; // density param overrides
+    scatP: Record<string, number>; // scatter param overrides
+    spread: number; // the level's radiusScale (1 = the shipped count^⅓ policy)
+    spin: boolean;
+    spinRate: number;
+    spinAxis: [number, number, number]; // rotation axis (unit; default canonical up)
+  }
+
+  /** The shape KEY whose params a row exposes: a bare shape is itself; a preset exposes its
+   *  bundled shape; a per-group (random / by-facet) row has no single shape (null). */
+  const shapeKeyOf = (place: string): string | null =>
+    isPerGroupRow(place)
+      ? null
+      : place.startsWith('preset:')
+        ? getPreset(place.slice('preset:'.length)).shape
+        : place;
+
+  /** The declared shape params for a row's place ([] for per-group rows). */
+  const rowShapeParams = (place: string): ParamDesc[] => {
+    const k = shapeKeyOf(place);
+    return k === null ? [] : shapeParams(k);
   };
+
+  /** Emit into `dst` the map entries the library should receive: a param is sent only when
+   *  it differs from its declared default (omit-at-default — so an untouched control is
+   *  byte-identical to omission, which matters for e.g. ball.radialPower's cbrt and
+   *  dendrite.tiers' auto), UNLESS its key is forced (mixture component means, which are
+   *  presence flags the library reads verbatim). */
+  const emitParams = (
+    descs: ParamDesc[],
+    map: Record<string, number>,
+    dst: Record<string, number>,
+    force?: Set<string>,
+  ): void => {
+    for (const d of descs) {
+      const v = map[d.key];
+      if (v === undefined || !Number.isFinite(v)) continue;
+      if (force?.has(d.key) || v !== d.default) dst[d.key] = v;
+    }
+  };
+
+  /** Editor depth: 1..6 level rows, never past the compiler's own MAX_LEVELS. */
+  const UI_MAX_LEVELS = Math.min(6, MAX_LEVELS);
+
+  /** The level-editor sentinel for a per-group RANDOM arrangement — mapped to the library's
+   *  `{ random: true }` place at compile time (compileLevels/buildPlace). Not a shape key, so it
+   *  never reaches getShape; placeSpecOf/dim lookups guard on it. */
+  const RANDOM_PLACE = '__random__';
+  const isRandomRow = (place: string): boolean => place === RANDOM_PLACE;
+
+  /** The level-editor sentinel for a per-group BY-FACET arrangement (F2) — mapped to the library's
+   *  `{ random: true, by: 'facet' }` place at compile time (buildPlace). Each filled group draws
+   *  its shape from the shape set by its OWN groupBy facet-value index (shapes[value mod n]), so
+   *  all clusters sharing a facet value get the SAME shape — meaningful, not scattered like the
+   *  random form. Like RANDOM_PLACE it is not a shape key, so placeSpecOf/dim/getShape guard on it. */
+  const BY_FACET_PLACE = '__byfacet__';
+  const isByFacetRow = (place: string): boolean => place === BY_FACET_PLACE;
+  /** Either per-group form (random or by-facet): both map to the library `{ random: true }` family
+   *  and share the same editor guards — no single fixed shape, so density axis is pinned to 0. */
+  const isPerGroupRow = (place: string): boolean => isRandomRow(place) || isByFacetRow(place);
+
+  const placeSpecOf = (place: string): PlacementSpec =>
+    place.startsWith('preset:') ? getPreset(place.slice('preset:'.length)) : { shape: place };
+
+  /** The mixture density's component MEANS are presence flags, not `?? default` fallbacks —
+   *  the engine reads `m<i>` verbatim to switch component i on. buildPlace forces these keys
+   *  through emit-at-default so a mean that happens to equal its seed still reaches the
+   *  engine (and component 0's `m0` is injected when absent — a mixture needs one). */
+  const MIX_MEANS = new Set(['m0', 'm1', 'm2', 'm3']);
+
+  /** Pick the declared keys present in `src` into a fresh override map (preset seeding). */
+  const seedMap = (descs: ParamDesc[], src: Record<string, number>): Record<string, number> => {
+    const m: Record<string, number> = {};
+    for (const d of descs) {
+      const v = src[d.key];
+      if (v !== undefined) m[d.key] = v;
+    }
+    return m;
+  };
+
+  /** Choosing a place POPULATES the row's knobs: a preset seeds density/scatter/ordering/axis
+   *  AND each knob's override map from its own bundle (still editable — edits spread the frozen
+   *  preset into a fresh spec at compile time); a bare shape keeps the density/scatter knobs,
+   *  resets its shape-param map (the new shape's params differ) and clamps the density axis to
+   *  its dim. The per-group sentinels (RANDOM / BY-FACET) keep density/scatter (applied to every
+   *  group) but have no single shape, so shape params are cleared and the density axis pinned
+   *  to 0 — the per-group shapes vary in dimension, and axis 0 is the one they all have. */
+  const setPlace = (row: LevelRow, place: string): void => {
+    row.place = place;
+    row.shapeP = {};
+    if (isPerGroupRow(place)) {
+      row.densityAxis = 0;
+      return;
+    }
+    if (place.startsWith('preset:')) {
+      const p = getPreset(place.slice('preset:'.length));
+      const pp = p.params ?? {};
+      row.ordering = p.ordering ?? 'byIndex';
+      row.density = p.density ?? 'uniform';
+      row.densityAxis = p.densityAxis ?? 0;
+      row.scatter = p.scatter ?? 'none';
+      row.shapeP = seedMap(shapeParams(p.shape), pp);
+      row.densP = seedMap(densityParams(row.density), pp);
+      row.scatP = seedMap(scatterParams(row.scatter), pp);
+      return;
+    }
+    if (row.densityAxis >= getShape(place).dim) row.densityAxis = 0;
+  };
+
+  const mkRow = (groupBy: string | null, place: string, over: Partial<LevelRow> = {}): LevelRow => {
+    const row: LevelRow = {
+      groupBy,
+      place: 'cloud',
+      ordering: 'byIndex',
+      orderFacet: null,
+      orderColumn: null,
+      density: 'uniform',
+      densityAxis: 0,
+      scatter: 'none',
+      shapeP: {},
+      densP: {},
+      scatP: {},
+      spread: 1,
+      spin: false,
+      spinRate: 0.3,
+      spinAxis: [0, 1, 0],
+    };
+    setPlace(row, place);
+    return Object.assign(row, over);
+  };
+
+  /** The shipped default hierarchies — the old fixed arrangements as starting points that
+   *  POPULATE the editor. Facet keys are the ACTIVE dataset's own (vault: region/type,
+   *  synth: galaxy/type), exactly as the old hardcoded levels were. */
+  const HPRESETS: Record<string, { label: string; rows: () => LevelRow[] }> = {
+    'regions-2': {
+      label: `${V.regionFacet} shells (2 levels)`,
+      rows: () => [mkRow(V.regionFacet, 'shell', { spinRate: 0.15 }), mkRow(null, 'cloud')],
+    },
+    galaxies: {
+      label: 'galaxies (spiralGalaxy)',
+      rows: () => [
+        mkRow(V.regionFacet, 'shell', { spinRate: 0.15 }),
+        mkRow(V.groupFacet, 'cloud', { spinRate: 0.5 }),
+        mkRow(null, 'preset:spiralGalaxy'),
+      ],
+    },
+    ring: {
+      label: `ring (${V.regionFacet}s)`,
+      rows: () => [
+        mkRow(V.regionFacet, 'shell', { spinRate: 0.15 }),
+        mkRow(V.groupFacet, 'cloud', { spinRate: 0.5 }),
+        mkRow(null, 'ring', { scatter: 'gaussian', scatP: { thickness: 0.06 } }),
+      ],
+    },
+    globe: {
+      label: 'globe (shell)',
+      rows: () => [
+        mkRow(V.regionFacet, 'shell', { spinRate: 0.15 }),
+        mkRow(V.groupFacet, 'cloud', { spinRate: 0.5 }),
+        mkRow(null, 'shell'),
+      ],
+    },
+    random: {
+      label: 'random (one cloud)',
+      rows: () => [mkRow(null, 'cloud', { spinRate: 0.1 })],
+    },
+    'random-shapes': {
+      // one group per top facet value, each laying its pages out with a DIFFERENT shape
+      // (library `{ random: true }`): a ring here, a globe there, a box elsewhere — all
+      // deterministic by group. A coarse top facet gives ~8–20 groups, so the variety reads.
+      label: `random shapes (${V.regionFacet}s)`,
+      rows: () => [mkRow(V.regionFacet, 'shell', { spinRate: 0.1 }), mkRow(null, RANDOM_PLACE)],
+    },
+  };
+  const DEFAULT_HPRESET = 'regions-2';
+
+  let mode: 'frozen' | 'custom' = 'frozen';
+  let rows: LevelRow[] = HPRESETS[DEFAULT_HPRESET]!.rows();
+  /** True when the live hierarchy's pivot count would overflow the field's pivot store —
+   *  the geometry still compiles and morphs, but no FrameSet installs and spins stay off
+   *  (the inline warning says so) instead of the store throwing mid-boot. */
+  let pivotOverflow = false;
+
+  /* ---- persistence: mode-scoped, like the config store's keys. */
+  const LEVELS_KEY = 'starscape-playground:levels:v1';
+  const saveLevels = (): void => {
+    try {
+      localStorage.setItem(LEVELS_KEY, JSON.stringify({ mode, preset: ui.hpreset.value, rows }));
+    } catch {
+      /* storage denied/full: the session still works, it just will not persist */
+    }
+  };
+  const loadLevels = (): { mode: 'frozen' | 'custom'; preset: string; rows: LevelRow[] } | null => {
+    try {
+      const raw = localStorage.getItem(LEVELS_KEY);
+      if (raw === null) return null;
+      const s = JSON.parse(raw) as { mode?: unknown; preset?: unknown; rows?: unknown };
+      const list = s.rows;
+      if (!Array.isArray(list) || list.length < 1 || list.length > UI_MAX_LEVELS) return null;
+      const shapes = new Set(shapeKeys());
+      const presets = new Set(presetKeys().map((p) => `preset:${p}`));
+      const dens = new Set(densityKeys());
+      const scats = new Set(scatterKeys());
+      const orders = new Set(orderingKeys());
+      const facets = new Set(Object.keys(graph.facets));
+      const cols = new Set(Object.keys(graph.columns));
+      const fin = (v: unknown, d: number): number =>
+        typeof v === 'number' && Number.isFinite(v) ? v : d;
+      /** Keep only the declared keys of a persisted override map, dropping unknown/missing/
+       *  non-finite entries — the guard the plan asks for (fall back to declared defaults). */
+      const sanMap = (v: unknown, descs: ParamDesc[]): Record<string, number> => {
+        const m: Record<string, number> = {};
+        if (v !== null && typeof v === 'object') {
+          const o = v as Record<string, unknown>;
+          for (const d of descs) {
+            const x = o[d.key];
+            if (typeof x === 'number' && Number.isFinite(x)) m[d.key] = x;
+          }
+        }
+        return m;
+      };
+      const out: LevelRow[] = [];
+      for (let k = 0; k < list.length; k++) {
+        const r = list[k] as Partial<LevelRow>;
+        const isLeaf = k === list.length - 1;
+        if (isLeaf ? r.groupBy != null : typeof r.groupBy !== 'string' || !facets.has(r.groupBy))
+          return null;
+        if (
+          typeof r.place !== 'string' ||
+          !(shapes.has(r.place) || presets.has(r.place) || isPerGroupRow(r.place))
+        )
+          return null;
+        if (typeof r.density !== 'string' || !dens.has(r.density)) return null;
+        if (typeof r.scatter !== 'string' || !scats.has(r.scatter)) return null;
+        const place = r.place;
+        const ax = r.spinAxis;
+        const spinAxis: [number, number, number] =
+          Array.isArray(ax) &&
+          ax.length === 3 &&
+          ax.every((c) => typeof c === 'number' && Number.isFinite(c)) &&
+          (ax[0] !== 0 || ax[1] !== 0 || ax[2] !== 0)
+            ? [ax[0] as number, ax[1] as number, ax[2] as number]
+            : [0, 1, 0];
+        out.push({
+          groupBy: isLeaf ? null : (r.groupBy as string),
+          place,
+          ordering: typeof r.ordering === 'string' && orders.has(r.ordering) ? r.ordering : 'byIndex',
+          orderFacet:
+            typeof r.orderFacet === 'string' && facets.has(r.orderFacet) ? r.orderFacet : null,
+          orderColumn:
+            typeof r.orderColumn === 'string' && cols.has(r.orderColumn) ? r.orderColumn : null,
+          density: r.density,
+          densityAxis: Math.min(Math.max(fin(r.densityAxis, 0) | 0, 0), 2),
+          scatter: r.scatter,
+          shapeP: sanMap(r.shapeP, rowShapeParams(place)),
+          densP: sanMap(r.densP, densityParams(r.density)),
+          scatP: sanMap(r.scatP, scatterParams(r.scatter)),
+          spread: Math.min(10, Math.max(0.25, fin(r.spread, 1))),
+          spin: r.spin === true,
+          spinRate: fin(r.spinRate, 0.3),
+          spinAxis,
+        });
+      }
+      return {
+        mode: s.mode === 'custom' ? 'custom' : 'frozen',
+        preset: typeof s.preset === 'string' ? s.preset : '',
+        rows: out,
+      };
+    } catch {
+      return null;
+    }
+  };
+
+  /* ---- compile the editor's rows into the library's LevelSpec list. A RANDOM row maps to the
+     library's per-group `{ random: true }` place: the density/scatter/params still apply to every
+     group (via `base`), only the SHAPE varies per group. densityAxis is left at 0 — the per-group
+     shapes vary in dimension, so axis 0 is the one they all have. */
+  /** The ordering's `stringParams` (the facet/column KEY byFacet/byColumn read) — undefined
+   *  for the keyless orderings, so nothing is sent and the default byIndex path is unchanged. */
+  const orderStringParams = (row: LevelRow): Record<string, string> | undefined => {
+    if (row.ordering === 'byFacet' && row.orderFacet) return { facet: row.orderFacet };
+    if (row.ordering === 'byColumn' && row.orderColumn) return { column: row.orderColumn };
+    return undefined;
+  };
+
+  const buildPlace = (row: LevelRow): PlacementSpec | RandomPlace => {
+    const densForce = row.density === 'mixture' ? MIX_MEANS : undefined;
+    const sp = orderStringParams(row);
+
+    if (isPerGroupRow(row.place)) {
+      const base: Omit<PlacementSpec, 'shape'> = { density: row.density, scatter: row.scatter };
+      if (row.ordering !== 'byIndex') base.ordering = row.ordering;
+      if (sp) base.stringParams = sp;
+      const params: Record<string, number> = {};
+      emitParams(densityParams(row.density), row.densP, params, densForce);
+      emitParams(scatterParams(row.scatter), row.scatP, params);
+      if (row.density === 'mixture' && params['m0'] === undefined) params['m0'] = 0;
+      base.params = params;
+      // BY-FACET keys the per-group shape to each group's own facet value; RANDOM hashes it.
+      return isByFacetRow(row.place) ? { random: true, by: 'facet', base } : { random: true, base };
+    }
+
+    const isPreset = row.place.startsWith('preset:');
+    const base = placeSpecOf(row.place); // {shape} for a bare shape, or the preset's frozen spec
+    const spec: PlacementSpec = { ...base };
+    spec.ordering = row.ordering;
+    if (sp) spec.stringParams = sp;
+    else delete spec.stringParams;
+    spec.density = row.density;
+    spec.scatter = row.scatter;
+    const dim = getShape(spec.shape).dim;
+    spec.densityAxis = Math.min(Math.max(row.densityAxis | 0, 0), dim - 1) as 0 | 1 | 2;
+
+    // A PRESET starts from its own param bundle and the override maps (seeded to the preset's
+    // values) win key-by-key, so an untouched preset row reproduces it exactly; a BARE shape
+    // starts empty and emits only overrides that differ from the library default (omit-at-
+    // default — the untouched row is byte-identical to the shipped behaviour).
+    const params: Record<string, number> = isPreset ? { ...(base.params ?? {}) } : {};
+    if (isPreset) {
+      const over = (descs: ParamDesc[], map: Record<string, number>, force?: Set<string>): void => {
+        for (const d of descs) {
+          const v = map[d.key];
+          if (v === undefined || !Number.isFinite(v)) continue;
+          if (force?.has(d.key) || v !== d.default || params[d.key] !== undefined) params[d.key] = v;
+        }
+      };
+      over(shapeParams(spec.shape), row.shapeP);
+      over(densityParams(row.density), row.densP, densForce);
+      over(scatterParams(row.scatter), row.scatP);
+    } else {
+      emitParams(shapeParams(spec.shape), row.shapeP, params);
+      emitParams(densityParams(row.density), row.densP, params, densForce);
+      emitParams(scatterParams(row.scatter), row.scatP, params);
+    }
+    if (row.density === 'mixture' && params['m0'] === undefined) params['m0'] = 0;
+    spec.params = params;
+    return spec;
+  };
+
+  const compileLevels = (): CompiledHierarchy => {
+    const L = rows.length;
+    /* A row's SPREAD controls how far apart ITS OWN groups sit — which is the radius of
+       their PARENT, one level up. So each level's radiusScale is driven by the NEXT row
+       down (the children seated inside it), and row 0's groups (the outermost) are seated
+       in the root radius, which is opts.rootRadiusScale. The leaf row therefore gets a live
+       spread (it governs how far pages spread inside their deepest group), and the leaf
+       LEVEL never carries a radiusScale (it has no pivot of its own). Leaf-only (L===1) is
+       the exception: the single whole-field group's own radius IS the page spread, so row
+       0 drives that level's radiusScale directly. */
+    const levels: LevelSpec[] = rows.map((row, k) => {
+      const isLeaf = k === L - 1;
+      const lv: LevelSpec = { place: buildPlace(row) };
+      if (!isLeaf) lv.groupBy = row.groupBy ?? undefined;
+      if (!isLeaf) lv.spin = { rate: 0 }; // an idle frame so live rate writes have a target (§3.5)
+      if (L === 1) {
+        lv.spin = { rate: 0 };
+        if (row.spread !== 1) lv.radiusScale = row.spread; // leaf-only: scales the whole field
+      } else {
+        const childRow = rows[k + 1]; // the children seated inside this level
+        if (childRow && childRow.spread !== 1) lv.radiusScale = childRow.spread;
+      }
+      return lv;
+    });
+    // row 0's spread always scales the root radius — the sphere its groups sit in. For a
+    // multi-level hierarchy that spreads the top-level groups apart; for a leaf-only field it
+    // grows the root in step with the single group's own radiusScale, so the two stay equal
+    // and the parent-fit guard never clamps it (without this, leaf-only spread > 1 was eaten
+    // by the clamp and had no effect).
+    const rootRadiusScale = Math.min(10, Math.max(0.25, rows[0]?.spread ?? 1));
+    return compileHierarchy(graph, levels, { spacing: arrangeSpacing, rootRadiusScale });
+  };
+
+  /* ---- the two arrange paths. */
+  const applyFrozen = (): void => {
+    morphing = true;
+    hierarchy = null;
+    pivotOverflow = false;
+    field.setHierarchy(null);
+    regionHierarchy = true; // meta3's region centres ARE the frozen layout's
+    applySpins();
+    computeRegionViews();
+    updateLevelStats();
+    flyHome(liveFov);
+    updateStats();
+  };
+
+  const applyCustom = (flyAfter: boolean): void => {
+    try {
+      const h = compileLevels();
+      // The pivot STORE (not the compiler) holds PIVOT_CAPACITY slots, and only spinning
+      // frames reach it: past the cap, install the same geometry with chainDepth 0 so no
+      // FrameSet ever syncs — the arrangement still works, spins stay off, and the inline
+      // warning says why (the synth `system` facet at 10⁶ is the known case).
+      pivotOverflow = h.pivots.count + 1 > PIVOT_CAPACITY;
+      morphing = true;
+      hierarchy = h;
+      field.setHierarchy(pivotOverflow ? { ...h, chainDepth: 0 } : h);
+      regionHierarchy = rows.length > 1 && rows[0]!.groupBy === V.regionFacet;
+      applySpins();
+      computeRegionViews();
+      updateLevelStats();
+      if (flyAfter) flyHome(liveFov);
+    } catch (err) {
+      // a compile refusal (the library's loud guard rails) lands in the warning box —
+      // the previous arrangement stays on screen, nothing breaks
+      ui.pivotwarn.textContent = err instanceof Error ? err.message : String(err);
+      ui.pivotwarn.classList.add('on', 'err');
+    }
+    updateStats();
+  };
+
+  let levelTimer = 0;
+  /** Debounced recompile (~150 ms): slider drags fire per pixel and the compile is O(n). */
+  const scheduleCustom = (): void => {
+    if (mode !== 'custom') return;
+    window.clearTimeout(levelTimer);
+    levelTimer = window.setTimeout(() => applyCustom(false), 150);
+  };
+  const applyCustomNow = (flyAfter: boolean): void => {
+    window.clearTimeout(levelTimer);
+    applyCustom(flyAfter);
+  };
+
+  /* ---- the editor DOM: one card per level, rebuilt on structural change only (number
+     and range inputs keep focus through their own drags). */
+  interface RowEls {
+    badge: HTMLSpanElement;
+    spreadRow: HTMLElement;
+    spinRow: HTMLElement;
+  }
+  let rowEls: RowEls[] = [];
+  const fmtI = (x: number): string => x.toLocaleString('en-US');
+
+  /** Group counts + guard rails, refreshed after every compile: each grouping row shows
+   *  its level's group count (stats.groupsPerLevel), the leaf shows the page count; the
+   *  spread/spin rows grey out where they have no pivot to act on. */
+  const updateLevelStats = (): void => {
+    const h = hierarchy;
+    for (let k = 0; k < rows.length; k++) {
+      const els = rowEls[k];
+      if (!els) continue;
+      const isLeaf = k === rows.length - 1;
+      els.badge.textContent = !h
+        ? ''
+        : isLeaf
+          ? `${fmtI(n)} nodes`
+          : `${fmtI(h.stats.groupsPerLevel[k] ?? 0)} groups`;
+      // Spin is live on EVERY row now (the shifted mapping): the leaf row turns the innermost
+      // groupBy groups' contents, and row 0 drives the FIELD-GLOBAL rotation. Under pivot
+      // overflow the per-pivot frames are inert — but row 0's field spin needs no pivots, so
+      // only rows ≥ 1 gray out; row 0 stays live and spins the whole field.
+      els.spinRow.classList.toggle('off', pivotOverflow && k > 0);
+      // spread is always live: a row's slider spreads ITS groups within the parent, and the
+      // leaf row spreads pages within their deepest group — so it is meaningful on every row.
+      els.spreadRow.classList.remove('off');
+    }
+    if (h !== null && pivotOverflow) {
+      ui.pivotwarn.textContent =
+        `${fmtI(h.pivots.count)} pivots exceed the spin store's capacity ` +
+        `(${fmtI(PIVOT_CAPACITY)}). The arrangement works, but spins are off for this ` +
+        `config — group by a coarser facet to spin it.`;
+      ui.pivotwarn.classList.add('on');
+      ui.pivotwarn.classList.remove('err');
+    } else {
+      ui.pivotwarn.classList.remove('on', 'err');
+      ui.pivotwarn.textContent = '';
+    }
+  };
+
+  /** Any manual edit: the editor is now the source of truth (the preset select drops to
+   *  its CUSTOM marker), persists, optionally rebuilds the DOM, recompiles debounced. */
+  const edited = (structural = false): void => {
+    ui.hpreset.value = '';
+    saveLevels();
+    if (structural) renderLevels();
+    scheduleCustom();
+  };
+
+  const buildRowEl = (row: LevelRow, k: number): HTMLDivElement => {
+    const isLeaf = k === rows.length - 1;
+    const el = document.createElement('div');
+    el.className = isLeaf ? 'lv leaf' : 'lv';
+
+    /* header: level tag · clustering facet (the ACTIVE dataset's own) · count · remove */
+    const head = document.createElement('div');
+    head.className = 'lvh';
+    const tag = document.createElement('b');
+    tag.textContent = `L${k}`;
+    head.appendChild(tag);
+    const g = document.createElement('select');
+    g.title = 'clustering: the facet this level groups by';
+    if (isLeaf) {
+      const o = document.createElement('option');
+      o.textContent = '— nodes —';
+      g.appendChild(o);
+      g.disabled = true;
+    } else {
+      for (const f of Object.keys(graph.facets)) {
+        const o = document.createElement('option');
+        o.value = f;
+        o.textContent = f;
+        g.appendChild(o);
+      }
+      g.value = row.groupBy ?? '';
+      g.addEventListener('change', () => {
+        row.groupBy = g.value;
+        edited();
+      });
+    }
+    head.appendChild(g);
+    const badge = document.createElement('span');
+    badge.className = 'lv-n';
+    head.appendChild(badge);
+    if (!isLeaf) {
+      const x = document.createElement('button');
+      x.type = 'button';
+      x.className = 'lv-x';
+      x.textContent = '×';
+      x.title = 'remove this level';
+      x.addEventListener('click', () => {
+        rows.splice(k, 1);
+        edited(true);
+      });
+      head.appendChild(x);
+    }
+    el.appendChild(head);
+
+    const lrow = (label: string): HTMLDivElement => {
+      const r = document.createElement('div');
+      r.className = 'lvrow';
+      const i = document.createElement('i');
+      i.textContent = label;
+      r.appendChild(i);
+      el.appendChild(r);
+      return r;
+    };
+    const opt = (sel: HTMLSelectElement | HTMLOptGroupElement, value: string, label: string): void => {
+      const o = document.createElement('option');
+      o.value = value;
+      o.textContent = label;
+      sel.appendChild(o);
+    };
+
+    /* A compact subrow of one number input per declared param of a knob, writing into `map`.
+       Each input shows the stored override or the declared default; an untouched input never
+       enters `map`, so buildPlace omits it (byte-identical to the shipped behaviour). */
+    const numField = (d: ParamDesc, map: Record<string, number>): HTMLLabelElement => {
+      const pp = document.createElement('label');
+      pp.className = 'pp';
+      pp.title = `${d.key}  ·  default ${+d.default.toFixed(4)}  ·  ${d.min}–${d.max}`;
+      const sp = document.createElement('span');
+      sp.textContent = d.label;
+      const inp = document.createElement('input');
+      inp.type = 'number';
+      inp.step = String(d.step);
+      inp.min = String(d.min);
+      inp.max = String(d.max);
+      inp.value = String(map[d.key] ?? d.default);
+      inp.addEventListener('input', () => {
+        const v = Number(inp.value);
+        if (inp.value.trim() !== '' && Number.isFinite(v)) map[d.key] = v;
+        else delete map[d.key];
+        edited();
+      });
+      pp.appendChild(sp);
+      pp.appendChild(inp);
+      return pp;
+    };
+    const paramPack = (label: string, descs: ParamDesc[], map: Record<string, number>): void => {
+      if (descs.length === 0) return;
+      const r = lrow(label);
+      const wrap = document.createElement('div');
+      wrap.className = 'pp-wrap';
+      for (const d of descs) wrap.appendChild(numField(d, map));
+      r.appendChild(wrap);
+    };
+    /* mixture needs presence-based components: m0 is always on (the compiler injects it),
+       m1..m3 opt in via a checkbox (their mean's PRESENCE is the toggle the engine reads). */
+    const mixturePack = (map: Record<string, number>): void => {
+      const by = new Map(densityParams('mixture').map((d) => [d.key, d] as const));
+      const r = lrow('mix·c');
+      const wrap = document.createElement('div');
+      wrap.className = 'pp-wrap';
+      for (const key of ['m0', 's0', 'w0']) wrap.appendChild(numField(by.get(key)!, map));
+      for (let i = 1; i <= 3; i++) {
+        const on = map[`m${i}`] !== undefined;
+        const cb = document.createElement('label');
+        cb.className = 'pp pp-cb';
+        cb.title = `component ${i}: toggle its gaussian on/off`;
+        const chk = document.createElement('input');
+        chk.type = 'checkbox';
+        chk.checked = on;
+        const lab = document.createElement('span');
+        lab.textContent = `c${i}`;
+        chk.addEventListener('change', () => {
+          if (chk.checked) map[`m${i}`] = by.get(`m${i}`)!.default;
+          else {
+            delete map[`m${i}`];
+            delete map[`s${i}`];
+            delete map[`w${i}`];
+          }
+          edited(true);
+        });
+        cb.appendChild(lab);
+        cb.appendChild(chk);
+        wrap.appendChild(cb);
+        if (on) for (const key of [`m${i}`, `s${i}`, `w${i}`]) wrap.appendChild(numField(by.get(key)!, map));
+      }
+      r.appendChild(wrap);
+    };
+
+    /* arrangement: ONE select — the registry's shapes, its placement presets, then the
+       per-group RANDOM entry (maps to the library's `{ random: true }` place: each group in
+       this level draws a different shape, deterministically by group). */
+    const srow = lrow('shape');
+    const s = document.createElement('select');
+    const ogS = document.createElement('optgroup');
+    ogS.label = 'shapes';
+    for (const key of shapeKeys()) opt(ogS, key, key);
+    const ogP = document.createElement('optgroup');
+    ogP.label = 'presets';
+    for (const name of presetKeys()) opt(ogP, `preset:${name}`, name);
+    const ogR = document.createElement('optgroup');
+    ogR.label = 'special';
+    opt(ogR, RANDOM_PLACE, 'random (per group)');
+    opt(ogR, BY_FACET_PLACE, 'by cluster facet');
+    s.appendChild(ogS);
+    s.appendChild(ogP);
+    s.appendChild(ogR);
+    s.value = row.place;
+    s.addEventListener('change', () => {
+      setPlace(row, s.value); // seeds density/scatter/ordering/params — row re-renders to show it
+      edited(true);
+    });
+    srow.appendChild(s);
+    // the row's shape (bare or the preset's bundled shape) exposes its own params here.
+    paramPack('shape·p', rowShapeParams(row.place), row.shapeP);
+
+    /* ordering: WHO sits where along the shape's primary axis + the facet/column sub-picker
+       the keyed orderings (byFacet/byColumn) read. byIndex (the default) changes nothing;
+       byFacet/byColumn are graph-backed, so they resolve on the leaf (page) level. */
+    const orow = lrow('order');
+    const os = document.createElement('select');
+    os.title = 'ordering: who sits where along the shape’s primary axis (facet/column act on the leaf)';
+    for (const key of orderingKeys()) opt(os, key, key);
+    os.value = row.ordering;
+    os.addEventListener('change', () => {
+      row.ordering = os.value;
+      if (row.ordering === 'byFacet' && !row.orderFacet)
+        row.orderFacet = Object.keys(graph.facets)[0] ?? null;
+      if (row.ordering === 'byColumn' && !row.orderColumn)
+        row.orderColumn = Object.keys(graph.columns)[0] ?? null;
+      edited(true);
+    });
+    orow.appendChild(os);
+    if (row.ordering === 'byFacet') {
+      const fs = document.createElement('select');
+      fs.title = 'facet whose values order the members (one contiguous sector each)';
+      for (const f of Object.keys(graph.facets)) opt(fs, f, f);
+      fs.value = row.orderFacet ?? Object.keys(graph.facets)[0] ?? '';
+      fs.addEventListener('change', () => {
+        row.orderFacet = fs.value;
+        edited();
+      });
+      orow.appendChild(fs);
+    } else if (row.ordering === 'byColumn') {
+      const cs = document.createElement('select');
+      cs.title = 'numeric column whose gradient orders the members';
+      for (const col of Object.keys(graph.columns)) opt(cs, col, col);
+      cs.value = row.orderColumn ?? Object.keys(graph.columns)[0] ?? '';
+      cs.addEventListener('change', () => {
+        row.orderColumn = cs.value;
+        edited();
+      });
+      orow.appendChild(cs);
+    }
+
+    /* distribution: density + the axis it warps (dim > 1 shapes), then its param pack. */
+    const drow = lrow('dens');
+    const d = document.createElement('select');
+    for (const key of densityKeys()) opt(d, key, key);
+    d.value = row.density;
+    d.addEventListener('change', () => {
+      row.density = d.value;
+      row.densP = {}; // the new density's params differ — start at its declared defaults
+      edited(true);
+    });
+    drow.appendChild(d);
+    // A per-group row (random / by-facet) has no single shape (so no fixed dim): skip the
+    // density-axis select — the density still warps axis 0 on every group, which every shape has.
+    const dim = isPerGroupRow(row.place) ? 1 : getShape(placeSpecOf(row.place).shape).dim;
+    if (dim > 1) {
+      const ax = document.createElement('select');
+      ax.title = 'densityAxis: which shape axis the density warps';
+      ax.style.flex = '0 0 52px';
+      for (let a = 0; a < dim; a++) opt(ax, String(a), `ax${a}`);
+      ax.value = String(Math.min(row.densityAxis, dim - 1));
+      ax.addEventListener('change', () => {
+        row.densityAxis = Number(ax.value);
+        edited();
+      });
+      drow.appendChild(ax);
+    }
+    if (row.density === 'mixture') mixturePack(row.densP);
+    else paramPack('dens·p', densityParams(row.density), row.densP);
+
+    /* scatter: flesh off the manifold + its param pack. */
+    const crow = lrow('scat');
+    const c = document.createElement('select');
+    for (const key of scatterKeys()) opt(c, key, key);
+    c.value = row.scatter;
+    c.addEventListener('change', () => {
+      row.scatter = c.value;
+      row.scatP = {};
+      edited(true);
+    });
+    crow.appendChild(c);
+    paramPack('scat·p', scatterParams(row.scatter), row.scatP);
+
+    /* spread: how far apart THIS level's own groups sit (seated in their parent's radius) —
+       so the galaxy row spreads the galaxies apart, the type row spreads types within each
+       galaxy, and the leaf row spreads pages within their deepest group. Drives the parent's
+       radius (root radius for level 0), not this level's own — see compileLevels. */
+    const prow = lrow('spread');
+    const range = document.createElement('input');
+    range.type = 'range';
+    range.min = '0.25';
+    range.max = '10';
+    range.step = '0.05';
+    range.value = String(row.spread);
+    range.title = 'spread: how far apart this level’s groups sit';
+    const rv = document.createElement('span');
+    rv.className = 'lv-rv';
+    rv.textContent = row.spread.toFixed(2);
+    range.addEventListener('input', () => {
+      row.spread = Number(range.value);
+      rv.textContent = row.spread.toFixed(2);
+      edited();
+    });
+    prow.appendChild(range);
+    prow.appendChild(rv);
+
+    /* spin: live rate straight into the pivot table — no recompile needed. */
+    const wrow = lrow('spin');
+    const on = document.createElement('input');
+    on.type = 'checkbox';
+    on.checked = row.spin;
+    on.addEventListener('change', () => {
+      row.spin = on.checked;
+      ui.hpreset.value = '';
+      saveLevels();
+      applySpins();
+      updateStats();
+    });
+    const rate = document.createElement('input');
+    rate.type = 'number';
+    rate.step = '0.05';
+    rate.value = String(row.spinRate);
+    rate.title = 'spin rate (rad per time unit)';
+    rate.addEventListener('input', () => {
+      row.spinRate = Number(rate.value) || 0;
+      saveLevels();
+      applySpins();
+    });
+    // spin axis: X / Y / Z (the compiler normalises it; default Y = canonical up). Live like
+    // the rate — applySpins writes the pivot/field axis straight into the table, no recompile.
+    const axisSel = document.createElement('select');
+    axisSel.title = 'spin axis (X / Y / Z)';
+    axisSel.style.flex = '0 0 46px';
+    for (const lbl of ['X', 'Y', 'Z']) opt(axisSel, lbl, lbl);
+    axisSel.value = axisLabel(row.spinAxis);
+    axisSel.addEventListener('change', () => {
+      row.spinAxis = AXES[axisSel.value] ?? [0, 1, 0];
+      ui.hpreset.value = '';
+      saveLevels();
+      applySpins();
+    });
+    wrow.appendChild(on);
+    wrow.appendChild(rate);
+    wrow.appendChild(axisSel);
+
+    rowEls[k] = { badge, spreadRow: prow, spinRow: wrow };
+    return el;
+  };
+
+  const renderLevels = (): void => {
+    ui.levels.innerHTML = '';
+    rowEls = [];
+    rows.forEach((row, k) => ui.levels.appendChild(buildRowEl(row, k)));
+    ui.addlevel.disabled = rows.length >= UI_MAX_LEVELS;
+    updateLevelStats();
+  };
+
+  /* ---- the rail handlers (also driven by the debug handle). */
+  const onModeChange = (): void => {
+    mode = ui.mode.value === 'custom' ? 'custom' : 'frozen';
+    ui.levelsbox.style.display = mode === 'custom' ? '' : 'none';
+    saveLevels();
+    if (mode === 'custom') {
+      renderLevels();
+      applyCustomNow(true);
+    } else {
+      applyFrozen();
+    }
+  };
+  const onPresetChange = (): void => {
+    const hp = HPRESETS[ui.hpreset.value];
+    if (hp === undefined) return;
+    rows = hp.rows();
+    saveLevels();
+    renderLevels();
+    applyCustomNow(true);
+  };
+  const onAddLevel = (): void => {
+    if (rows.length >= UI_MAX_LEVELS) return;
+    const facets = Object.keys(graph.facets);
+    const used = new Set(rows.map((r) => r.groupBy));
+    const pick = facets.find((f) => !used.has(f)) ?? facets[0] ?? V.groupFacet;
+    rows.splice(rows.length - 1, 0, mkRow(pick, 'shell'));
+    edited(true);
+  };
+  const onLevelsReset = (ev?: Event): void => {
+    ev?.preventDefault();
+    localStorage.removeItem(LEVELS_KEY);
+    rows = HPRESETS[DEFAULT_HPRESET]!.rows();
+    ui.hpreset.value = DEFAULT_HPRESET;
+    saveLevels();
+    renderLevels();
+    if (mode === 'custom') applyCustomNow(true);
+  };
+
+  /* the preset-hierarchy select's options (plus the CUSTOM marker it drops to on edit) */
+  {
+    const custom = document.createElement('option');
+    custom.value = '';
+    custom.textContent = '· custom ·';
+    custom.disabled = true;
+    ui.hpreset.appendChild(custom);
+    for (const [name, hp] of Object.entries(HPRESETS)) {
+      const o = document.createElement('option');
+      o.value = name;
+      o.textContent = hp.label;
+      ui.hpreset.appendChild(o);
+    }
+  }
 
   const applyProjection = (): void => {
     const mode = ui.proj.value === '2d' ? '2d' : '3d';
-    if (mode !== field.projection) morphing = true; // setProjection no-ops on a same-mode call
+    if (mode !== field.projection) morphing = true;
     field.setProjection(mode);
-    const fovTarget = mode === '2d' ? 30 : DEFAULT_FOV; // narrow lens flattens the read
-    demoTweens.to('fov', fovTarget, { duration: 0.9 });
+    const fovTarget = mode === '2d' ? 30 : DEFAULT_FOV;
+    appTweens.to('fov', fovTarget, { duration: 0.9 });
     flyHome(fovTarget);
   };
 
-  ui.arrangement.addEventListener('change', applyArrangement);
-  ui.pull.addEventListener('change', applyArrangement);
-  ui.spin0.addEventListener('change', applySpins);
-  ui.spin1.addEventListener('change', applySpins);
-  ui.rate0.addEventListener('change', applySpins);
-  ui.rate1.addEventListener('change', applySpins);
-  ui.proj.addEventListener('change', applyProjection);
-  // spread moved into the tuning panel's `motion` group (stage 8) — one knob, one owner
+  /* ---- view distance: how far you can see. Pushes the field's depth haze out (setViewDistance)
+     AND the camera's far clip plane past it, so distant galaxies stay drawn instead of fading or
+     clipping — important once the spread sliders blow the field well past its original extent. */
+  const baseCameraFar = (radius + diagonal) * 20;
+  const VIEWDIST_KEY = 'starscape-playground:viewdist';
+  const applyViewDistance = (persist = true): void => {
+    const mult = Math.min(20, Math.max(0.5, Number(ui.viewdist.value) || 1));
+    const fog = field.setViewDistance(mult);
+    camera.far = Math.max(baseCameraFar, fog.far * 2);
+    camera.updateProjectionMatrix();
+    ui.viewdistv.textContent = `${mult.toFixed(1)}×`;
+    if (persist) {
+      try {
+        localStorage.setItem(VIEWDIST_KEY, String(mult));
+      } catch {
+        /* storage full or blocked — the control still works this session */
+      }
+    }
+  };
+  {
+    const saved = Number(localStorage.getItem(VIEWDIST_KEY));
+    if (Number.isFinite(saved) && saved >= 0.5 && saved <= 20) ui.viewdist.value = String(saved);
+    applyViewDistance(false);
+  }
+  ui.viewdist.addEventListener('input', () => applyViewDistance());
 
-  /* ---- stage 7: the zoom ladder + DOM overlay (DESIGN §6) ----------------------------
-     The machine is pure (src/ladder/ladder.ts) — the demo's job is the candidate pass, the
-     cursor, the pin (= the existing select state) and the per-frame overlay call. */
+  ui.mode.addEventListener('change', onModeChange);
+  ui.hpreset.addEventListener('change', onPresetChange);
+  ui.addlevel.addEventListener('click', onAddLevel);
+  ui.levelsreset.addEventListener('click', onLevelsReset);
+  ui.proj.addEventListener('change', applyProjection);
+  ui.home.addEventListener('click', () => flyHome(liveFov));
+
+  /* ---- the keys/help legend: a button in the rail header toggles the overlay; Escape and a
+     click anywhere outside close it (it is a reference card, not a mode). */
+  const legendEl = document.getElementById('legend')!;
+  const keysBtn = document.getElementById('keys') as HTMLButtonElement;
+  const toggleLegend = (show?: boolean): void => {
+    const on = show ?? legendEl.hasAttribute('hidden');
+    if (on) legendEl.removeAttribute('hidden');
+    else legendEl.setAttribute('hidden', '');
+    keysBtn.classList.toggle('on', on);
+  };
+  keysBtn.addEventListener('click', () => toggleLegend());
+  legendEl.addEventListener('click', () => toggleLegend(false));
+
+  /* ---- the GLOW controls: on/off + the three bloom knobs. Live uniform writes (no recompile);
+     the on/off switches the render path. Initialised from the persisted glow state below. */
+  ui.glow.addEventListener('change', () => setGlow(ui.glow.checked));
+  ui.glowStrength.addEventListener('input', () => {
+    glow.strength = Number(ui.glowStrength.value);
+    applyGlowParams();
+    saveGlow();
+  });
+  ui.glowRadius.addEventListener('input', () => {
+    glow.radius = Number(ui.glowRadius.value);
+    applyGlowParams();
+    saveGlow();
+  });
+  ui.glowThreshold.addEventListener('input', () => {
+    glow.threshold = Number(ui.glowThreshold.value);
+    applyGlowParams();
+    saveGlow();
+  });
+  /* Compression is a CONFIG key (store-backed, persisted + preset-aware), so its slider drives
+     the store like the tuning panel does — marks the look custom, saves, routes (applyCompression
+     reflects it back + writes the post uniform) and syncs the tuning panel row. */
+  ui.glowCompression.addEventListener('input', () => {
+    if (store.set('compression', Number(ui.glowCompression.value))) {
+      panel.markCustom();
+      store.save();
+      routeKey('compression');
+      panel.sync();
+      syncLook();
+    }
+  });
+
+  /* ---- the zoom ladder + overlay, with the REAL wiki provider --------------------------- */
   injectStyles();
+  /* closeOrbit (declared up by the camera block) is the node we flew into a tight orbit of
+     (double-click), or -1. While set, its pinned reading card is suppressed so it stays a glyph
+     you circle; it clears on a new select, on Escape, on a wiki-link navigate, or when the camera
+     leaves its leash (handled in the loop). leaveCloseOrbit() centralises that teardown. */
+  // the library's deterministic prose provider: a synthetic page body is a pure function of the
+  // node id and the same salt everywhere, so an opened card is stable across reloads (§10.1).
   const provider = makeSynthProvider(graph);
   const ladderRoot = document.getElementById('ladder')!;
-  // the pin affordance reuses the existing select-clear, exactly like Escape below
   const onUnpin = (): void => {
-    if (field.setSelect(-1)) updateOverlay();
+    paintSelected(-1);
+    if (field.setSelect(-1)) updateStats();
   };
-  /** Every ladder tunable, from the config (ladder group of the routing table). The threshold
-   *  and band keys are ALSO mutated live on ladder.config; this builder serves the rebuild
-   *  keys — namedCap/cards size fixed buffers and lockW/lockH freeze the overlay rect at
-   *  creation, so those four recreate the machine + overlay (an event, never per frame). */
   const ladderOptsFromCfg = (): Parameters<typeof createLadder>[0] => ({
     namedPx: num('namedPx'),
     earn: num('labelEarn'),
@@ -514,6 +1662,15 @@ async function main(): Promise<void> {
     lockW: num('lockW'),
     lockH: num('lockH'),
     cardRadiusSpacings: num('cardRadius'),
+    // the per-tier master switches (Fix 1): off fully suppresses that tier, below any threshold.
+    showLabels: bool('showLabels'),
+    showCards: bool('showCards'),
+    showOpen: bool('showOpen'),
+    // card attention: 'center' gates cards to the centre region (radius centerSize); 'cursor'
+    // leaves the gate off (Infinity) so the cursor only re-ranks. See gatherCandidates for the
+    // matching cursorPx anchor (cursor→node vs centre→node).
+    attentionGateRadiusPx:
+      str('cardAttention') === 'center' ? num('centerSize') : Number.POSITIVE_INFINITY,
   });
   let ladder = createLadder(ladderOptsFromCfg());
   let ladderOverlay = createOverlay({
@@ -524,7 +1681,7 @@ async function main(): Promise<void> {
     onUnpin,
   });
   const rebuildLadder = (): void => {
-    ladderOverlay.dispose(); // unmounts every live label/card — the old rule's leftovers
+    ladderOverlay.dispose();
     ladder = createLadder(ladderOptsFromCfg());
     ladderOverlay = createOverlay({
       container: ladderRoot,
@@ -535,58 +1692,15 @@ async function main(): Promise<void> {
     });
   };
 
-  // pointer state the ladder consumes (written by the pointermove wiring below)
   let pointerActive = false;
   let cursorMoved = false;
 
-  // the one clip matrix (projection × worldInverse) the candidate pass and the overlay share
   const camInv = new Matrix4();
   const clipM = new Matrix4();
 
-  // the largest size-channel radius in the corpus — the candidate reach bound. Maintained by
-  // applySizes() (the nodes group rebinds the channel live). A loop, never a spread (§10.3).
-  let maxSizeWorld = 0;
-  for (let i = 0; i < n; i++) {
-    const s = field.sizeOf(i);
-    if (s > maxSizeWorld) maxSizeWorld = s;
-  }
-  const maxBoost = Math.max(BOOST_HOVER, BOOST_SELECT);
-
-  /* THE CANDIDATE RECIPE, stage-9 edition — bounded per frame HOWEVER big the corpus.
-     The stage-7 version walked every grid cell in reach each frame; at the §9 home framing
-     reach covers the whole field, so it was an O(n) sweep per frame — measured 67 ms at 10⁶,
-     all by itself two orders over the §9 frame-CPU budget. The fix splits the pass by what
-     actually needs per-frame freshness:
-
-     NEAR PASS (every frame, exact): cells within the CARD distance (dCard × frustum slack +
-     drift) of the camera. Cards, locks and the open page key off live DEPTH — a stale
-     distance would lag the open tier exactly where the ladder lives — and near the camera
-     this is a handful of cells whatever n is. Per node: view-forward depth (clip w ≡ −z_view,
-     what the shader sizes by), the px gate, the frustum margin test (±1.25/±1.3 NDC), the
-     cursor pull. While spinning, each resident is re-formed through the live frame chain
-     first (refreshViewOf — written back into viewBuf, so overlay and click target agree).
-
-     FAR SWEEP (incremental, SWEEP_CELLS_PER_FRAME cells a frame): the named band only needs
-     the best ~`keep` candidates by projected size, and label admission already carries dwell
-     hysteresis — so membership may lag a few hundred ms, exactly the staleness class of the
-     morph gap the stage-7 header accepted. One GENERATION sweeps the full reach box (the
-     stage-7 reach formula) keeping a bounded top-K-by-px selection; cells are pruned with the
-     per-cell max of the size channel (pick/grid cellMaxOf): a cell whose LARGEST node cannot
-     project over the admission floor at the cell's nearest possible depth is skipped whole.
-     The sweep pins ITS grid + cellMax + drift base, so a mid-generation rebuild (spins) never
-     restarts it — the widening just grows by the drift since the PINNED grid was built. On
-     completion the selection becomes the published FAR SET: node ids only, re-projected
-     FRESH every frame (≤ FAR_CAP nodes), so rank, cursor pull and distances are live — only
-     membership is a generation stale. A morph clears it (every position moved).
-
-     REFINEMENT vs stage 7 (deliberate, documented in SCALE.md): far admission is by RESTING
-     projected size — the cursor pull and the hover boost promote candidates within the
-     published set but no longer recruit from outside the top-K×2 band. At the framings where
-     that band is even oversubscribed (10⁵⁺ zoomed out, tens of thousands passing the px
-     gate), individual sub-band glyphs are pixels apart and unpointable anyway.
-
-     The pinned node is appended even when both passes missed it — a pin outranks the ladder.
-     Columns are fixed scratch, grown geometrically, never allocated per frame (§10). */
+  /* THE CANDIDATE PASS — exhaustive by design at this corpus size (see the header): every
+     node, every frame: depth, px gate, frustum margin, cursor pull. The pinned node bypasses
+     every gate (a pin outranks the ladder). Columns are fixed scratch. */
   let candCap = 0;
   let candNode = new Uint32Array(0);
   let candPx = new Float64Array(0);
@@ -625,341 +1739,76 @@ async function main(): Promise<void> {
     ladderCandidates.cursorPx = candCur;
   };
 
-  /* ---- far-sweep state (see THE CANDIDATE RECIPE above). All fixed scratch. ---- */
-  /** Hard ceiling on the published far set (and its selection heap). */
-  const FAR_CAP = 256;
-  /** Cells examined per frame — the sweep's whole per-frame budget is this many cheap cell
-   *  tests plus the members of the few that survive the pruning. 4096 ≈ a sixth of the 10⁵
-   *  grid (6-frame generations) and 1/61 of the 10⁶ grid (~1.5 s generations): measured, the
-   *  number where the slice stays under ~0.3 ms at 10⁵ (the §9 0.5 ms row leaves no room for
-   *  more) while label-set refresh stays comfortably inside the dwell hysteresis. */
-  const SWEEP_CELLS_PER_FRAME = 4096;
-  const heapNode = new Uint32Array(FAR_CAP);
-  const heapPx = new Float64Array(FAR_CAP);
-  let heapK = 0;
-  let heapLimit = FAR_CAP;
-  const farNode = new Uint32Array(FAR_CAP);
-  let farCount = 0;
-  let sweepActive = false;
-  let sweepGrid = grid; // the generation's PINNED grid (survives rebuilds mid-sweep)
-  let sweepCellMax = gridCellMax;
-  let sweepDriftBase = 0; // driftTotal when the pinned grid was built
-  let sweepReach = 0;
-  let sweepLoX = 0;
-  let sweepHiX = -1;
-  let sweepLoY = 0;
-  let sweepHiY = -1;
-  let sweepLoZ = 0;
-  let sweepHiZ = -1;
-  let sweepX = 0;
-  let sweepY = 0;
-  let sweepZ = 0;
-  let sweepCells = 0; // telemetry: cells in this generation's box / done so far
-  let sweepDone = 0;
-  let sweepGen = 0;
-  /** Which nodes THIS frame's near pass admitted — O(1) dedupe for the far merge. */
-  const nearStamp = new Uint32Array(n);
-  let nearEpoch = 0;
-
-  const heapSift = (j: number): void => {
-    // min-heap on px: root holds the admission floor once the selection is full
-    for (;;) {
-      const l = j * 2 + 1;
-      if (l >= heapK) return;
-      const r = l + 1;
-      const c = r < heapK && heapPx[r]! < heapPx[l]! ? r : l;
-      if (heapPx[c]! >= heapPx[j]!) return;
-      const tn = heapNode[j]!;
-      const tp = heapPx[j]!;
-      heapNode[j] = heapNode[c]!;
-      heapPx[j] = heapPx[c]!;
-      heapNode[c] = tn;
-      heapPx[c] = tp;
-      j = c;
-    }
-  };
-  const heapPush = (node: number, px: number): void => {
-    if (heapK < heapLimit) {
-      let j = heapK++;
-      heapNode[j] = node;
-      heapPx[j] = px;
-      while (j > 0) {
-        const p = (j - 1) >> 1;
-        if (heapPx[p]! <= heapPx[j]!) break;
-        const tn = heapNode[j]!;
-        const tp = heapPx[j]!;
-        heapNode[j] = heapNode[p]!;
-        heapPx[j] = heapPx[p]!;
-        heapNode[p] = tn;
-        heapPx[p] = tp;
-        j = p;
-      }
-    } else if (px > heapPx[0]!) {
-      heapNode[0] = node;
-      heapPx[0] = px;
-      heapSift(0);
-    }
-  };
-
-  /** Drop the far set and any sweep in flight — a morph moved every position, so a stale
-   *  membership would name the wrong places; the next gather starts a fresh generation. */
-  const resetSweep = (): void => {
-    sweepActive = false;
-    heapK = 0;
-    farCount = 0;
-  };
-
-  /** Advance the far sweep by one budget slice (see THE CANDIDATE RECIPE). */
-  function farSlice(fovPx: number, slack: number, dCard: number): void {
-    if (!sweepActive) {
-      // a new generation pins the CURRENT grid and derives its box from the live camera
-      sweepGrid = grid;
-      sweepCellMax = gridCellMax;
-      sweepDriftBase = gridDriftBase;
-      heapLimit = Math.min(FAR_CAP, Math.max(ladder.config.keep, ladder.config.earn) * 2);
-      heapK = 0;
-      sweepReach =
-        Math.max(
-          standoffOf(maxSizeWorld * NODE_SCALE * maxBoost, ladder.config.namedPx, fovPx),
-          dCard,
-        ) *
-          slack +
-        gridDrift;
-      const g = sweepGrid;
-      sweepLoX = Math.max(0, Math.floor((camera.position.x - sweepReach - g.minX) / g.cellX));
-      sweepHiX = Math.min(g.side - 1, Math.floor((camera.position.x + sweepReach - g.minX) / g.cellX));
-      sweepLoY = Math.max(0, Math.floor((camera.position.y - sweepReach - g.minY) / g.cellY));
-      sweepHiY = Math.min(g.side - 1, Math.floor((camera.position.y + sweepReach - g.minY) / g.cellY));
-      sweepLoZ = Math.max(0, Math.floor((camera.position.z - sweepReach - g.minZ) / g.cellZ));
-      sweepHiZ = Math.min(g.side - 1, Math.floor((camera.position.z + sweepReach - g.minZ) / g.cellZ));
-      sweepX = sweepLoX;
-      sweepY = sweepLoY;
-      sweepZ = sweepLoZ;
-      sweepCells =
-        Math.max(0, sweepHiX - sweepLoX + 1) *
-        Math.max(0, sweepHiY - sweepLoY + 1) *
-        Math.max(0, sweepHiZ - sweepLoZ + 1);
-      sweepDone = 0;
-      sweepActive = sweepCells > 0;
-      if (!sweepActive) {
-        farCount = 0;
-        return;
-      }
-    }
-    const g = sweepGrid;
-    const cm = sweepCellMax;
-    const live = !fieldSettledNow;
-    const driftW = driftTotal - sweepDriftBase; // nodes may sit this far from their old cells
-    const reachW = sweepReach + driftW;
-    const r2 = reachW * reachW;
-    const cx = camera.position.x;
-    const cy = camera.position.y;
-    const cz = camera.position.z;
-    const m = clipM.elements;
-    const namedPx = ladder.config.namedPx;
-    /* Best-case px factor: diameter × NODE_SCALE × fovPx over the cell's minimum VIEW DEPTH.
-       Depth (clip w) is linear over the cell box, so its exact minimum is one corner picked
-       by coefficient sign — the same number the per-node gate divides by, with no Euclidean
-       slack inflating the bound 1.6× (measured: the slack form passed ~3× the cells). */
-    const pxNum = 2 * NODE_SCALE * fovPx;
-    const m3 = m[3]!;
-    const m7 = m[7]!;
-    const m11 = m[11]!;
-    const m15 = m[15]!;
-    let budget = SWEEP_CELLS_PER_FRAME;
-    while (budget > 0) {
-      const z0 = g.minZ + sweepZ * g.cellZ;
-      const y0 = g.minY + sweepY * g.cellY;
-      const x0 = g.minX + sweepX * g.cellX;
-      const dz0 = cz < z0 ? z0 - cz : cz > z0 + g.cellZ ? cz - (z0 + g.cellZ) : 0;
-      const dy0 = cy < y0 ? y0 - cy : cy > y0 + g.cellY ? cy - (y0 + g.cellY) : 0;
-      const dx0 = cx < x0 ? x0 - cx : cx > x0 + g.cellX ? cx - (x0 + g.cellX) : 0;
-      const d2 = dx0 * dx0 + dy0 * dy0 + dz0 * dz0;
-      budget--;
-      sweepDone++;
-      if (d2 <= r2) {
-        const k = (sweepZ * g.side + sweepY) * g.side + sweepX;
-        // the admission floor: the px gate, raised to the selection's own minimum once full
-        const floor = heapK >= heapLimit && heapPx[0]! > namedPx ? heapPx[0]! : namedPx;
-        const depthMin =
-          (m3 >= 0 ? m3 * x0 : m3 * (x0 + g.cellX)) +
-          (m7 >= 0 ? m7 * y0 : m7 * (y0 + g.cellY)) +
-          (m11 >= 0 ? m11 * z0 : m11 * (z0 + g.cellZ)) +
-          m15;
-        const dMin = Math.max(depthMin - driftW, 1e-3);
-        if ((cm[k]! * pxNum) / dMin >= floor) {
-          const lo = g.start[k]!;
-          const hi = g.start[k + 1]!;
-          for (let q = lo; q < hi; q++) {
-            const i = g.order[q]!;
-            if (live) refreshViewOf(i);
-            const o = i * 3;
-            const wx = viewBuf[o]!;
-            const wy = viewBuf[o + 1]!;
-            const wz = viewBuf[o + 2]!;
-            const cw = m[3]! * wx + m[7]! * wy + m[11]! * wz + m[15]!;
-            if (cw <= 0) continue;
-            // RESTING size (boost excluded — see the recipe's refinement note)
-            const px = projectedPx(field.sizeOf(i) * NODE_SCALE, cw, fovPx);
-            if (px < namedPx || (heapK >= heapLimit && px <= heapPx[0]!)) continue;
-            const ndx = (m[0]! * wx + m[4]! * wy + m[8]! * wz + m[12]!) / cw;
-            const ndy = (m[1]! * wx + m[5]! * wy + m[9]! * wz + m[13]!) / cw;
-            if (ndx < -NDC_MARGIN_X || ndx > NDC_MARGIN_X || ndy < -NDC_MARGIN_Y || ndy > NDC_MARGIN_Y) {
-              continue;
-            }
-            heapPush(i, px);
-          }
-        }
-      }
-      // advance the cursor; past the box end the generation lands
-      if (++sweepX > sweepHiX) {
-        sweepX = sweepLoX;
-        if (++sweepY > sweepHiY) {
-          sweepY = sweepLoY;
-          if (++sweepZ > sweepHiZ) {
-            farNode.set(heapNode.subarray(0, heapK));
-            farCount = heapK;
-            sweepActive = false;
-            sweepGen++;
-            return;
-          }
-        }
-      }
-    }
-  }
-
   function gatherCandidates(): number {
-    nearEpoch++;
     const fovPx = fovPxOf(H, liveFov);
-    const live = !fieldSettledNow; // spins/spread in flight: re-transform every resident
-    const tanHalf = Math.tan((liveFov * Math.PI) / 360);
-    const tV = tanHalf * NDC_MARGIN_Y;
-    const tH = tanHalf * (W / H) * NDC_MARGIN_X;
-    const slack = Math.sqrt(1 + tV * tV + tH * tH); // Euclidean ≤ depth × slack inside the margin
-    const dCard = ladder.config.cardSpacings * spacing * field.spread;
-    // the NEAR pass reaches the card distance only — the far sweep owns the rest (the recipe)
-    const reach = dCard * slack + gridDrift;
-    const r2 = reach * reach;
+    const live = !fieldSettledNow;
+    const m = clipM.elements;
+    // the card-attention anchor: in 'center' mode cursorPx is the CSS-px distance from the CANVAS
+    // CENTRE to each node (available for every on-screen node, no pointer needed); in 'cursor' mode
+    // it stays the live cursor→node distance (only when the pointer is over the canvas). W/H are CSS
+    // px and the node screen position is derived from the same clip matrix, so the centre (W/2, H/2)
+    // is in CSS px too — consistent with the cursor path, no devicePixelRatio factor enters.
+    const centerMode = str('cardAttention') === 'center';
+    // In close orbit the orbited node is deliberately NOT a candidate: it draws no label and no
+    // card at any distance, so it stays a bare highlighted glyph you circle (its identity lives
+    // in the side panel). Its pin is suppressed too — nothing forces its card open.
+    const pinnedNode = closeOrbit >= 0 ? -1 : field.select;
     const cx = camera.position.x;
     const cy = camera.position.y;
     const cz = camera.position.z;
-    const m = clipM.elements;
-    const pinnedNode = field.select;
-    const g = grid;
-    const loX = Math.max(0, Math.floor((cx - reach - g.minX) / g.cellX));
-    const hiX = Math.min(g.side - 1, Math.floor((cx + reach - g.minX) / g.cellX));
-    const loY = Math.max(0, Math.floor((cy - reach - g.minY) / g.cellY));
-    const hiY = Math.min(g.side - 1, Math.floor((cy + reach - g.minY) / g.cellY));
-    const loZ = Math.max(0, Math.floor((cz - reach - g.minZ) / g.cellZ));
-    const hiZ = Math.min(g.side - 1, Math.floor((cz + reach - g.minZ) / g.cellZ));
     let k = 0;
     let sawPinned = false;
-    for (let iz = loZ; iz <= hiZ; iz++) {
-      const z0 = g.minZ + iz * g.cellZ;
-      const dz0 = cz < z0 ? z0 - cz : cz > z0 + g.cellZ ? cz - (z0 + g.cellZ) : 0;
-      for (let iy = loY; iy <= hiY; iy++) {
-        const y0 = g.minY + iy * g.cellY;
-        const dy0 = cy < y0 ? y0 - cy : cy > y0 + g.cellY ? cy - (y0 + g.cellY) : 0;
-        if (dy0 * dy0 + dz0 * dz0 > r2) continue;
-        for (let ix = loX; ix <= hiX; ix++) {
-          const x0 = g.minX + ix * g.cellX;
-          const dx0 = cx < x0 ? x0 - cx : cx > x0 + g.cellX ? cx - (x0 + g.cellX) : 0;
-          if (dx0 * dx0 + dy0 * dy0 + dz0 * dz0 > r2) continue; // cell box outside the sphere
-          const cell = (iz * g.side + iy) * g.side + ix;
-          const lo = g.start[cell]!;
-          const hi = g.start[cell + 1]!;
-          for (let q = lo; q < hi; q++) {
-            const i = g.order[q]!;
-            const o = i * 3;
-            if (live) refreshViewOf(i); // follow the spin BEFORE gating — and the overlay
-            //                             and click target read this same refreshed slot
-            const wx = viewBuf[o]!;
-            const wy = viewBuf[o + 1]!;
-            const wz = viewBuf[o + 2]!;
-            const isPin = i === pinnedNode;
-            // view-forward depth: clip w ≡ −z_view for a standard perspective matrix —
-            // the same divisor the node shader sizes by (one pixel unit, §5)
-            const cw = m[3]! * wx + m[7]! * wy + m[11]! * wz + m[15]!;
-            if (cw <= 0 && !isPin) continue; // behind the nose
-            let dist = cw;
-            if (cw <= 0) {
-              // a pinned node behind the camera: any positive stand-in — the pin path
-              // bypasses every distance gate, this only keeps the column sane
-              const dx = wx - cx;
-              const dy = wy - cy;
-              const dz = wz - cz;
-              dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
-            }
-            const ppx = projectedPx(field.sizeOf(i) * NODE_SCALE * field.boostOf(i), dist, fovPx);
-            if (ppx < ladder.config.namedPx && !isPin) continue; // a mote and nothing more
-            let cur = Infinity;
-            if (cw > 0) {
-              const ndx = (m[0]! * wx + m[4]! * wy + m[8]! * wz + m[12]!) / cw;
-              const ndy = (m[1]! * wx + m[5]! * wy + m[9]! * wz + m[13]!) / cw;
-              if (
-                (ndx < -NDC_MARGIN_X || ndx > NDC_MARGIN_X ||
-                  ndy < -NDC_MARGIN_Y || ndy > NDC_MARGIN_Y) &&
-                !isPin
-              ) {
-                continue;
-              }
-              if (pointerActive) {
-                const sx = (ndx * 0.5 + 0.5) * W - px;
-                const sy = (-ndy * 0.5 + 0.5) * H - py;
-                cur = Math.hypot(sx, sy);
-              }
-            }
-            if (k >= candCap) growCand(k + 1);
-            candNode[k] = i;
-            candPx[k] = ppx;
-            candDist[k] = dist;
-            candCur[k] = cur;
-            nearStamp[i] = nearEpoch; // the far merge below must not re-admit this node
-            if (isPin) sawPinned = true;
-            k++;
-          }
-        }
-      }
-    }
-
-    /* ---- the far sweep: advance one slice, then merge the published set. Membership is
-       ≤ a generation stale; EVERYTHING ELSE is fresh — each far node is re-projected here
-       every frame (≤ FAR_CAP of them), so rank, cursor pull and distance are live. */
-    farSlice(fovPx, slack, dCard);
-    for (let f = 0; f < farCount; f++) {
-      const i = farNode[f]!;
-      if (nearStamp[i] === nearEpoch || i === pinnedNode) continue; // pin appended below
+    for (let i = 0; i < n; i++) {
+      if (i === closeOrbit) continue;
       if (live) refreshViewOf(i);
       const o = i * 3;
       const wx = viewBuf[o]!;
       const wy = viewBuf[o + 1]!;
       const wz = viewBuf[o + 2]!;
+      const isPin = i === pinnedNode;
+      // view-forward depth: clip w ≡ −z_view — the same divisor the node shader sizes by
       const cw = m[3]! * wx + m[7]! * wy + m[11]! * wz + m[15]!;
-      if (cw <= 0) continue; // drifted behind the nose since admission
-      const ppx = projectedPx(field.sizeOf(i) * NODE_SCALE * field.boostOf(i), cw, fovPx);
-      if (ppx < ladder.config.namedPx) continue; // fell under the gate — re-earns next sweep
-      const ndx = (m[0]! * wx + m[4]! * wy + m[8]! * wz + m[12]!) / cw;
-      const ndy = (m[1]! * wx + m[5]! * wy + m[9]! * wz + m[13]!) / cw;
-      if (ndx < -NDC_MARGIN_X || ndx > NDC_MARGIN_X || ndy < -NDC_MARGIN_Y || ndy > NDC_MARGIN_Y) {
-        continue;
+      if (cw <= 0 && !isPin) continue;
+      let dist = cw;
+      if (cw <= 0) {
+        const dx = wx - cx;
+        const dy = wy - cy;
+        const dz = wz - cz;
+        dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
       }
+      const ppx = projectedPx(field.sizeOf(i) * NODE_SCALE * field.boostOf(i), dist, fovPx);
+      if (ppx < ladder.config.namedPx && !isPin) continue;
       let cur = Infinity;
-      if (pointerActive) {
-        const sx = (ndx * 0.5 + 0.5) * W - px;
-        const sy = (-ndy * 0.5 + 0.5) * H - py;
-        cur = Math.hypot(sx, sy);
+      if (cw > 0) {
+        const ndx = (m[0]! * wx + m[4]! * wy + m[8]! * wz + m[12]!) / cw;
+        const ndy = (m[1]! * wx + m[5]! * wy + m[9]! * wz + m[13]!) / cw;
+        if (
+          (ndx < -NDC_MARGIN_X || ndx > NDC_MARGIN_X || ndy < -NDC_MARGIN_Y || ndy > NDC_MARGIN_Y) &&
+          !isPin
+        ) {
+          continue;
+        }
+        if (centerMode) {
+          // distance from the canvas centre (W/2, H/2) to the node, CSS px:
+          //   nodeX − W/2 = (ndx·0.5+0.5)·W − W/2 = ndx·0.5·W, likewise nodeY − H/2 = −ndy·0.5·H.
+          const sx = ndx * 0.5 * W;
+          const sy = ndy * 0.5 * H;
+          cur = Math.hypot(sx, sy);
+        } else if (pointerActive) {
+          const sx = (ndx * 0.5 + 0.5) * W - px;
+          const sy = (-ndy * 0.5 + 0.5) * H - py;
+          cur = Math.hypot(sx, sy);
+        }
       }
       if (k >= candCap) growCand(k + 1);
       candNode[k] = i;
       candPx[k] = ppx;
-      candDist[k] = cw;
+      candDist[k] = dist;
       candCur[k] = cur;
-      nearStamp[i] = nearEpoch;
+      if (isPin) sawPinned = true;
       k++;
     }
-
     if (pinnedNode >= 0 && !sawPinned) {
-      // a pin outranks the walk: report its true depth so its card tier is honest
       if (live) refreshViewOf(pinnedNode);
       const o = pinnedNode * 3;
       const wx = viewBuf[o]!;
@@ -971,7 +1820,7 @@ async function main(): Promise<void> {
       const dz = wz - cz;
       if (k >= candCap) growCand(k + 1);
       candNode[k] = pinnedNode;
-      candPx[k] = 0; // the ladder's pin path bypasses the px gate anyway
+      candPx[k] = 0;
       candDist[k] = cw > 0 ? cw : Math.sqrt(dx * dx + dy * dy + dz * dz);
       candCur[k] = Infinity;
       k++;
@@ -979,7 +1828,6 @@ async function main(): Promise<void> {
     return k;
   }
 
-  // the overlay's per-frame view: stable references, fields refreshed in the loop
   const overlayView = {
     matrix: clipM.elements,
     positions: viewBuf,
@@ -989,8 +1837,7 @@ async function main(): Promise<void> {
   };
   let lastCand = 0;
 
-  /* ---- hover: cast at most once per frame, from the latest cursor position, and only
-     while the view is settled (the grid is only valid then — see the header). */
+  /* ---- hover: once per frame at most, suppressed mid-morph and mid-flight. -------------- */
   let W = window.innerWidth;
   let H = window.innerHeight;
   let px = 0;
@@ -1004,8 +1851,6 @@ async function main(): Promise<void> {
       .sub(camera.position)
       .normalize();
     return pickRay(grid, camera.position, RAY, {
-      // The shader's own sizing, constant for constant, so the hit disc IS the drawn disc
-      // (one CSS-pixel unit shared by shader, picker and ladder — DESIGN.md §5).
       tanHalf: Math.tan((liveFov * Math.PI) / 360),
       halfH: H / 2,
       sizeScale: NODE_SCALE,
@@ -1015,22 +1860,20 @@ async function main(): Promise<void> {
       dRef,
       sizeOf: (i: number): number => field.sizeOf(i),
       boostOf: (i: number): number => field.boostOf(i),
-      // widened while spinning: the grid's positions lag the drawn ones by at most this
-      // (the port's gridDrift trade — a wider walk beats a click that does nothing)
       drift: gridDrift,
     });
   }
 
   function hover(i: number): void {
-    if (field.setHover(i)) updateOverlay();
+    if (field.setHover(i)) updateStats();
   }
 
   canvas.addEventListener('pointermove', (ev: PointerEvent): void => {
     px = ev.clientX;
     py = ev.clientY;
     pickDue = true;
-    pointerActive = true; // attention follows the cursor (ladder scoring)
-    cursorMoved = true; // and a real move is what clears a retreat()'s suspension
+    pointerActive = true;
+    cursorMoved = true;
   });
   canvas.addEventListener('pointerleave', (): void => {
     pickDue = false;
@@ -1038,49 +1881,405 @@ async function main(): Promise<void> {
     hover(-1);
   });
 
-  /* ---- select. CAPTURE phase: the orbit camera resolves its own gesture from a bubble-phase
-     pointerup on the canvas, so the host must read consumeClick before that listener resets
-     the gesture state. The flycam leaves pointerup entirely to the host. */
+  /* ======================================================================================
+   * SELECTION MODEL (COMPARISON.md F1): a click is an APPROACH. The baseline's rule, ported:
+   * selecting a page exists to show what it connects to, so the camera flies in and frames
+   * the whole neighbourhood — stand-off from the neighbours' own spread, clamped so a leaf
+   * page does not put you inside it and a 400-link hub does not fling you across the vault.
+   * ====================================================================================== */
+
+  function viewVecOf(i: number): Vector3 {
+    if (!fieldSettledNow && !morphing) refreshViewOf(i);
+    return new Vector3(viewBuf[i * 3]!, viewBuf[i * 3 + 1]!, viewBuf[i * 3 + 2]!);
+  }
+
+  function focusDistance(i: number): number {
+    const p = viewVecOf(i);
+    let far = 0;
+    const nb = neighbours(graph, i);
+    for (let k = 0; k < nb.length; k++) {
+      const d = viewVecOf(nb[k]!).distanceTo(p);
+      if (d > far) far = d;
+    }
+    const sp = spacing * field.spread;
+    const vfov = (liveFov * Math.PI) / 360;
+    const hfov = Math.atan(Math.tan(vfov) * camera.aspect);
+    const need = (far / Math.sin(Math.min(vfov, hfov))) * 0.62;
+    return Math.min(
+      Math.max(need, ladder.config.openSpacings * sp * 1.6),
+      ladder.config.cardSpacings * sp * 9,
+    );
+  }
+
+  /** Deselecting from close up RETREATS past the card threshold (the demo's rule: a closed
+   *  page must shrink into the point it came from, or the next cursor move reopens it). */
+  function retreatFrom(was: number): void {
+    if (!fly || was < 0) return;
+    const p = viewVecOf(was);
+    const dCard = ladder.config.cardSpacings * spacing * field.spread;
+    if (camera.position.distanceTo(p) < dCard * 1.05) fly.goTo(p, dCard * 1.7, 800);
+  }
+
+  function selectNode(i: number): void {
+    const was = field.select;
+    leaveCloseOrbit(); // a plain (single-click) select leaves close-orbit mode: pin + read as usual
+    field.setSelect(i);
+    paintSelected(i);
+    if (i >= 0) {
+      const t = viewVecOf(i);
+      // the node becomes the orbit target, so drift turns the neighbourhood around it
+      cam.setTarget(t, false);
+      if (fly) fly.goTo(t, focusDistance(i), 950);
+    } else if (was >= 0) {
+      retreatFrom(was);
+    }
+    updateStats();
+  }
+
+  /** DOUBLE-CLICK: fly into a TIGHT orbit of a SINGLE node — close enough that the node fills a
+   *  good part of the view, not the whole neighbourhood (that is single-click's focusDistance).
+   *  The node becomes the orbit pivot (cam.setTarget), so dragging circles it and Space/turntable
+   *  auto-orbits it; the wheel then dollies even closer (the lowered zoomRange floor). It stays
+   *  SELECTED (highlight + side panel) but its reading card is kept unpinned/suspended — see the
+   *  closeOrbit handling in the render loop — so the node you are circling is never obscured. */
+  function flyCloseOrbit(i: number): void {
+    if (!fly || i < 0) return;
+    closeOrbit = i;
+    // No node-clamp lift any more: the px cap is OFF globally (library default uncapped), so the
+    // node already grows without bound as you wheel in. Double-click only re-targets the orbit
+    // onto this node (so dragging circles it) and suspends its card — growth is no longer tied to
+    // orbit (Fix 3).
+    field.setSelect(i);
+    paintSelected(i);
+    ladder.retreat(); // drop any card open right now; the loop holds it suspended while orbiting
+    const t = viewVecOf(i);
+    cam.setTarget(t, false);
+    // Land close (the dolly floor is now nose-to-node, so the wheel takes it the rest of the way
+    // to a full-frame fill). zoomRange() already reflects closeOrbit — floor is tiny here.
+    const tightRadius = Math.max(spacing * field.spread * 0.9, zoomRange()[0] * 1.2);
+    fly.goTo(t, tightRadius, 700);
+    updateStats();
+  }
+
+  /* ---- select (capture phase — see the demo's note on orbit's bubble-phase pointerup). -- */
   window.addEventListener(
     'pointerup',
     (ev: PointerEvent): void => {
       const wasClick = cam.consumeClick(ev);
       if (!wasClick || ev.target !== canvas) return;
-      if (morphing) return; // base positions are mid-retarget; a wrong select is worse than none
-      const i = castAt(ev.clientX, ev.clientY); // THIS event's coordinate, never the last move's
-      field.setSelect(i);
-      if (i >= 0) {
-        // The node becomes the orbit pivot — the camera stays put (keepRadius false), so a
-        // click re-aims what dragging turns around without jumping the view. viewBuf holds
-        // where the node is DRAWN — refreshed through the live frame chain while spinning.
-        if (!fieldSettledNow) refreshViewOf(i);
-        cam.setTarget(new Vector3(viewBuf[i * 3]!, viewBuf[i * 3 + 1]!, viewBuf[i * 3 + 2]!), false);
+      if (morphing) return;
+      selectNode(castAt(ev.clientX, ev.clientY));
+    },
+    true,
+  );
+
+  /* DOUBLE-CLICK a node → fly into a TIGHT orbit of just that node (flyCloseOrbit). This is a
+     window-level listener (capture) that resolves the node with castAt from the pointer, not from
+     the DOM target, so it fires over the canvas AND over a reading card sitting on the node —
+     "read a page, then double-click it to circle it". The single-click above still fires first
+     (select + neighbourhood framing); the double-click REFINES it, redirecting the in-flight goTo
+     to the close orbit and dropping the card. Clicks on the control UI (panel, side panel, config,
+     stats) and on wiki-links are left alone. */
+  window.addEventListener(
+    'dblclick',
+    (ev: MouseEvent): void => {
+      if (morphing) return;
+      const t = ev.target as HTMLElement | null;
+      if (
+        t &&
+        (t.closest('#panel') ||
+          t.closest('.ss-cfg') ||
+          t.closest('#selpanel') ||
+          t.closest('#stats') ||
+          t.closest('#error') ||
+          t.closest('a'))
+      ) {
+        return;
       }
-      updateOverlay();
+      const i = castAt(ev.clientX, ev.clientY);
+      if (i >= 0) flyCloseOrbit(i);
     },
     true,
   );
 
   window.addEventListener('keydown', (ev: KeyboardEvent): void => {
+    const typing = (): boolean => {
+      const tag = (document.activeElement as HTMLElement | null)?.tagName;
+      return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT';
+    };
     if (ev.key === 'Escape') {
-      // Escape = close + retreat + unpin (the port's deselect-from-close-up, main.js
-      // ~189): close the open slot, suspend auto-open, clear the selection (the pin is
-      // the select state) — and fly the CAMERA back past the card threshold so the open
-      // page shrinks into the point it came from. Without the flight the locked card
-      // keeps filling the screen, and the next cursor move (which clears the suspension
-      // — that is user intent) would reopen the very page Escape just closed.
+      if (!legendEl.hasAttribute('hidden')) {
+        toggleLegend(false); // Escape closes the keys legend first
+        return;
+      }
+      // close + retreat + unpin (retreatFrom carries the demo's shrink-back rule)
+      leaveCloseOrbit(); // Escape also leaves close-orbit mode (and restores the node clamp)
       const was = ladder.state.open >= 0 ? ladder.state.open : field.select;
       ladder.retreat();
-      if (field.setSelect(-1)) updateOverlay();
-      if (fly && was >= 0) {
-        if (!fieldSettledNow && !morphing) refreshViewOf(was);
-        const o = was * 3;
-        const p = new Vector3(viewBuf[o]!, viewBuf[o + 1]!, viewBuf[o + 2]!);
-        const dCard = ladder.config.cardSpacings * spacing * field.spread;
-        if (camera.position.distanceTo(p) < dCard * 1.05) fly.goTo(p, dCard * 1.7, 800);
-      }
+      paintSelected(-1);
+      if (field.setSelect(-1)) updateStats();
+      retreatFrom(was);
+    }
+    // '/' focuses the node search, as its placeholder promises (never while typing)
+    if (ev.key === '/' && !typing()) {
+      ev.preventDefault();
+      ui.search.focus();
+    }
+    // '~' (backquote) toggles the full schema tuning panel, as the button title promises
+    if ((ev.key === '~' || ev.key === '`') && !typing()) {
+      ev.preventDefault();
+      panel.toggle();
     }
   });
+
+  /* ======================================================================================
+   * THE SELECTED-PAGE PANEL (COMPARISON.md F5): what this page connects to, as clickable
+   * chips — the panel the open body's wiki-links complement, not replace.
+   * ====================================================================================== */
+
+  const escHtml = (s: unknown): string =>
+    String(s ?? '').replace(
+      /[&<>"]/g,
+      (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c]!,
+    );
+  const layerCss = (li: number): string => {
+    const c = V.layerColorsByName[V.layerNames[li] ?? ''] ?? [0.6, 0.62, 0.66];
+    return `rgb(${Math.round(c[0] * 255)},${Math.round(c[1] * 255)},${Math.round(c[2] * 255)})`;
+  };
+
+  function paintSelected(i: number): void {
+    const p = ui.selpanel;
+    if (i < 0) {
+      p.classList.remove('on');
+      p.innerHTML = '';
+      return;
+    }
+    const li = typeFacet.data[i]!;
+    const deg = graph.columns['degree']!.data[i] ?? 0;
+    const regionName = V.regions[graph.facets[V.regionFacet]!.data[i]!]?.name ?? '—';
+    const nb = neighbours(graph, i);
+    const chips: string[] = [];
+    const cap = Math.min(nb.length, 24);
+    for (let k = 0; k < cap; k++) {
+      const j = nb[k]!;
+      chips.push(
+        `<button class="chip" data-i="${j}"><i style="background:${layerCss(
+          typeFacet.data[j]!,
+        )}"></i>${escHtml(graph.labelOf(j))}</button>`,
+      );
+    }
+    p.innerHTML =
+      `<div class="s-h"><i style="background:${layerCss(li)}"></i>${escHtml(graph.labelOf(i))}</div>` +
+      `<div class="s-m">${escHtml(V.layerNames[li])} · ${deg} links · region “${escHtml(regionName)}”</div>` +
+      (V.summaries[i] ? `<div class="s-s">${escHtml(V.summaries[i])}</div>` : '') +
+      `<div class="s-n">${chips.join('')}</div>`;
+    p.classList.add('on');
+    p.querySelectorAll<HTMLButtonElement>('.chip').forEach((b) => {
+      b.addEventListener('click', (ev) => {
+        ev.stopPropagation();
+        selectNode(Number(b.dataset['i']));
+      });
+    });
+  }
+
+  /* ======================================================================================
+   * PAGE SEARCH (COMPARISON.md F2): the baseline's "find a page /" — substring match over
+   * the real labels, hits sorted by degree, a click selects and flies the neighbourhood in.
+   * ====================================================================================== */
+
+  // graph.labelOf either way (vault labels are an array behind it, synth labels a closure —
+  // never 10⁶ eager lowered strings; the scan early-exits at 12 hits).
+  ui.search.addEventListener('input', () => {
+    const v = ui.search.value.trim().toLowerCase();
+    ui.hits.innerHTML = '';
+    if (v.length < 2) {
+      ui.hits.classList.remove('on');
+      return;
+    }
+    const deg = graph.columns['degree']!.data;
+    const out: number[] = [];
+    for (let i = 0; i < n && out.length < 12; i++) {
+      if (graph.labelOf(i).toLowerCase().includes(v)) out.push(i);
+    }
+    out.sort((a, b) => (deg[b] ?? 0) - (deg[a] ?? 0));
+    for (const i of out) {
+      const b = document.createElement('button');
+      b.innerHTML =
+        `<i class="dot" style="background:${layerCss(typeFacet.data[i]!)}"></i>` +
+        `<span>${escHtml(graph.labelOf(i))}</span><b>${deg[i] ?? 0}</b>`;
+      b.addEventListener('click', () => {
+        ui.hits.classList.remove('on');
+        ui.hits.innerHTML = '';
+        ui.search.value = '';
+        ui.search.blur();
+        selectNode(i);
+      });
+      ui.hits.appendChild(b);
+    }
+    ui.hits.classList.toggle('on', out.length > 0);
+  });
+  ui.search.addEventListener('keydown', (ev) => {
+    ev.stopPropagation(); // Escape here clears the search, never closes an open page
+    if (ev.key === 'Escape') {
+      ui.search.value = '';
+      ui.hits.classList.remove('on');
+      ui.hits.innerHTML = '';
+      ui.search.blur();
+    }
+    if (ev.key === 'Enter') {
+      (ui.hits.querySelector('button') as HTMLButtonElement | null)?.click();
+    }
+  });
+
+  /* ======================================================================================
+   * REGIONS (COMPARISON.md F3): named labels over the field — visible from outside a
+   * region, gone once you are inside and its pages name themselves — plus the fly-to list.
+   * Region centres: meta3's own measured centres in the frozen layout; the level-0 pivots
+   * when a hierarchy groups by region; NOTHING in ringGlobal/force, where a region has no
+   * place (the labels and the list hide rather than point at fiction).
+   * ====================================================================================== */
+
+  interface RegionView {
+    x: number;
+    y: number;
+    z: number;
+    r: number;
+  }
+  let regionViews: RegionView[] = [];
+  let regionsValid = false;
+
+  const regionEls = V.regions.map((r) => {
+    const el = document.createElement('div');
+    el.className = 'rl';
+    el.innerHTML = `<b>${escHtml(r.name)}</b><i>${r.count} nodes</i>`;
+    ui.regionLabels.appendChild(el);
+    return el;
+  });
+
+  function computeRegionViews(): void {
+    if (hierarchy === null) {
+      regionViews = V.regions.map((r) => ({
+        x: r.centre[0],
+        y: r.centre[1],
+        z: r.centre[2],
+        r: r.radius,
+      }));
+      regionsValid = true;
+    } else if (regionHierarchy) {
+      // level-0 pivot per region value, found by walking one member node's pivot chain
+      const pv = hierarchy.pivots;
+      const regData = graph.facets[V.regionFacet]!.data;
+      const views: (RegionView | null)[] = V.regions.map(() => null);
+      let missing = views.length;
+      for (let i = 0; i < n && missing > 0; i++) {
+        const v = regData[i]!;
+        if (views[v]) continue;
+        let p = hierarchy.nodePivot[i]!;
+        while (pv.level[p]! > 0) p = pv.parent[p]!;
+        views[v] = {
+          x: pv.world[p * 3]!,
+          y: pv.world[p * 3 + 1]!,
+          z: pv.world[p * 3 + 2]!,
+          r: pv.radius[p]!,
+        };
+        missing--;
+      }
+      regionViews = views.map((w) => w ?? { x: 0, y: 0, z: 0, r: 0 });
+      regionsValid = true;
+    } else {
+      regionsValid = false;
+    }
+    ui.regionsBox.style.display = regionsValid ? '' : 'none';
+    if (!regionsValid) for (const el of regionEls) el.style.opacity = '0';
+  }
+
+  function flyToRegion(k: number): void {
+    if (!regionsValid || !fly) return;
+    const rv = regionViews[k]!;
+    const C = field.centroid();
+    const s = field.spread;
+    const t = new Vector3(
+      C[0] + (rv.x - C[0]) * s,
+      C[1] + (rv.y - C[1]) * s,
+      C[2] + (rv.z - C[2]) * s,
+    );
+    fly.goTo(t, Math.max(rv.r * s * 2.3, spacing * s * 6), 1100);
+  }
+
+  V.regions.forEach((r, k) => {
+    const b = document.createElement('button');
+    b.className = 'reg';
+    b.innerHTML = `<i style="background:${layerCss(r.layer)}"></i><span>${escHtml(r.name)}</span><b>${r.count}</b>`;
+    b.addEventListener('click', () => flyToRegion(k));
+    ui.regionList.appendChild(b);
+  });
+  computeRegionViews();
+
+  /** Projected-span fades, the baseline's constants: in at REGION_IN px of projected region
+   *  diameter, gone by REGION_OUT (by then its pages label themselves); overlapping labels
+   *  cull first-come. Hidden mid-morph — centres describe the TARGET arrangement. */
+  const REGION_IN = 55;
+  const REGION_OUT = 1500;
+  const regionBoxes: { x: number; y: number; w: number; h: number }[] = [];
+  function updateRegionLabels(): void {
+    if (!regionsValid || morphing) {
+      if (regionsValid) for (const el of regionEls) el.style.opacity = '0';
+      return;
+    }
+    const m = clipM.elements;
+    const C = field.centroid();
+    const s = field.spread;
+    const tanHalf = Math.tan((liveFov * Math.PI) / 360);
+    regionBoxes.length = 0;
+    for (let k = 0; k < regionEls.length; k++) {
+      const el = regionEls[k]!;
+      const rv = regionViews[k]!;
+      const wx = C[0] + (rv.x - C[0]) * s;
+      const wy = C[1] + (rv.y - C[1]) * s;
+      const wz = C[2] + (rv.z - C[2]) * s;
+      const cw = m[3]! * wx + m[7]! * wy + m[11]! * wz + m[15]!;
+      if (cw <= 0) {
+        el.style.opacity = '0';
+        continue;
+      }
+      const ndx = (m[0]! * wx + m[4]! * wy + m[8]! * wz + m[12]!) / cw;
+      const ndy = (m[1]! * wx + m[5]! * wy + m[9]! * wz + m[13]!) / cw;
+      if (ndx < -1.1 || ndx > 1.1 || ndy < -1.15 || ndy > 1.15) {
+        el.style.opacity = '0';
+        continue;
+      }
+      const span = (2 * rv.r * s * (H / 2)) / (tanHalf * Math.max(cw, 1));
+      const RG_FULL = REGION_IN * 2.7;
+      const a = Math.min(
+        (span - REGION_IN) / Math.max(RG_FULL - REGION_IN, 1),
+        Math.max(0, 1 - (span - REGION_OUT) / REGION_OUT),
+      );
+      if (a <= 0.02) {
+        el.style.opacity = '0';
+        continue;
+      }
+      const x = (ndx * 0.5 + 0.5) * W;
+      const y = (-ndy * 0.5 + 0.5) * H;
+      const ew = el.offsetWidth || 120;
+      const eh = el.offsetHeight || 26;
+      const bx = x - ew / 2;
+      const by = y - eh / 2;
+      let hit = false;
+      for (const bb of regionBoxes) {
+        if (bx < bb.x + bb.w && bx + ew > bb.x && by < bb.y + bb.h && by + eh > bb.y) {
+          hit = true;
+          break;
+        }
+      }
+      if (hit) {
+        el.style.opacity = '0';
+        continue;
+      }
+      regionBoxes.push({ x: bx, y: by, w: ew, h: eh });
+      el.style.transform = `translate3d(${Math.round(bx)}px,${Math.round(by)}px,0)`;
+      el.style.opacity = String(Math.min(1, a));
+    }
+  }
 
   window.addEventListener('resize', () => {
     W = window.innerWidth;
@@ -1088,48 +2287,19 @@ async function main(): Promise<void> {
     renderer.setSize(W, H);
     camera.aspect = W / H;
     camera.updateProjectionMatrix();
-    field.resize(H); // CSS px — the shared pixel unit
+    field.resize(H);
+    post.setSize(W, H); // the HDR/bloom targets track the renderer; this lands it same-frame
   });
 
-  /* =========================================================================================
-   * THE ROUTING TABLE (stage 8) — the ONE place a config key meets its subsystem.
-   *
-   * The panel knows no key's meaning (it renders schema rows); the store knows no subsystem
-   * (it validates and persists); every key's effect is decided HERE, once. Three kinds:
-   *
-   *   LIVE — takes effect the tick you drag. Routes: a field setter (blend, tonemap,
-   *     exposure, link budget, colour column, spread), a channel-buffer rewrite through the
-   *     public objects (node sizes, facet/uniform colours — the iSize/iColor arrays are the
-   *     field's own buffers, so picker and ladder follow for free), a ladder.config write
-   *     (thresholds and the label band are read fresh every update), a ladder REBUILD for
-   *     the four keys that size fixed buffers or freeze the overlay rect (labelCap,
-   *     maxCards, lockW, lockH — an event, never per frame), a flycam-config write (read
-   *     live every frame by design), the pivot-table rate write (levelSpin), the scene
-   *     ground, or the renderer's pixel ratio (renderScale).
-   *
-   *   BOOT — read once at createField(): the five focus alphas (linkBase, linkFocus,
-   *     linkHover, linkDim, dimOthers) are baked into the focus state. The knob validates,
-   *     persists and exports like any other; a change lands on the next reload.
-   *
-   *   NONE (yet) — the schema ships the knob (§7) but this library version bakes the
-   *     constant into the TSL material at build time (field/nodes.ts, links.ts): nodeMinPx,
-   *     nodeMaxPx, falloff, bodyR, haloPx, haloGain, coreHot, lenSoft, lenFloor.
-   *     The §5 shader-hook tier is the seam they will route through; listed so the gap is
-   *     explicit, not silent (§10.4's spirit). flatPx graduated to LIVE at stage 9
-   *     (field.setFlatPx — the boot quality notch's LOD lever).
-   * ======================================================================================= */
+  /* ======================================================================================
+   * THE ROUTING TABLE — one place a config key meets its subsystem (the demo's pattern).
+   * ====================================================================================== */
 
   const linkTotal = field.stats().links.total;
-  const colorFacetKey = Object.keys(graph.facets)[0]!; // the field's own default facet
-  /* The uniform hue and the light ground are LIBRARY data now (theme/palettes UNIFORM_RGB,
-     field/constants BG_LIGHT): the shipped 'blueprint' and 'paper' presets lean on them, so
-     a host inventing its own values made the same named look render differently per app. */
+  const typeFacet = graph.facets['type']!;
 
-  /* -- nodes: size channel × contrast curve × scale, folded into the iSize buffer. The
-     shader's radius is iSize × NODE_SCALE (baked), so writing channel × (nodeScale /
-     NODE_SCALE) draws channel × nodeScale exactly — and field.sizeOf (same array) keeps the
-     picker, the candidate walk and the ladder on the drawn disc. The channel buffer is
-     cached so dragging `nodeScale` rescales without re-ranking the column. */
+  /* -- nodes: channel × curve × scale into the iSize buffer (field.sizeOf reads the same
+     array, so picker and ladder stay on the drawn disc). */
   const sizeBuf = sizeAttr.array as Float32Array;
   let sizeChannelKey = '';
   let sizeCurveVal = NaN;
@@ -1141,31 +2311,16 @@ async function main(): Promise<void> {
       baseSizes =
         channel === 'uniform'
           ? uniformSizes(n)
-          : sizesFromColumn(graph.columns['degree']!.data, n, curve);
+          : sizesFromColumn(graph.columns[channel]!.data, n, curve);
       sizeChannelKey = channel;
       sizeCurveVal = curve;
     }
     const k = num('nodeScale') / NODE_SCALE;
-    maxSizeWorld = 0;
-    for (let i = 0; i < n; i++) {
-      const s = baseSizes[i]! * k;
-      sizeBuf[i] = s;
-      if (s > maxSizeWorld) maxSizeWorld = s;
-    }
+    for (let i = 0; i < n; i++) sizeBuf[i] = baseSizes[i]! * k;
     sizeAttr.needsUpdate = true;
-    // the far sweep prunes cells by their size maximum — the bound follows the channel
-    // (an event, never per frame; same pinned-slab guard as rebuildGrid)
-    gridCellMax = cellMaxOf(
-      grid,
-      (i) => field.sizeOf(i),
-      gridCellMax === sweepCellMax ? undefined : gridCellMax,
-    );
   };
 
-  /* -- links take their endpoints' colours (field.ts rule) — after a demo-side node repaint
-     the RGB lanes are rewritten the same way. RGB ONLY: every alpha slot belongs to the
-     focus state, and a sweep is ONE whole-buffer range (never a bare version bump — the
-     field's own upload discipline). */
+  /* -- links take their endpoints' colours; RGB lanes only, one whole-buffer range. */
   const rewriteLinkRGB = (): void => {
     const colors = colorAttr.array as Float32Array;
     const lc = linkColorAttr.array as Float32Array;
@@ -1187,14 +2342,32 @@ async function main(): Promise<void> {
     linkColorAttr.needsUpdate = true;
   };
 
-  /* -- colour: three modes, one writer. 'column' goes through the library (setColorColumn
-     rank-normalises degree through the ramp and recolours the links itself); 'facet' binds
-     the demo's facet through the chosen palette (golden = the generator, names = theme
-     data); 'uniform' is one flat hue. */
+  /* -- colour: 'column' through the library; 'facet' through a palette, where 'vault' is the
+     data's own layer palette — meta3.layerColors through namedPaletteBuffer; 'uniform' flat. */
   const applyColors = (): void => {
     const mode = str('colorMode');
     if (mode === 'column') {
       field.setColorColumn('degree', str('ramp') as RampName);
+      return;
+    }
+    if (mode === 'density') {
+      // LOCAL SPATIAL DENSITY through the library (field/density.ts): the field computes a
+      // per-node neighbourhood count off the CURRENT target geometry and ranks it through the
+      // ramp — crowded hot, sparse cool, white cores. It recolours itself on every arrange change
+      // (setHierarchy/setTarget), so the look follows a morph without this being re-run; the link
+      // RGB is rewritten inside the library, no site-side rewriteLinkRGB needed.
+      field.setColorByDensity(str('ramp') as RampName);
+      return;
+    }
+    if (mode === 'facet' && str('colorOrder') === 'spatial') {
+      // SPATIAL facet order (F1): the library projects the chosen facet's value centroids onto their
+      // dominant spatial axis and colours each cluster by that projection through the ramp, so
+      // spatially-adjacent clusters share hue (a smooth, seam-free gradient). Position-dependent, so
+      // it recolours itself on every arrange change (setHierarchy/setTarget) — and the link RGB is
+      // rewritten inside the library, no site-side rewriteLinkRGB needed. The palette control is
+      // inert here (ramp drives it); colorInertKeys() greys it to say so.
+      const facetKey = str('colorFacet');
+      field.setColorFacetSpatial(graph.facets[facetKey] ? facetKey : 'type', str('ramp') as RampName);
       return;
     }
     const colors = colorAttr.array as Float32Array;
@@ -1205,31 +2378,68 @@ async function main(): Promise<void> {
         colors[i * 3 + 2] = UNIFORM_RGB[2];
       }
     } else {
-      const facet = graph.facets[colorFacetKey]!;
+      // WHICH facet colours the field is the user's choice (the 'colour facet' picker, widened
+      // from the live graph) — default 'type', today's behaviour. The palette is built from the
+      // CHOSEN facet's values and painted by its data, exactly the field's own facet-colour path.
+      const facetKey = str('colorFacet');
+      const facet = graph.facets[facetKey] ?? typeFacet;
       const name = str('palette');
       const pal =
-        name === 'golden'
-          ? facetPalette(facet.values.length)
-          : paletteBuffer(PALETTES[name as PaletteName], facet.values.length);
+        name === 'vault'
+          ? // the vault's named layer colours key on the 'type' facet's value names; for any
+            // other facet those names don't match, so fall back to the golden generator there.
+            facet === typeFacet
+            ? namedPaletteBuffer(facet.values, V.layerColorsByName, [0.6, 0.62, 0.66])
+            : facetPalette(facet.values.length)
+          : name === 'golden'
+            ? facetPalette(facet.values.length)
+            : paletteBuffer(PALETTES[name as PaletteName], facet.values.length);
       paintFacetColors(facet.data, n, pal, colors);
     }
     colorAttr.needsUpdate = true;
     rewriteLinkRGB();
   };
 
-  /* -- the ground. The scene owns the background (the field only ships its default), and the
-     chrome follows the ground — a light field under dark-ground labels is not a theme, it is
-     unreadable (the predecessor's paintGround). Blending is its OWN key: the §5 rule
-     "blending follows the ground" is the presets' job, enforced by the theme tests. */
+  /* -- which of the 'palette' / 'colour ramp' controls has NO live effect in the current colour
+     mode, so the panel can GREY the dead one (Fix 2). Exactly one of the two ever drives the
+     colour: the categorical PALETTE drives only facet + value order; the RAMP drives column,
+     density, and facet + spatial order; 'uniform' is a flat hue and uses neither. Greying the
+     inapplicable control stops the "I changed the palette and nothing happened" confusion — the
+     value still saves and rides looks, it just can't move the field from here. Recomputed live
+     whenever colorMode / colorOrder change (routeKey / onBulk below). */
+  const colorInertKeys = (): string[] => {
+    const mode = str('colorMode');
+    if (mode === 'uniform') return ['palette', 'ramp']; // flat hue — neither drives
+    if (mode === 'facet') return str('colorOrder') === 'spatial' ? ['palette'] : ['ramp'];
+    return ['palette']; // column | density — the ramp drives
+  };
+
+  /* -- 'center size' is meaningful ONLY when card attention is 'center'; in cursor mode it sizes a
+     region nothing is gated to, so grey it (the same inert-row convention as the colour controls:
+     the value still saves and rides looks, it just has no live effect here). */
+  const ladderInertKeys = (): string[] => (str('cardAttention') === 'center' ? [] : ['centerSize']);
+
+  /* The full inert set the panel paints. setInert REPLACES the set each call, so every caller must
+     pass the union — colour greying AND ladder greying — or flipping one would clear the other. */
+  const inertKeys = (): string[] => [...colorInertKeys(), ...ladderInertKeys()];
+
+  /* -- shape: bind the node glyph to a facet (library setShapeFacet). 'none' → all discs. The
+     glyphs only read as distinct at a decent node size / lower density, so this pairs with the
+     'node size' control. An independent channel from colour — the two do not interact. */
+  const applyShapeFacet = (): void => {
+    const key = str('shapeFacet');
+    field.setShapeFacet(key === 'none' || !graph.facets[key] ? null : key);
+  };
+
   const applyGround = (): void => {
-    const light = str('background') === 'light';
-    scene.background = new Color(light ? BG_LIGHT : field.background);
+    const bg = str('background');
+    const light = bg === 'light';
+    // 'black' is pure #000 (the nebula look's ground); 'dark' is the field's BG_DARK near-black.
+    const color = light ? BG_LIGHT : bg === 'black' ? BG_BLACK : field.background;
+    scene.background = new Color(color);
     document.body.classList.toggle('light', light);
   };
 
-  /* -- the ladder's live keys: thresholds and the label band are read fresh every
-     ladder.update, so mutating the resolved config routes them with no rebuild. The keep
-     band re-applies createLadder's clamp (keep ≥ earn — hysteresis cannot be negative). */
   const applyLadderCfg = (): void => {
     const c = ladder.config;
     c.namedPx = num('namedPx');
@@ -1240,10 +2450,17 @@ async function main(): Promise<void> {
     c.lockSpacings = num('tierLock');
     c.openSpacings = num('tierOpen');
     c.cardRadiusSpacings = num('cardRadius');
+    // master switches: the ladder reads these live every tick, so flipping one drops its tier the
+    // same frame (and emits the exits the overlay unmounts on) — no ladder rebuild needed.
+    c.showLabels = bool('showLabels');
+    c.showCards = bool('showCards');
+    c.showOpen = bool('showOpen');
+    // the attention gate is read live too: 'center' gates cards to a centreSize-px region, 'cursor'
+    // leaves it off. gatherCandidates independently switches the cursorPx anchor to match.
+    c.attentionGateRadiusPx =
+      str('cardAttention') === 'center' ? num('centerSize') : Number.POSITIVE_INFINITY;
   };
 
-  /* -- flight: the flycam reads flyCfg live every frame; the orbit cam has its own defaults
-     and no knobs here (?cam=orbit is a diagnostics mode). */
   const applyFlight = (): void => {
     flyCfg.speedK = num('speedK');
     flyCfg.mouseSens = num('mouseSens');
@@ -1256,93 +2473,169 @@ async function main(): Promise<void> {
   const applyBlend = (): void => {
     field.setBlend(str('blend') === 'additive' ? 'additive' : 'normal');
   };
+  /* The tonemap seam: with GLOW on the roll-off happens ONCE, post-sum, in the bloom chain, so
+     the field's in-material curve is bypassed ('none') to avoid tonemapping twice; with glow off
+     the field owns the curve exactly as before. One function, both paths — nothing can drift. */
   const applyTonemap = (): void => {
-    field.setTonemap(str('tonemap') as TonemapOp, num('exposure'));
+    const op = str('tonemap') as TonemapOp;
+    const exposure = num('exposure');
+    if (glow.on) {
+      post.setTonemap(op, exposure);
+      field.setTonemap('none');
+    } else {
+      field.setTonemap(op, exposure);
+    }
   };
+  /* Live bloom knobs → post.setBloom + the readout spans. */
+  const applyGlowParams = (): void => {
+    post.setBloom({ strength: glow.strength, radius: glow.radius, threshold: glow.threshold });
+    ui.glowStrengthv.textContent = glow.strength.toFixed(2);
+    ui.glowRadiusv.textContent = glow.radius.toFixed(2);
+    ui.glowThresholdv.textContent = glow.threshold.toFixed(2);
+  };
+  /* Highlight compression (PRE-bloom, post/bloom.ts). Unlike strength/radius/threshold it is a
+     CONFIG key (the nebula preset ships a moderate default, so the core shows structure out of
+     the box, and the tuning panel's "highlight compression" row edits the same value) — so the
+     store is the source of truth and this mirrors it into the glow-box slider. Only the post
+     chain reads it; with glow off it has no visible effect. */
+  const applyCompression = (): void => {
+    const c = num('compression');
+    post.setCompression(c);
+    ui.glowCompression.value = String(c);
+    ui.glowCompressionv.textContent = c.toFixed(2);
+  };
+  /* Turn the bloom on/off: reroute the tonemap (applyTonemap reads glow.on), reflect the UI,
+     persist. The render loop reads glow.on to pick post.render() vs renderer.render(). */
+  const setGlow = (on: boolean, persist = true): void => {
+    glow.on = on;
+    ui.glow.checked = on;
+    document.getElementById('glowbox')?.classList.toggle('on', on);
+    applyGlowParams();
+    applyTonemap();
+    if (persist) saveGlow();
+    updateStats();
+  };
+  /* -- links on/off (COMPARISON.md F5) composes with the budget: off is a budget of zero —
+     reported in the stats line like every drop (§10.4), never a hidden object. */
   const applyBudget = (): void => {
-    field.setLinkBudget(Math.round(num('linkBudget') * linkTotal));
+    field.setLinkBudget(ui.links.checked ? Math.round(num('linkBudget') * linkTotal) : 0);
   };
+  ui.links.addEventListener('change', () => {
+    applyBudget();
+    updateStats();
+  });
   const applySpread = (): void => {
-    field.setSpread(num('spread'), 0.15); // a short tween — lands EXACTLY on the slider value
+    field.setSpread(num('spread'), 0.15);
   };
   const applyRenderScale = (): void => {
     renderer.setPixelRatio(window.devicePixelRatio * num('renderScale'));
     renderer.setSize(W, H);
+    post.setSize(W, H); // the pixel ratio just changed — resize the HDR/bloom targets with it
   };
   const applyFlatPx = (): void => {
     field.setFlatPx(num('flatPx'));
   };
+  /* -- node GLYPH style: the seven knobs that were compile-time shader constants until the
+     library's stage 10, now live GLOBAL uniforms (one Field.setNodeStyle write, no recompile).
+     All seven are pushed together — cheap scalar uniforms, so splitting them per-key would buy
+     nothing. `nodeMinPx`/`nodeMaxPx` are the px clamp rails (library key `minPx`/`maxPx`). */
+  /* The 'size cap' slider ships at its TOP detent = OFF (schema default === offAt): map that to
+     the library's uncapped sentinel so the node grows without bound and fills the view on any
+     approach — no select, no "pushing". Dragging the slider DOWN passes a finite px cap through
+     verbatim (a user re-imposing a cap). offAt is read from the live schema row so the threshold
+     can never drift from the slider's own top. */
+  const nodeCapOffAt =
+    ((schema.find((r) => r.key === 'nodeMaxPx') as { offAt?: number } | undefined)?.offAt) ??
+    Infinity;
+  const applyNodeStyle = (): void => {
+    const cap = num('nodeMaxPx');
+    field.setNodeStyle({
+      bodyR: num('bodyR'),
+      haloPx: num('haloPx'),
+      haloGain: num('haloGain'),
+      coreHot: num('coreHot'),
+      minPx: num('nodeMinPx'),
+      maxPx: cap >= nodeCapOffAt ? NODE_MAX_PX_OFF : cap,
+      falloff: num('falloff'),
+    });
+  };
+  /* -- link style: the long-edge fade. `lenSoft` is a FRACTION of the field diagonal (the
+     library multiplies by its diagonal), `lenFloor` the fraction the longest edge keeps. */
+  const applyLinkStyle = (): void => {
+    field.setLinkStyle({ lenSoft: num('lenSoft'), lenFloor: num('lenFloor') });
+  };
 
-  /** key → route. One entry per LIVE key; the boot and none lists close the enumeration so
-   *  every schema key is accounted for here, by name. */
   const ROUTE: Record<string, () => void> = {
-    // ladder (live config writes)
     tierCard: applyLadderCfg,
     tierLock: applyLadderCfg,
     tierOpen: applyLadderCfg,
     cardRadius: applyLadderCfg,
-    // ladder (rebuild: fixed buffers / frozen overlay rect)
     maxCards: rebuildLadder,
     lockW: rebuildLadder,
     lockH: rebuildLadder,
     labelCap: rebuildLadder,
-    // the label band
     namedPx: applyLadderCfg,
     labelEarn: applyLadderCfg,
     labelKeep: applyLadderCfg,
     labelDwell: applyLadderCfg,
-    // nodes
+    showLabels: applyLadderCfg,
+    showCards: applyLadderCfg,
+    showOpen: applyLadderCfg,
+    cardAttention: applyLadderCfg,
+    centerSize: applyLadderCfg,
     sizeChannel: applySizes,
     nodeScale: applySizes,
     sizeCurve: applySizes,
-    // colour and ground
+    shapeFacet: applyShapeFacet,
+    bodyR: applyNodeStyle,
+    haloPx: applyNodeStyle,
+    haloGain: applyNodeStyle,
+    coreHot: applyNodeStyle,
+    nodeMinPx: applyNodeStyle,
+    nodeMaxPx: applyNodeStyle,
+    falloff: applyNodeStyle,
+    lenSoft: applyLinkStyle,
+    lenFloor: applyLinkStyle,
     colorMode: applyColors,
+    colorFacet: applyColors,
+    colorOrder: applyColors,
     palette: applyColors,
     ramp: applyColors,
     background: applyGround,
     blend: applyBlend,
     tonemap: applyTonemap,
     exposure: applyTonemap,
-    // links
+    compression: applyCompression,
     linkBudget: applyBudget,
-    // motion
     spread: applySpread,
     cameraDrift: applyFlight,
     driftRate: applyFlight,
     levelSpin: applySpins,
-    // flight
     speedK: applyFlight,
     mouseSens: applyFlight,
     turnRate: applyFlight,
     easeLin: applyFlight,
-    // perf
     renderScale: applyRenderScale,
     flatPx: applyFlatPx,
   };
-  /** Read once at createField (focus state) — persisted, applied on the next reload. */
   const BOOT_KEYS = ['linkBase', 'linkFocus', 'linkHover', 'linkDim', 'dimOthers'] as const;
-  /** Baked into the TSL materials — no seam in this library version (see the header).
-   *  flatPx left this list at stage 9: it is a live uniform now (field.setFlatPx), the boot
-   *  quality notch's LOD lever. */
-  const UNROUTED_KEYS = [
-    'nodeMinPx',
-    'nodeMaxPx',
-    'falloff',
-    'bodyR',
-    'haloPx',
-    'haloGain',
-    'coreHot',
-    'lenSoft',
-    'lenFloor',
-  ] as const;
+  /* Nothing is inert any more: the node glyph knobs (bodyR/haloPx/haloGain/coreHot/
+     nodeMinPx/nodeMaxPx/falloff) and the link-length knobs (lenSoft/lenFloor) were the
+     library's last compile-time shader constants, and stage 10 turned them into live GLOBAL
+     uniforms — all nine now route to Field.setNodeStyle/setLinkStyle above, so the panel
+     renders every row normally rather than graying it with a "no live effect" tooltip. */
+  const UNROUTED_KEYS = [] as const;
 
   const routeKey = (key: string): void => {
     const route = ROUTE[key];
     if (route) route();
-    updateOverlay();
+    // colorMode / colorOrder decide which of palette / ramp is live, and cardAttention decides
+    // whether 'center size' is live, so re-grey the dead row the instant any of them moves — the
+    // panel repaints only the affected rows, no rebuild.
+    if (key === 'colorMode' || key === 'colorOrder' || key === 'cardAttention')
+      panel.setInert(inertKeys());
+    updateStats();
   };
-  /** The '*' path: a preset, reset or import may have moved every key — re-apply each route
-   *  exactly once (the table maps many keys onto few appliers, so dedupe by function). */
   const applyAll = (): void => {
     rebuildLadder();
     const seen = new Set<() => void>([rebuildLadder]);
@@ -1352,26 +2645,50 @@ async function main(): Promise<void> {
       seen.add(route);
       route();
     }
-    updateOverlay();
+    updateStats();
   };
 
-  /* ---- the tuning panel (stage 8): generated from the schema, live on drag, ~ toggles.
-     onChange routes ONE key; onBulk (preset pick / reset / paste) re-applies the table. */
+  /* ---- the tuning panel + the rail's look select (both drive the same store). ----------- */
   injectPanelStyles();
   const panel = createPanel({
     store,
+    schema,
     onChange: routeKey,
-    onBulk: (): void => applyAll(),
-    inertKeys: UNROUTED_KEYS, // greyed in the panel: a live-looking dead knob reads as a bug
+    onBulk: (): void => {
+      applyAll();
+      syncLook();
+      // a preset / reset / paste may have moved colorMode|colorOrder|cardAttention — re-grey all
+      panel.setInert(inertKeys());
+    },
+    inertKeys: UNROUTED_KEYS,
   });
   document.body.appendChild(panel.el);
-  document.getElementById('tune')?.addEventListener('click', () => panel.toggle());
-  // the boot applyAll() runs below, after the stats state it reports into exists
+  panel.setInert(inertKeys()); // seed palette/ramp AND center-size greying from the booted config
+  ui.tune.addEventListener('click', () => panel.toggle());
 
-  /* ---- live stats: rAF-interval median over 90 frames (SCALE.md's measurement) PLUS
-     jsFrameMs — the per-frame CPU around the update calls (cameras, tweens, frames, pick),
-     median of 90, NEVER renderer.render (gl.finish does not block in Chrome). Telemetry
-     shows hidden states (§10.7): room, damping, budgets, morph t, inside-frame. */
+  for (const name of Object.keys(VISUAL_PRESETS)) {
+    const opt = document.createElement('option');
+    opt.value = name;
+    opt.textContent = VISUAL_PRESETS[name as keyof typeof VISUAL_PRESETS].label;
+    ui.look.appendChild(opt);
+  }
+  const syncLook = (): void => {
+    const names = Object.keys(VISUAL_PRESETS);
+    ui.look.value = names.includes(store.preset) ? store.preset : names[0]!;
+  };
+  syncLook();
+  ui.look.addEventListener('change', () => {
+    if (!store.applyLook(ui.look.value)) return;
+    store.save();
+    panel.sync();
+    // the 'nebula' look turns the glow ON (its halos are the bloom's input); every other look
+    // turns it off, so picking any other look is a clean return to the un-bloomed field.
+    setGlow(ui.look.value === 'nebula');
+    applyAll();
+  });
+
+  /* ---- the stats overlay: rAF-interval median (SCALE.md's measurement) + jsFrameMs, and
+     every hidden state §10.7 wants visible. */
   const intervals = new Float64Array(90);
   const jsMs = new Float64Array(90);
   let filled = 0;
@@ -1380,7 +2697,7 @@ async function main(): Promise<void> {
   let jsCursor = 0;
   let prevT = -1;
   let frame = 0;
-  let bootMs = 0; // navigationStart → first rendered frame (§9 boot; marked in the loop)
+  let bootMs = 0;
   let drawCalls = 0;
   let room = Infinity;
   let speed = 0;
@@ -1393,74 +2710,47 @@ async function main(): Promise<void> {
     const copy = Array.from(buf.subarray(0, k)).sort((a, b) => a - b);
     return copy[k >> 1]!;
   };
-
-  /* jsFrameMs by SEGMENT (measurement rig, not shipped behaviour): rolling 90-frame
-   * medians per phase of the update window, so "what costs the frame" is read off the
-   * handle instead of guessed. Four extra performance.now() calls per frame — noise
-   * next to the 0.1 ms clock resolution they share with jsFrameMs itself. */
-  const SEGS = ['cam', 'field', 'grid', 'pick', 'ladder'] as const;
-  const segBuf = new Float64Array(SEGS.length * 90);
-  let segFilled = 0;
-  let segCursor = 0;
-  const segMark = new Float64Array(SEGS.length + 1);
-  const jsBreakdown = (): Record<string, number> => {
-    const out: Record<string, number> = {};
-    const scratch = new Float64Array(90);
-    for (let s = 0; s < SEGS.length; s++) {
-      for (let k = 0; k < segFilled; k++) scratch[k] = segBuf[k * SEGS.length + s]!;
-      out[SEGS[s]!] = medianOf(scratch, segFilled);
-    }
-    return out;
-  };
   const fpsMedian = (): number => {
     const ms = medianOf(intervals, filled);
     return ms > 0 ? 1000 / ms : 0;
   };
   const jsFrameMs = (): number => medianOf(jsMs, jsFilled);
 
-  /** The frame the camera is inside (§3.5 telemetry): frameOfPoint over the camera
-   *  position mapped back through the inverse spread (the pivot spheres live unspread). */
   const insideFrame = (): string => {
     const f = field.frames;
     if (!f) return 'world';
     const s = field.spread;
     const c = field.centroid();
-    roomPos.x = c[0] + (camera.position.x - c[0]) / s;
-    roomPos.y = c[1] + (camera.position.y - c[1]) / s;
-    roomPos.z = c[2] + (camera.position.z - c[2]) / s;
-    const piv = f.frameOfPoint([roomPos.x, roomPos.y, roomPos.z]);
+    const p: [number, number, number] = [
+      c[0] + (camera.position.x - c[0]) / s,
+      c[1] + (camera.position.y - c[1]) / s,
+      c[2] + (camera.position.z - c[2]) / s,
+    ];
+    const piv = f.frameOfPoint(p);
     if (piv < 0) return 'world';
     const lv = hierarchy ? hierarchy.pivots.level[piv]! : 0;
     return `p${piv}/L${lv}`;
   };
 
   const fmt = (x: number): string => x.toLocaleString('en-US');
-  function updateOverlay(): void {
+  function updateStats(): void {
     const s = field.stats();
     const hov = field.hover;
     const sel = field.select;
     statsEl.textContent =
       `nodes ${fmt(s.nodes)} · links ${fmt(s.links.drawn)} / ${fmt(s.links.total)} drawn · ` +
-      `draw calls ${drawCalls} · fps ${fpsMedian().toFixed(1)} (median of ${filled}) · ` +
-      `jsFrameMs ${jsFrameMs().toFixed(2)} · graph ${(tGraph - t0).toFixed(0)} ms · ` +
-      `${backendName}/${pullMode} · cam ${camMode}\n` +
+      `regions ${V.regions.length} · draw calls ${drawCalls} · ` +
+      `fps ${fpsMedian().toFixed(1)} (median of ${filled}) · jsFrameMs ${jsFrameMs().toFixed(2)} · ` +
+      `boot ${bootMs.toFixed(0)} ms (graph ${(tGraph - t0).toFixed(0)}) · ${backendName}\n` +
       `inside:${insideFrame()} · morph t ${s.morph.t.toFixed(2)} · spread ${s.spread.toFixed(2)} · ` +
-      `${s.projection} · pivots ${fmt(s.pivots)}` +
-      // The two boot-notch levers that drop RESOLUTION/DETAIL rather than content. §10.4's
-      // letter doesn't require a stats row (nothing is culled), but §10.7 does require the
-      // telemetry to show hidden states — a reader must be able to tell the field is
-      // rendering at half resolution without digging for __starscape.quality.
-      ` · render dpr ${renderer.getPixelRatio()} (scale ${num('renderScale')}) · ` +
-      `flat < ${num('flatPx')} px${settledNow ? '' : ' · animating'}\n` +
+      `${s.projection} · pivots ${fmt(s.pivots)} · field-spin ${s.fieldSpin.toFixed(2)} · ` +
+      `render dpr ${renderer.getPixelRatio()} ` +
+      `(scale ${num('renderScale')}) · flat < ${num('flatPx')} px${settledNow ? '' : ' · animating'}\n` +
       `room ${Number.isFinite(room) ? room.toFixed(0) : '∞'} · speed ${speed.toFixed(0)}` +
       `${blocked ? ' (damped)' : ''} · ` +
       `hover: ${hov >= 0 ? graph.labelOf(hov) : '—'} · ` +
       `selected: ${sel >= 0 ? graph.labelOf(sel) : '—'}\n` +
-      // the ladder's budgets, reported not implied (§10.4) — named/cards/open counts, and
-      // the far sweep's generation state (a budget that lags content must say so too)
-      `ladder: cand ${lastCand} · far ${farCount}/${heapLimit}` +
-      `${sweepActive ? ` (sweep ${Math.round((100 * sweepDone) / Math.max(sweepCells, 1))}%)` : ''} · ` +
-      `named ${ladder.state.namedCount}/${ladder.config.namedCap} · ` +
+      `ladder: cand ${lastCand} · named ${ladder.state.namedCount}/${ladder.config.namedCap} · ` +
       `cards ${ladder.state.cards.length}/${ladder.config.cards} · ` +
       `open ${ladder.state.open >= 0 ? graph.labelOf(ladder.state.open) : '—'}` +
       `${ladder.state.suspended ? ' · suspended' : ''}` +
@@ -1468,7 +2758,35 @@ async function main(): Promise<void> {
       ` · look ${store.preset}`;
   }
 
-  applyAll(); // boot: the loaded config (defaults ⊕ persisted diff) reaches every subsystem
+  /* GLOW boot: the 'nebula' look implies the glow on (the signature look); any other persisted
+     look restores the saved glow pref. Reflect the knobs in the rail, then let applyAll route the
+     tonemap through the right path (applyTonemap reads glow.on). */
+  glow.on = store.preset === 'nebula' ? true : glow.on;
+  ui.glow.checked = glow.on;
+  document.getElementById('glowbox')?.classList.toggle('on', glow.on);
+  ui.glowStrength.value = String(glow.strength);
+  ui.glowRadius.value = String(glow.radius);
+  ui.glowThreshold.value = String(glow.threshold);
+  applyGlowParams();
+
+  applyAll(); // boot: defaults ⊕ persisted diff reach every subsystem
+
+  /* ---- restore the persisted arrange mode + level config (mode-scoped, like the config
+     store), or the shipped defaults; a stored custom mode morphs to it right away. */
+  {
+    const stored = loadLevels();
+    if (stored !== null) {
+      mode = stored.mode;
+      rows = stored.rows;
+      ui.hpreset.value = stored.preset;
+    } else {
+      ui.hpreset.value = DEFAULT_HPRESET;
+    }
+    ui.mode.value = mode;
+    ui.levelsbox.style.display = mode === 'custom' ? '' : 'none';
+    renderLevels();
+    if (mode === 'custom') applyCustomNow(false);
+  }
 
   const loop = (t: number): void => {
     let dt = 0;
@@ -1477,53 +2795,49 @@ async function main(): Promise<void> {
       intervals[cursor] = dtMs;
       cursor = (cursor + 1) % intervals.length;
       if (filled < intervals.length) filled++;
-      // clamp the step so a backgrounded tab cannot slingshot the cameras
       dt = Math.min(dtMs, 100) * 0.001;
     }
     prevT = t;
 
-    const c0 = performance.now(); // jsFrameMs window opens: every per-frame CPU update
-    segMark[0] = c0;
+    const c0 = performance.now();
     const telem = cam.update(dt);
     room = telem.room;
     speed = telem.speed;
     blocked = telem.blocked;
-    segMark[1] = performance.now();
+    if (pose.active) {
+      // the app-side pose tween (see flyPoseTo): wins over the idle flycam this frame
+      pose.t += dt * 1000;
+      const k = cubicInOut(Math.min(1, pose.t / pose.ms));
+      camera.position.lerpVectors(pose.p0, pose.p1, k);
+      camera.quaternion.slerpQuaternions(pose.q0, pose.q1, k);
+      if (pose.t >= pose.ms) {
+        pose.active = false;
+        cam.setTarget(pose.g, false); // dragging now pivots around the framed centre
+      }
+    }
 
-    demoTweens.update(dt);
-    field.update(dt); // tweens + frames: O(pivots), zero when idle (§4)
-    segMark[2] = performance.now();
+    appTweens.update(dt);
+    field.update(dt);
 
     fieldSettledNow = field.settled();
-    settledNow = fieldSettledNow && !demoTweens.active() && !(fly?.tweening ?? false);
+    settledNow =
+      fieldSettledNow && !appTweens.active() && !(fly?.tweening ?? false) && !pose.active;
     if (settledNow && !wasSettled) {
-      rebuildGrid(); // on settle — never per frame (DESIGN §6)
-      updateOverlay();
+      rebuildGrid();
+      updateStats();
     }
     wasSettled = settledNow;
     if (morphing && field.morphT >= 1) {
-      // the retarget landed: the base endpoints are parked — refresh the CPU mirror, and
-      // rebuild the index NOW if live spins will keep the settle edge from ever firing
       morphing = false;
       field.basePositions(baseBuf);
-      resetSweep(); // every position moved — a stale far set would name the wrong places
       if (!fieldSettledNow) {
         rebuildGrid();
         gridCooldown = 0.25;
       }
     }
-    /* Grid upkeep under spin (the port's ensureGrid, moved on-loop): rotation walks the
-       drawn positions away from the snapshot the grid indexes, so the error is TRACKED —
-       candidate reach and pickRay widen by gridDrift — and the index rebuilt lazily once
-       the drift passes a full cell, rate-limited to once a second so the O(n) pass stays
-       off the steady frame clock. Stage 9 widened both (from cell/3 every 250 ms): the
-       rebuild measures ~68 ms at 10⁶, and at 4 Hz that was a visible hitch train — the
-       walks' drift-widening keeps every consumer CORRECT at any staleness, so the only
-       price of the longer leash is a few hundred extra near-cells visited per frame. */
+    // grid upkeep under spin: tracked drift widens every walk; rebuild lazily, rate-limited
     if (!morphing && (field.frames?.activeThisTick() ?? false)) {
-      const dd = spinDriftRate * dt * field.spread;
-      driftTotal += dd;
-      gridDrift += dd;
+      gridDrift += spinDriftRate * dt * field.spread;
     }
     gridCooldown = Math.max(0, gridCooldown - dt);
     if (!morphing && gridCooldown === 0 && gridDrift > grid.cellMax) {
@@ -1531,118 +2845,125 @@ async function main(): Promise<void> {
       gridCooldown = 1.0;
     }
     if (!fieldSettledNow && !morphing) {
-      // sync the spread mirror refreshViewOf composes with (one read per frame, not per node)
       const c = field.centroid();
       spreadC[0] = c[0];
       spreadC[1] = c[1];
       spreadC[2] = c[2];
       spreadK = field.spread;
+      field.fieldSpinQuat(fieldQ); // the field-global rotation, mirrored in refreshViewOf
+      fieldDisplaced = field.fieldSpinDisplaced();
     }
-    segMark[3] = performance.now();
 
-    // Hover resolves against the latest cursor position, once per frame at most. A morph
-    // suppresses it (positions and index genuinely disagree), and so does a camera tween
-    // (the ray would sweep nodes nobody is pointing at); a SPINNING field picks fine —
-    // the ladder's nodes are written back fresh and the walk widens by the drift.
-    if (pickDue && !morphing && !(fly?.tweening ?? false)) {
+    if (pickDue && !morphing && !(fly?.tweening ?? false) && !pose.active) {
       pickDue = false;
       hover(castAt(px, py));
     }
-    segMark[4] = performance.now();
 
-    /* ---- the ladder tick (stage 7). Candidates are gathered every frame the BASE is
-       parked — including during spins and spread tweens, where gatherCandidates re-forms
-       each resident through the live frame chain (refreshViewOf): the ladder must live
-       exactly when you fly toward a rotating page, and §9's 10⁶ acceptance row is "all
-       spins on". Only a MORPH skips the pass (mid-retarget the positions and the index
-       disagree) — the dwell hysteresis absorbs that 0.9 s gap. The clip matrix is rebuilt
-       here, not read from the renderer — the camera moved this frame. */
+    /* ADAPTIVE NEAR PLANE (O(1)): track the camera's distance to its orbit target so a node you
+       close on does not clip, WITHOUT a tiny global near that would z-fight the huge far plane.
+       Far away, cam.radius is large and `want` clamps to nearFar (= the original radius*0.001),
+       so depth precision at range is byte-for-byte what it was. Closing on a node shrinks `want`
+       toward the 0.02 floor. updateProjectionMatrix only when it moves meaningfully (>8%), to
+       avoid per-frame matrix churn. */
+    {
+      const nearFar = Math.max(0.05, radius * 0.001);
+      // Keep the near plane BELOW the orbit radius so a node you close right up on never clips:
+      // normally the 0.02 floor holds (byte-identical at range), but once the radius shrinks under
+      // ~0.04 (close-orbit wheel-in) the floor follows it down to radius·0.5 — always < radius, so
+      // the billboard (at the target's depth) stays in front of near. It climbs back on fly-out.
+      const want = Math.min(nearFar, Math.max(cam.radius * 0.02, Math.min(0.02, cam.radius * 0.5)));
+      if (Math.abs(camera.near - want) > want * 0.08) {
+        camera.near = want;
+        camera.updateProjectionMatrix();
+      }
+    }
+
+    /* CLOSE ORBIT (double-click): while flying around a single node, suppress its PINNED reading
+       card (the one a pin forces fully open on top of everything) so the node stays a glyph you
+       circle — the selection highlight + side panel stay. Holding the ladder suspended
+       (cursorMoved forced false) also keeps a card from auto-opening if you wheel right in. The
+       mode ends — and the node deselects — once you leave its card distance (any direction). */
+    if (closeOrbit >= 0 && !(fly?.tweening ?? false)) {
+      // Armed only once the fly-in has LANDED (not while the goTo tween is still closing the
+      // distance — the camera starts beyond the leash and flies in, which must not self-cancel).
+      const o = closeOrbit * 3;
+      if (!fieldSettledNow && !morphing) refreshViewOf(closeOrbit);
+      const dx = camera.position.x - viewBuf[o]!;
+      const dy = camera.position.y - viewBuf[o + 1]!;
+      const dz = camera.position.z - viewBuf[o + 2]!;
+      // Generous leash: getting VERY CLOSE (wheel-in shrinks the radius) never trips it — the
+      // leash is an upper bound, and dolly/orbit keep the camera within a node-radius of the
+      // target. It ends the mode only when you deliberately fly well AWAY from the node.
+      const leash = spacing * field.spread * 4.5;
+      if (dx * dx + dy * dy + dz * dz > leash * leash) {
+        leaveCloseOrbit();
+        paintSelected(-1);
+        if (field.setSelect(-1)) updateStats();
+      }
+    }
+
     camera.updateMatrixWorld();
     camInv.copy(camera.matrixWorld).invert();
     clipM.multiplyMatrices(camera.projectionMatrix, camInv);
-    ladderView.pinned = field.select; // the pin IS the select state
+    ladderView.pinned = closeOrbit >= 0 ? -1 : field.select;
+    if (closeOrbit >= 0) cursorMoved = false; // keep the ladder suspended while orbiting
     ladderView.cursorMoved = cursorMoved;
-    ladderView.spacing = spacing * field.spread; // the tier thresholds are spacing-denominated
-    //   and candidate depths live in SPREAD world units — the unit must follow the slider
-    //   (the port recomputed sp = spacing × spreadK on every config change)
+    ladderView.spacing = spacing * field.spread;
     cursorMoved = false;
     lastCand = morphing ? 0 : gatherCandidates();
     ladderCandidates.count = lastCand;
     const ladderState = ladder.update(dt, ladderView);
     if (!fieldSettledNow && !morphing) {
-      // glue every mounted label/card to the spot the shader draws THIS frame — including
-      // ones riding out their drop grace, which the candidate walk no longer visits
       for (let j = 0; j < ladderState.namedCount; j++) refreshViewOf(ladderState.named[j]!);
       for (const slot of ladderState.cards) refreshViewOf(slot.node);
     }
     overlayView.width = W;
     overlayView.height = H;
-    overlayView.pinned = field.select;
+    overlayView.pinned = closeOrbit >= 0 ? -1 : field.select;
     ladderOverlay.update(ladderState, overlayView);
+    updateRegionLabels();
 
-    const c1 = performance.now(); // jsFrameMs window closes BEFORE render
+    const c1 = performance.now();
     jsMs[jsCursor] = c1 - c0;
     jsCursor = (jsCursor + 1) % jsMs.length;
     if (jsFilled < jsMs.length) jsFilled++;
-    segMark[5] = c1;
-    for (let s = 0; s < SEGS.length; s++) {
-      segBuf[segCursor * SEGS.length + s] = segMark[s + 1]! - segMark[s]!;
-    }
-    segCursor = (segCursor + 1) % 90;
-    if (segFilled < 90) segFilled++;
 
-    renderer.render(scene, camera);
+    // GLOW on → the HDR bloom chain (scene → half-float → bloom → post-sum tonemap → screen);
+    // off → the plain direct render, byte-for-byte the pre-bloom path (zero added cost).
+    if (glow.on) post.render();
+    else renderer.render(scene, camera);
     drawCalls = renderer.info.render.drawCalls;
     if (frame === 0) {
-      /* §9 boot = navigationStart → first frame. performance.now() is relative to
-       * timeOrigin (navigationStart), so this one read IS the boot time; the mark makes
-       * it visible in the Performance panel too. First render submitted = first frame
-       * (SCALE.md methodology: never time renderer.render itself — this is a timestamp,
-       * not a duration around the call). */
-      bootMs = performance.now();
-      performance.mark('starscape:first-frame');
+      bootMs = performance.now(); // navigationStart → first frame (a timestamp, not a
+      performance.mark('starscape-playground:first-frame'); // duration around render — SCALE.md)
     }
-    if (frame % 30 === 0) updateOverlay();
+    if (frame % 30 === 0) updateStats();
     frame++;
     requestAnimationFrame(loop);
   };
   requestAnimationFrame(loop);
 
-  // The debug handle every demo carries (§10.7). The setters mirror the panel so a headless
-  // browser check can drive the ARRANGE flow and verify the §4 round-trip FNV equality
-  // programmatically; fnvBase() hashes the CPU base positions (mix with exact endpoints).
+  /* ---- the debug handle (§10.7) + the SCALE.md measurement rig. ------------------------- */
   (window as unknown as Record<string, unknown>)['__starscape'] = {
     renderer,
     scene,
     camera,
     field,
     graph,
+    synth: V,
     cam,
     castAt,
-    fnvFrozen,
-    fnvBase: (): number => fnv1a(field.basePositions()),
+    store,
+    panel,
+    provider,
+    configWarnings,
+    // the routing table's enumeration, inspectable: live keys route this frame, boot keys land
+    // on the next reload (createField focus opts), unrouted keys have no live seam this version.
+    routes: { live: Object.keys(ROUTE), boot: BOOT_KEYS, unrouted: UNROUTED_KEYS },
     settled: (): boolean => settledNow,
     fpsMedian,
     jsFrameMs,
-    /* ---- the SCALE.md measurement rig (§9: assert the viewpoint, median of 90 rAF
-       intervals, never renderer.render). All three are demo-side instrumentation, not
-       library API. */
     bootMs: (): number => bootMs,
-    jsBreakdown,
-    /** Far-sweep + grid-upkeep telemetry (§10.7: hidden costs shown, not implied). */
-    sweep: (): Record<string, number | boolean> => ({
-      gen: sweepGen,
-      active: sweepActive,
-      done: sweepDone,
-      cells: sweepCells,
-      far: farCount,
-      lastRebuildMs,
-      gridDrift,
-    }),
-    quality,
-    /** Camera distance to the live TARGET extent centre over the home-framing distance
-     *  (flyHome's own formula) — must read ~1.0 before any §9 number is recorded
-     *  (SCALE.md: every wrong number was a moved viewpoint). */
     homeRatio: (): number => {
       const e = field.targetExtent();
       const d = Math.hypot(
@@ -1654,15 +2975,10 @@ async function main(): Promise<void> {
         (Math.max(e.radius, radius * 0.05) / Math.tan((liveFov * Math.PI) / 360)) * HOME_MARGIN;
       return d / home;
     },
-    /** A FRESH median-of-`frames` rAF-interval window (the rolling overlay buffer keeps
-     *  old state; a measurement wants only the state being measured). Resolves with the
-     *  medians plus the context that makes the number honest: spins, dpr, budgets. */
     measure: (
       frames = 90,
     ): Promise<{
       msMedian: number;
-      msP90: number;
-      msWorst: number;
       fps: number;
       jsMedian: number;
       drawCalls: number;
@@ -1674,11 +2990,11 @@ async function main(): Promise<void> {
     }> =>
       new Promise((resolve) => {
         const buf = new Float64Array(frames);
-        let k = -1; // first callback only primes prev
+        let k = -1;
         let prev = 0;
-        const tick = (t: number): void => {
-          if (k >= 0) buf[k] = t - prev;
-          prev = t;
+        const tick = (tt: number): void => {
+          if (k >= 0) buf[k] = tt - prev;
+          prev = tt;
           k++;
           if (k < frames) {
             requestAnimationFrame(tick);
@@ -1686,18 +3002,14 @@ async function main(): Promise<void> {
           }
           const sorted = Array.from(buf).sort((a, b) => a - b);
           const ms = sorted[frames >> 1]!;
-          const p90 = sorted[Math.min(frames - 1, Math.floor(frames * 0.9))]!;
-          const worst = sorted[frames - 1]!;
           const s = field.stats();
           const handle = (window as unknown as Record<string, Record<string, () => number>>)[
             '__starscape'
           ]!;
           resolve({
             msMedian: ms,
-            msP90: p90, // stalls (grid rebuilds under spin) live here, not in the median
-            msWorst: worst,
             fps: ms > 0 ? 1000 / ms : 0,
-            jsMedian: jsFrameMs(), // the rolling buffer — full of steady state by now
+            jsMedian: jsFrameMs(),
             drawCalls,
             dpr: renderer.getPixelRatio(),
             homeRatio: handle['homeRatio']!(),
@@ -1708,58 +3020,48 @@ async function main(): Promise<void> {
         };
         requestAnimationFrame(tick);
       }),
-    setArrangement: (name: string): void => {
-      ui.arrangement.value = name;
-      applyArrangement();
+    setMode: (m: 'frozen' | 'custom'): void => {
+      ui.mode.value = m;
+      onModeChange();
     },
-    setProjection: (mode: '2d' | '3d'): void => {
-      ui.proj.value = mode;
+    applyHierarchyPreset: (name: string): boolean => {
+      if (HPRESETS[name] === undefined) return false;
+      if (mode !== 'custom') {
+        ui.mode.value = 'custom';
+        onModeChange();
+      }
+      ui.hpreset.value = name;
+      onPresetChange();
+      return true;
+    },
+    get levelRows() {
+      return rows;
+    },
+    setLevelRows: (rs: LevelRow[]): void => {
+      rows = rs;
+      ui.hpreset.value = '';
+      saveLevels();
+      renderLevels();
+      if (mode === 'custom') applyCustomNow(false);
+    },
+    get hierarchy() {
+      return hierarchy;
+    },
+    get pivotOverflow() {
+      return pivotOverflow;
+    },
+    setProjection: (mode2d: '2d' | '3d'): void => {
+      ui.proj.value = mode2d;
       applyProjection();
     },
-    setSpread: (v: number): void => {
-      // spread is a config key now — the panel, the store and the field stay in agreement
-      if (store.set('spread', v)) {
-        panel.markCustom();
-        store.save();
-        routeKey('spread');
-        panel.sync();
-      }
-    },
-    setSpin: (level: 0 | 1, on: boolean, rate?: number): void => {
-      (level === 0 ? ui.spin0 : ui.spin1).checked = on;
-      if (rate !== undefined) (level === 0 ? ui.rate0 : ui.rate1).value = String(rate);
+    setSpin: (level: number, on: boolean, rate?: number): void => {
+      const r = rows[level];
+      if (r === undefined) return;
+      r.spin = on;
+      if (rate !== undefined) r.spinRate = rate;
+      saveLevels();
+      renderLevels();
       applySpins();
-    },
-    setPull: (on: boolean): void => {
-      ui.pull.checked = on;
-      applyArrangement();
-    },
-    // stage 7: the ladder, the overlay and a tier-walking helper. flyToNode(i, s) stands
-    // off s page-spacings from node i's DRAWN position — s 2.4 approaches past the card
-    // threshold (2.2), 1.5 grows the box, 1.0 locks it, 0.4 opens the body (0.45), all the
-    // ladder's own units (spread included, like the thresholds), so a headless check can
-    // walk the tiers deterministically.
-    // live getters — the stage-8 rebuild keys (labelCap/maxCards/lockW/lockH) swap both
-    get ladder() {
-      return ladder;
-    },
-    get overlay() {
-      return ladderOverlay;
-    },
-    provider,
-    /* stage 8: the config store, the panel, the routing table's '*' path, and a setter that
-       walks the full user path (validate → touch → persist → route → panel sync) so a
-       headless check drives config exactly as a slider would. */
-    store,
-    panel,
-    configWarnings,
-    applyAll,
-    // the routing table's full enumeration, inspectable: live keys route, boot keys land on
-    // the next reload (createField focus opts), unrouted keys await the §5 shader-hook seam
-    routes: {
-      live: Object.keys(ROUTE),
-      boot: BOOT_KEYS,
-      unrouted: UNROUTED_KEYS,
     },
     setConfig: (key: string, value: ConfigValue): boolean => {
       if (!store.set(key, value)) return false;
@@ -1773,8 +3075,37 @@ async function main(): Promise<void> {
       if (!store.applyLook(name)) return false;
       store.save();
       panel.sync();
+      setGlow(name === 'nebula');
       applyAll();
+      syncLook();
       return true;
+    },
+    setGlow: (on: boolean): void => setGlow(on),
+    setBloom: (p: { strength?: number; radius?: number; threshold?: number }): void => {
+      if (p.strength !== undefined) {
+        glow.strength = p.strength;
+        ui.glowStrength.value = String(p.strength);
+      }
+      if (p.radius !== undefined) {
+        glow.radius = p.radius;
+        ui.glowRadius.value = String(p.radius);
+      }
+      if (p.threshold !== undefined) {
+        glow.threshold = p.threshold;
+        ui.glowThreshold.value = String(p.threshold);
+      }
+      applyGlowParams();
+      saveGlow();
+    },
+    get glow() {
+      return { on: glow.on, ...post.bloom, tonemap: post.tonemap };
+    },
+    post,
+    get ladder() {
+      return ladder;
+    },
+    get overlay() {
+      return ladderOverlay;
     },
     ladderState: (): string =>
       JSON.stringify({
@@ -1787,26 +3118,32 @@ async function main(): Promise<void> {
       }),
     flyToNode: (i: number, spacings = 0.4, ms = 900): void => {
       if (!fly) return;
-      cursorMoved = true; // a deliberate goto is user intent — it clears a retreat's
-      //                     suspension, exactly as the port's flyTo re-enabled auto-open
+      cursorMoved = true;
       if (!fieldSettledNow && !morphing) refreshViewOf(i);
-      const t = new Vector3(viewBuf[i * 3]!, viewBuf[i * 3 + 1]!, viewBuf[i * 3 + 2]!);
-      fly.goTo(t, Math.max(spacings * spacing * field.spread, 0.01), ms);
+      const tv = new Vector3(viewBuf[i * 3]!, viewBuf[i * 3 + 1]!, viewBuf[i * 3 + 2]!);
+      fly.goTo(tv, Math.max(spacings * spacing * field.spread, 0.01), ms);
     },
-    // §9: "viewpoint asserted (never trusted)". The idle turntable keeps the camera
-    // orbiting, so an fps A/B measured over it compares two different fills — baseline
-    // drift dwarfs small per-feature costs. A measurement harness parks it with
-    // setTurntable(false) (and restores it after) so both windows share one viewpoint.
+    flyToPage: (id: string, spacings = 0.4): boolean => {
+      const i = V.byId.get(id);
+      if (i === undefined) return false;
+      field.setSelect(i);
+      paintSelected(i);
+      const handle = (window as unknown as Record<string, Record<string, (a: number, b?: number) => void>>)[
+        '__starscape'
+      ]!;
+      handle['flyToNode']!(i, spacings);
+      return true;
+    },
     setTurntable: (on: boolean): void => {
       if (fly) fly.spin = on;
     },
   };
 
-  updateOverlay();
+  updateStats();
 }
 
 main().catch((err: unknown) => {
-  // §10.5: a boot failure must surface in the UI, never an idle page with an empty console.
+  // §10.5: a boot failure surfaces in the UI, never an idle page with an empty console.
   errorEl.style.display = 'block';
   errorEl.textContent = `boot failed: ${err instanceof Error ? (err.stack ?? err.message) : String(err)}`;
   statsEl.textContent = 'boot failed';

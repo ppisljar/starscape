@@ -3,40 +3,150 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>starscape demo — the field</title>
+    <title>starscape — playground</title>
+    <meta
+      name="description"
+      content="An interactive playground for the starscape graph-visualization library: fly through a synthetic field of up to a million nodes and drive every control the library exposes."
+    />
+    <link
+      rel="icon"
+      href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%2304060C'/%3E%3Ccircle cx='9' cy='22' r='2.4' fill='%2371F5B8'/%3E%3Ccircle cx='22' cy='10' r='3.2' fill='%2359A0FF'/%3E%3Ccircle cx='21' cy='23' r='1.8' fill='%23C78CFF'/%3E%3Cpath d='M9 22 L22 10 M22 10 L21 23' stroke='%23FFC74F' stroke-width='1' opacity='.55'/%3E%3C/svg%3E"
+    />
     <link rel="stylesheet" href="./demo.css" />
   </head>
   <body>
     <div id="panel">
-      <h3>ARRANGE <button id="tune" type="button" title="tuning panel (~)">tune</button></h3>
-      <label
-        >arrangement
-        <select id="arrangement">
-          <option value="frozen">frozen (synth layout)</option>
-          <option value="galaxies">galaxies (spiralGalaxy)</option>
-          <option value="ring">ring</option>
-          <option value="globe">globe (shell)</option>
-          <option value="random">random (cloud)</option>
-        </select>
-      </label>
-      <label class="row"
-        ><span><input type="checkbox" id="spin0" /> spin L0</span>
-        <input type="number" id="rate0" value="0.15" step="0.05" />
-      </label>
-      <label class="row"
-        ><span><input type="checkbox" id="spin1" /> spin L1</span>
-        <input type="number" id="rate1" value="0.5" step="0.05" />
-      </label>
-      <!-- spread lives in the tuning panel's `motion` group now (stage 8) -->
-      <label
-        >projection
-        <select id="proj">
-          <option value="3d">3d</option>
-          <option value="2d">2d</option>
-        </select>
-      </label>
-      <label><span><input type="checkbox" id="pull" /> pull (bloom on type anchors)</span></label>
+      <h3>
+        <span>STARSCAPE · PLAYGROUND</span>
+        <button id="keys" type="button" title="camera keys &amp; help">? keys</button>
+      </h3>
+      <div id="find">
+        <input id="search" type="text" placeholder="find a node /" autocomplete="off" spellcheck="false" />
+        <div id="hits"></div>
+      </div>
+
+      <!-- DATASET: every size is a fully synthetic corpus generated client-side from (n, seed). -->
+      <details class="grp" open>
+        <summary>dataset</summary>
+        <label
+          >size
+          <select id="data">
+            <option value="1000">synth 1k</option>
+            <option value="10000">synth 10k</option>
+            <option value="100000">synth 100k</option>
+            <option value="1000000">synth 1M</option>
+          </select>
+        </label>
+        <label
+          >arrange
+          <select id="mode">
+            <option value="frozen">frozen (the generated layout)</option>
+            <option value="custom">custom (level editor)</option>
+          </select>
+        </label>
+        <!-- the LEVELS editor (custom mode): preset hierarchies populate it; the editor is the
+             source of truth. Rows are built by main.ts from the live registries. -->
+        <div id="levelsbox" style="display: none">
+          <label
+            >preset hierarchy
+            <select id="hpreset"></select>
+          </label>
+          <div id="levels"></div>
+          <div class="row">
+            <button id="addlevel" type="button" title="insert a grouping level above the leaf">
+              + level
+            </button>
+            <a id="levelsreset" href="#" title="restore the shipped default hierarchy">reset</a>
+          </div>
+          <div id="pivotwarn"></div>
+        </div>
+      </details>
+
+      <!-- VIEW: projection, how far you can see, links on/off. -->
+      <details class="grp" open>
+        <summary>view</summary>
+        <label
+          >projection
+          <select id="proj">
+            <option value="3d">3d</option>
+            <option value="2d">2d</option>
+          </select>
+        </label>
+        <label class="row" title="how far you can see — pushes the depth haze and the far clip plane out"
+          >view distance
+          <span class="vd"><input type="range" id="viewdist" min="0.5" max="20" step="0.5" value="1" /><span id="viewdistv">1.0×</span></span>
+        </label>
+        <label class="row"
+          ><span><input type="checkbox" id="links" checked /> links</span>
+        </label>
+      </details>
+
+      <!-- LOOK: the shipped visual presets, plus the HDR bloom (glow) post-process. -->
+      <details class="grp" open>
+        <summary>look</summary>
+        <label
+          >preset look
+          <select id="look"></select>
+        </label>
+        <!-- GLOW: the HDR bloom post-process. Default OFF (nothing regresses); the 'nebula' look
+             turns it on. Strength/radius/threshold drive the library's post.setBloom live. -->
+        <div id="glowbox">
+          <label class="row" title="HDR bloom post-process — render additively into a half-float buffer, bloom the sum, tonemap once"
+            ><span><input type="checkbox" id="glow" /> glow (bloom)</span>
+          </label>
+          <label class="row glowp" title="overall bloom brightness"
+            >strength
+            <span class="vd"><input type="range" id="glowStrength" min="0" max="3" step="0.05" value="1.3" /><span id="glowStrengthv">1.30</span></span>
+          </label>
+          <label class="row glowp" title="how far the glow spreads (0..1 across the mip pyramid) — keep it tight or the whole screen hazes grey"
+            >radius
+            <span class="vd"><input type="range" id="glowRadius" min="0" max="1" step="0.02" value="0.4" /><span id="glowRadiusv">0.40</span></span>
+          </label>
+          <label class="row glowp" title="luminance below which a pixel does not seed the bloom — with additive HDR the dense cores are the ones over it"
+            >threshold
+            <span class="vd"><input type="range" id="glowThreshold" min="0" max="2" step="0.02" value="1.0" /><span id="glowThresholdv">1.00</span></span>
+          </label>
+          <label class="row glowp" title="highlight compression (PRE-bloom): additive accumulation makes a dense core thousands of times brighter than the sparse arms, so a single exposure blows the core to a flat white disc. This curves the brightness sublinearly (hue preserved) so the core shows structure and the lifted arms bloom — raise it when the core is a white blob, 0 is off"
+            >compression
+            <span class="vd"><input type="range" id="glowCompression" min="0" max="1" step="0.05" value="0" /><span id="glowCompressionv">0.00</span></span>
+          </label>
+        </div>
+      </details>
+
+      <div class="row">
+        <button id="home" type="button" title="back to the whole field">home</button>
+        <button id="tune" type="button" title="full tuning panel (~)">tune</button>
+      </div>
+      <div id="regions">
+        <h4>regions</h4>
+        <div id="regionlist"></div>
+      </div>
     </div>
+
+    <!-- the flycam keys / help legend (toggled by the "? keys" button) -->
+    <div id="legend" hidden>
+      <h4>camera &amp; keys</h4>
+      <table>
+        <tr><td><kbd>W</kbd> / <kbd>S</kbd></td><td>fly forward / back</td></tr>
+        <tr><td><kbd>A</kbd> / <kbd>D</kbd></td><td>strafe left / right</td></tr>
+        <tr><td><kbd>X</kbd> / <kbd>C</kbd></td><td>rise / descend</td></tr>
+        <tr><td>drag</td><td>mouse-look</td></tr>
+        <tr><td>wheel</td><td>dolly (hold <kbd>Shift</kbd> = coarse)</td></tr>
+        <tr><td><kbd>CapsLock</kbd></td><td>lock current speed</td></tr>
+        <tr><td><kbd>Alt</kbd></td><td>fine motion</td></tr>
+        <tr><td>click</td><td>select a node &amp; frame it</td></tr>
+        <tr><td>double-click</td><td>fly up &amp; orbit a node</td></tr>
+        <tr><td><kbd>Esc</kbd></td><td>deselect / retreat</td></tr>
+        <tr><td><kbd>/</kbd></td><td>focus the search box</td></tr>
+        <tr><td>tune</td><td>full schema tuning panel</td></tr>
+      </table>
+      <p>Every size is a synthetic corpus generated in the browser from (n, seed). <b>tune</b> opens the full schema-driven panel; <b>arrange → custom</b> opens the per-level hierarchy editor.</p>
+    </div>
+
+    <!-- region name labels over the field (visible from outside a region, gone inside it) -->
+    <div id="regionlabels"></div>
+    <!-- the selected node's link chips (what it connects to, clickable) -->
+    <div id="selpanel"></div>
     <!-- the zoom-ladder overlay root: positioned over the canvas, owned by createOverlay -->
     <div id="ladder"></div>
     <div id="stats">booting…</div>
