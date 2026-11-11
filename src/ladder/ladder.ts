@@ -177,6 +177,9 @@ export function createLadder(opts: LadderOptions = {}): Ladder {
     cardRadiusSpacings: opts.cardRadiusSpacings ?? CARD_R_SPACINGS,
     cursorRadiusPx: opts.cursorRadiusPx ?? CURSOR_RADIUS_PX,
     cursorPull: opts.cursorPull ?? CURSOR_PULL,
+    // the attention GATE: Infinity (the default) is no gate — exactly today's behaviour, since a
+    // cursorPx can never exceed Infinity. Finite = the consumer's chosen centre-region radius.
+    attentionGateRadiusPx: opts.attentionGateRadiusPx ?? Number.POSITIVE_INFINITY,
     // per-tier master switches: default on, so omitting them is exactly today's behaviour.
     showLabels: opts.showLabels ?? true,
     showCards: opts.showCards ?? true,
@@ -245,6 +248,9 @@ export function createLadder(opts: LadderOptions = {}): Ladder {
     const dCard = cfg.cardSpacings * view.spacing;
     const dLock = cfg.lockSpacings * view.spacing;
     const dOpen = cfg.openSpacings * view.spacing;
+    // the attention gate, read live (Infinity = no gate). A candidate farther from the anchor than
+    // this never holds a card/lock/open; the pin bypasses it. Independent of the cursor-pull above.
+    const gate = cfg.attentionGateRadiusPx;
     ensure(count);
 
     // ---- 1. the candidate filter + score. Attention follows the cursor: proximity to the
@@ -390,6 +396,9 @@ export function createLadder(opts: LadderOptions = {}): Ladder {
       if (node === pinned) continue;
       const d = distCol[c]!;
       if (d > dCard) continue;
+      // the attention gate: beyond it the node may still be a mote/label (named tier above is
+      // untouched) but never a card. The pin is already excluded from this loop, so it is spared.
+      if (curCol[c]! > gate) continue;
       const s = slotPool[nSlots]!;
       s.node = node;
       s.tier = d <= dLock ? 'lock' : 'card';
@@ -413,7 +422,10 @@ export function createLadder(opts: LadderOptions = {}): Ladder {
       }
       if (!has) {
         const d = openPos >= 0 ? distCol[openPos]! : Infinity;
-        if (d <= dCard && budget > 0) {
+        // honour the gate here too: an open card whose node has drifted outside the attention
+        // region closes now (the card follows the anchor), the same way falling past dCard closes.
+        const curOpen = openPos >= 0 ? curCol[openPos]! : Infinity;
+        if (d <= dCard && budget > 0 && curOpen <= gate) {
           const at = nSlots < budget ? nSlots++ : nSlots - 1;
           const s = slotPool[at]!;
           s.node = openNode;

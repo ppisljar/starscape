@@ -428,6 +428,85 @@ describe('the per-tier master switches suppress a whole tier', () => {
   });
 });
 
+describe('the attention gate (cards only; the pin and the label tier are spared)', () => {
+  // dist 40 is inside D_OPEN(45), so an ungated node here opens. `cur` is the attention-anchor
+  // distance the consumer supplies — the cursor's, or (centre mode) the screen centre's.
+  const near = (node: number, px: number, cur: number): Row => ({ node, px, dist: 40, cur });
+
+  it('no gate (default Infinity): a far-anchor candidate still climbs the ladder — today', () => {
+    const lad = createLadder({ dwellMs: 0, openHoldMs: 0 });
+    const st = lad.update(0.016, viewOf([near(1, 40, 10_000)]));
+    expect(st.open).toBe(1);
+    expect(st.cards.length).toBe(1);
+  });
+
+  it('a finite gate excludes a beyond-gate candidate from card/lock/open — even close AND large', () => {
+    const lad = createLadder({ dwellMs: 0, openHoldMs: 0, attentionGateRadiusPx: 100 });
+    // cur 500 ≫ gate 100: no card, no lock, no open, whatever the distance or glyph size
+    const st = lad.update(0.016, viewOf([near(1, 80, 500)]));
+    expect(st.cards.length).toBe(0);
+    expect(st.open).toBe(-1);
+    // but it IS still a named label — the gate spares the label tier
+    expect(namedOf(st)).toEqual([1]);
+    expect(evList(st.events.named).enter).toEqual([1]);
+  });
+
+  it('within the gate a candidate opens exactly as it would with no gate', () => {
+    const lad = createLadder({ dwellMs: 0, openHoldMs: 0, attentionGateRadiusPx: 100 });
+    const st = lad.update(0.016, viewOf([near(1, 80, 50)]));
+    expect(st.cards.length).toBe(1);
+    expect(st.open).toBe(1);
+  });
+
+  it('exactly AT the gate radius still cards; a hair beyond never does (boundary)', () => {
+    let st = createLadder({ dwellMs: 0, openHoldMs: 0, attentionGateRadiusPx: 100 }).update(
+      0.016,
+      viewOf([near(1, 40, 100)]),
+    );
+    expect(st.open).toBe(1);
+    st = createLadder({ dwellMs: 0, openHoldMs: 0, attentionGateRadiusPx: 100 }).update(
+      0.016,
+      viewOf([near(1, 40, 100 + 1e-9)]),
+    );
+    expect(st.open).toBe(-1);
+    expect(st.cards.length).toBe(0);
+  });
+
+  it('the gate re-ranks nothing — a beyond-gate node is removed, an in-gate one takes the slot', () => {
+    const lad = createLadder({ dwellMs: 0, openHoldMs: 0, attentionGateRadiusPx: 100, cards: 2 });
+    // node 1 is bigger (ranks first) but beyond the gate; node 2 is smaller but inside it
+    const st = lad.update(0.016, viewOf([near(1, 80, 400), near(2, 20, 30)]));
+    expect(cardNodes(st)).toEqual([2]); // only the in-gate node holds a card
+    expect(st.open).toBe(2);
+    expect(namedOf(st)).toEqual([1, 2]); // both still named (label tier ignores the gate)
+  });
+
+  it('a PINNED node beyond the gate still opens (pin outranks the gate)', () => {
+    const lad = createLadder({ attentionGateRadiusPx: 100 });
+    const st = lad.update(0.016, viewOf([near(1, 80, 9999)], { pinned: 1 }));
+    expect(st.open).toBe(1);
+    expect(st.cards[0]).toMatchObject({ node: 1, tier: 'open', growT: 1 });
+  });
+
+  it('a pinned node far off the anchor AND not even a candidate still opens', () => {
+    const lad = createLadder({ attentionGateRadiusPx: 60 });
+    const st = lad.update(0.016, viewOf([{ node: 1, px: 20, dist: 5000, cur: 5000 }], { pinned: 42 }));
+    expect(st.open).toBe(42);
+    expect(st.cards[0]).toMatchObject({ node: 42, tier: 'open', growT: 1 });
+  });
+
+  it('an open card drifting beyond the gate closes — the card follows the anchor', () => {
+    const lad = createLadder({ dwellMs: 0, openHoldMs: 0, attentionGateRadiusPx: 100 });
+    let st = lad.update(0.016, viewOf([near(1, 40, 20)]));
+    expect(st.open).toBe(1);
+    // same node, same distance — only the anchor moved away from it (centre mode: it left centre)
+    st = lad.update(0.016, viewOf([near(1, 40, 300)]));
+    expect(st.open).toBe(-1);
+    expect(st.cards.length).toBe(0);
+    expect(evList(st.events.open).exit).toEqual([1]);
+  });
+});
+
 describe('the open slot (budget 1)', () => {
   const near = (node: number, px: number): Row => ({ node, px, dist: 40 });
 

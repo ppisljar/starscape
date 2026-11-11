@@ -111,6 +111,17 @@ export interface LadderOptions {
   cardRadiusSpacings?: number;
   cursorRadiusPx?: number;
   cursorPull?: number;
+  /** The ATTENTION GATE, CSS px — default Infinity (no gate, today's behaviour). When FINITE, a
+   *  candidate whose `cursorPx` (the attention-anchor distance the consumer supplies) EXCEEDS it
+   *  is excluded from the CARD, LOCK and OPEN tiers: it can still be a mote and a named label, but
+   *  no card opens on it. This is a GATE, orthogonal to the cursor-pull boost (which still applies
+   *  within `cursorRadiusPx` and never gates): the pull RE-RANKS what is already eligible, the gate
+   *  decides WHAT is eligible at all. The ladder never learns WHERE the anchor is — the consumer
+   *  chooses it by what it puts in `cursorPx` (the live cursor, or the screen centre) and sets the
+   *  matching gate radius; so this one option covers both "open what you point at" (gate Infinity)
+   *  and "open only near the screen centre" (gate = the centre-region radius). A PINNED node
+   *  bypasses the gate exactly as it bypasses every other budget and filter. */
+  attentionGateRadiusPx?: number;
   /* ---- per-tier master switches (default on). Each SUPPRESSES one whole tier — a true OFF the
    * tier thresholds alone cannot reach (a threshold only moves WHERE a tier fires, never whether
    * it fires at all). They are read live every tick, so flipping one off drops that tier's set
