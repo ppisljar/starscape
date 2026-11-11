@@ -253,6 +253,31 @@ async function main(): Promise<void> {
   const str = (k: string): string => store.get(k) as string;
   const bool = (k: string): boolean => store.get(k) === true;
 
+  /* ---- SCENE PRESETS: one top-level pick sets the WHOLE scene at once — the hierarchy AND the
+     look AND glow AND view — so a single choice reproduces a complete curated scene. SPACE4_LOOK
+     is the config diff for the shipped 'space4' galaxy-nebula (its rows/glow/view live in
+     applyScene below). A fresh visitor opens on space4 (a far better first impression than the
+     neutral frozen field), so its look is pre-seeded into the store HERE — before createField —
+     so the BOOT-routed focus alphas and the size channel it needs are baked at creation, not only
+     after a reload. Every space4 value is valid in the synth schema (words column, system facet,
+     filmic tone curve — all present in generateSynth's corpus). */
+  const SCENE_KEY = 'starscape-playground:scene:v1';
+  const SPACE4_LOOK: Record<string, ConfigValue> = {
+    tierCard: 0.5, tierLock: 0.5, tierOpen: 0.4, maxCards: 1, lockW: 750, lockH: 580,
+    namedPx: 8, labelEarn: 60, labelKeep: 90, labelCap: 90, labelDwell: 2000,
+    sizeChannel: 'words', nodeScale: 4, sizeCurve: 3, nodeMinPx: 1,
+    bodyR: 1, haloPx: 5.5, haloGain: 0.6, coreHot: 0.5,
+    colorFacet: 'system', colorOrder: 'spatial', background: 'black', blend: 'additive',
+    tonemap: 'filmic', exposure: 0.1, compression: 0.45,
+    linkBase: 0.26, linkFocus: 0.84, linkDim: 0.148, dimOthers: 0.43, lenSoft: 0.17, lenFloor: 0,
+  };
+  const SPACE4_GLOW = { on: true, strength: 0.25, radius: 0.04, threshold: 0 };
+  const SPACE4_VIEW = { distance: 20, projection: '3d' as const };
+  // fresh visitor → open on space4: bake its look into the store before createField reads it.
+  if (localStorage.getItem(SCENE_KEY) === null) {
+    for (const [k, v] of Object.entries(SPACE4_LOOK)) store.set(k, v);
+  }
+
   /* ---- renderer: the ONE place devicePixelRatio lives; the field reasons in CSS px. */
   boot('starting the renderer');
   const renderer = new WebGPURenderer({ antialias: true });
@@ -543,6 +568,7 @@ async function main(): Promise<void> {
 
   /* ---- the rail ------------------------------------------------------------------------- */
   const ui = {
+    scene: document.getElementById('scene') as HTMLSelectElement,
     data: document.getElementById('data') as HTMLSelectElement,
     mode: document.getElementById('mode') as HTMLSelectElement,
     levelsbox: document.getElementById('levelsbox') as HTMLDivElement,
@@ -573,6 +599,23 @@ async function main(): Promise<void> {
     regionList: document.getElementById('regionlist') as HTMLDivElement,
     regionLabels: document.getElementById('regionlabels') as HTMLDivElement,
     selpanel: document.getElementById('selpanel') as HTMLDivElement,
+  };
+
+  /* ---- the SCENE selector's "you've diverged" bookkeeping. Any manual edit to the hierarchy,
+     the look, the glow or the view flips the selector to the 'custom' sentinel and persists it, so
+     the control honestly reflects that the scene no longer matches a shipped preset. Guarded by
+     applyingScene so the programmatic apply (applyScene, below) never trips it. */
+  let currentScene = 'space4';
+  let applyingScene = false;
+  const markSceneCustom = (): void => {
+    if (applyingScene || currentScene === 'custom') return;
+    currentScene = 'custom';
+    ui.scene.value = 'custom';
+    try {
+      localStorage.setItem(SCENE_KEY, 'custom');
+    } catch {
+      /* storage denied: the session still works, the choice just will not persist */
+    }
   };
 
   /* ---- the DATA select: reflect the booted dataset, and write the choice into the query
@@ -894,6 +937,7 @@ async function main(): Promise<void> {
     } catch {
       /* storage denied/full: the session still works, it just will not persist */
     }
+    markSceneCustom(); // any hierarchy edit diverges from the active scene preset (guarded)
   };
   const loadLevels = (): { mode: 'frozen' | 'custom'; preset: string; rows: LevelRow[] } | null => {
     try {
@@ -1582,13 +1626,19 @@ async function main(): Promise<void> {
     if (Number.isFinite(saved) && saved >= 0.5 && saved <= 20) ui.viewdist.value = String(saved);
     applyViewDistance(false);
   }
-  ui.viewdist.addEventListener('input', () => applyViewDistance());
+  ui.viewdist.addEventListener('input', () => {
+    applyViewDistance();
+    markSceneCustom();
+  });
 
   ui.mode.addEventListener('change', onModeChange);
   ui.hpreset.addEventListener('change', onPresetChange);
   ui.addlevel.addEventListener('click', onAddLevel);
   ui.levelsreset.addEventListener('click', onLevelsReset);
-  ui.proj.addEventListener('change', applyProjection);
+  ui.proj.addEventListener('change', () => {
+    applyProjection();
+    markSceneCustom();
+  });
   ui.home.addEventListener('click', () => flyHome(liveFov));
 
   /* ---- the keys/help legend: a button in the rail header toggles the overlay; Escape and a
@@ -1606,21 +1656,27 @@ async function main(): Promise<void> {
 
   /* ---- the GLOW controls: on/off + the three bloom knobs. Live uniform writes (no recompile);
      the on/off switches the render path. Initialised from the persisted glow state below. */
-  ui.glow.addEventListener('change', () => setGlow(ui.glow.checked));
+  ui.glow.addEventListener('change', () => {
+    setGlow(ui.glow.checked);
+    markSceneCustom();
+  });
   ui.glowStrength.addEventListener('input', () => {
     glow.strength = Number(ui.glowStrength.value);
     applyGlowParams();
     saveGlow();
+    markSceneCustom();
   });
   ui.glowRadius.addEventListener('input', () => {
     glow.radius = Number(ui.glowRadius.value);
     applyGlowParams();
     saveGlow();
+    markSceneCustom();
   });
   ui.glowThreshold.addEventListener('input', () => {
     glow.threshold = Number(ui.glowThreshold.value);
     applyGlowParams();
     saveGlow();
+    markSceneCustom();
   });
   /* Compression is a CONFIG key (store-backed, persisted + preset-aware), so its slider drives
      the store like the tuning panel does — marks the look custom, saves, routes (applyCompression
@@ -1632,6 +1688,7 @@ async function main(): Promise<void> {
       routeKey('compression');
       panel.sync();
       syncLook();
+      markSceneCustom();
     }
   });
 
@@ -2658,12 +2715,16 @@ async function main(): Promise<void> {
   const panel = createPanel({
     store,
     schema,
-    onChange: routeKey,
+    onChange: (key: string): void => {
+      routeKey(key);
+      markSceneCustom(); // a tuning-panel edit diverges from the active scene preset (guarded)
+    },
     onBulk: (): void => {
       applyAll();
       syncLook();
       // a preset / reset / paste may have moved colorMode|colorOrder|cardAttention — re-grey all
       panel.setInert(inertKeys());
+      markSceneCustom();
     },
     inertKeys: UNROUTED_KEYS,
   });
@@ -2933,6 +2994,120 @@ async function main(): Promise<void> {
     // turns it off, so picking any other look is a clean return to the un-bloomed field.
     setGlow(ui.look.value === 'nebula');
     applyAll();
+    markSceneCustom(); // picking a look diverges from the active scene preset
+  });
+
+  /* ======================================================================================
+   * SCENE PRESETS — one pick drives the WHOLE scene (hierarchy + look + glow + view), reusing
+   * the playground's existing apply paths. applyScene is guarded by applyingScene so the cascade
+   * of applies it fires never flips the selector to 'custom'. 'space4' is the curated galaxy-
+   * nebula; 'default' returns to the neutral frozen field. The chosen scene persists (SCENE_KEY)
+   * and is re-applied on every boot — so it survives a dataset-size switch (which reloads).
+   * ====================================================================================== */
+  const buildSpace4Rows = (): LevelRow[] => [
+    // L0 — systems laid out as spiral galaxies, slow turn
+    mkRow('system', 'preset:spiralGalaxy', {
+      ordering: 'byHash',
+      density: 'exponential',
+      densityAxis: 0,
+      scatter: 'gaussian',
+      shapeP: { arms: 6, swirl: 5, bar: 0.03, radialPower: 0.35 },
+      densP: { rate: 1.25 },
+      scatP: { thickness: 0.01 },
+      spread: 1,
+      spin: true,
+      spinRate: 0.02,
+      spinAxis: [0, 1, 0],
+    }),
+    // L1 — a shape per type cluster (by-cluster-facet), power-law packed
+    mkRow('type', BY_FACET_PLACE, {
+      ordering: 'byIndex',
+      density: 'powerLaw',
+      scatter: 'gaussian',
+      shapeP: {},
+      densP: { alpha: 1e8 },
+      scatP: { thickness: 0.5 },
+      spread: 1,
+      spin: true,
+      spinRate: 0.1,
+      spinAxis: [0, 1, 0],
+    }),
+    // L2 (leaf) — nodes on a thin disc
+    mkRow(null, 'disc', {
+      ordering: 'byIndex',
+      density: 'exponential',
+      densityAxis: 1,
+      scatter: 'gaussian',
+      shapeP: {},
+      densP: {},
+      scatP: { thickness: 0.01 },
+      spread: 1,
+      spin: true,
+      spinRate: 0.3,
+      spinAxis: [0, 1, 0],
+    }),
+  ];
+  const applyScene = (name: string): void => {
+    if (name !== 'space4' && name !== 'default') return;
+    applyingScene = true;
+    // 1. LOOK (config): reset to the neutral 'field' baseline, then overlay the scene's diff.
+    store.applyPreset('field');
+    if (name === 'space4') {
+      for (const [k, v] of Object.entries(SPACE4_LOOK)) store.set(k, v);
+      panel.markCustom();
+    }
+    // 2. GLOW: set the bloom params + on/off (setGlow reroutes the tonemap seam, reflects the UI,
+    //    persists, and toggles the glow-box rows).
+    const g = name === 'space4' ? SPACE4_GLOW : { on: false, strength: 1.3, radius: 0.4, threshold: 1 };
+    glow.strength = g.strength;
+    glow.radius = g.radius;
+    glow.threshold = g.threshold;
+    ui.glowStrength.value = String(g.strength);
+    ui.glowRadius.value = String(g.radius);
+    ui.glowThreshold.value = String(g.threshold);
+    setGlow(g.on);
+    // 3. HIERARCHY / mode
+    if (name === 'space4') {
+      mode = 'custom';
+      ui.mode.value = 'custom';
+      ui.levelsbox.style.display = '';
+      rows = buildSpace4Rows();
+      ui.hpreset.value = '';
+      renderLevels();
+      applyCustomNow(false);
+    } else {
+      mode = 'frozen';
+      ui.mode.value = 'frozen';
+      ui.levelsbox.style.display = 'none';
+      applyFrozen();
+    }
+    saveLevels();
+    // 4. VIEW: distance + projection
+    const view = name === 'space4' ? SPACE4_VIEW : { distance: 1, projection: '3d' as const };
+    ui.viewdist.value = String(view.distance);
+    applyViewDistance();
+    ui.proj.value = view.projection;
+    applyProjection();
+    // 5. route the config through every subsystem + sync the panels
+    applyAll();
+    panel.sync();
+    panel.setInert(inertKeys());
+    syncLook();
+    store.save();
+    // 6. selector state + persistence
+    currentScene = name;
+    ui.scene.value = name;
+    try {
+      localStorage.setItem(SCENE_KEY, name);
+    } catch {
+      /* storage denied: the session still works, the choice just will not persist */
+    }
+    applyingScene = false;
+    updateStats();
+  };
+  ui.scene.addEventListener('change', () => {
+    const v = ui.scene.value;
+    if (v === 'space4' || v === 'default') applyScene(v);
   });
 
   /* ---- the stats overlay: rAF-interval median (SCALE.md's measurement) + jsFrameMs, and
@@ -3034,6 +3209,22 @@ async function main(): Promise<void> {
     ui.levelsbox.style.display = mode === 'custom' ? '' : 'none';
     renderLevels();
     if (mode === 'custom') applyCustomNow(false);
+  }
+
+  /* ---- SCENE boot: a fresh visitor (no stored scene) opens directly on space4; a returning
+     visitor re-applies whichever scene they chose, so it survives reloads AND dataset-size
+     switches (which reload the page). 'custom' keeps the state restored above and just reflects
+     it in the selector. */
+  {
+    const storedScene = localStorage.getItem(SCENE_KEY);
+    if (storedScene === null || storedScene === 'space4') {
+      applyScene('space4');
+    } else if (storedScene === 'default') {
+      applyScene('default');
+    } else {
+      currentScene = 'custom';
+      ui.scene.value = 'custom';
+    }
   }
 
   const loop = (t: number): void => {

@@ -651,6 +651,19 @@ body.light #regionlabels .rl b {
   display: flex;
 }
 
+/* ---- the top-level SCENE preset selector: the most global control, set apart from the rest -- */
+#panel #scenebox {
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  padding-bottom: 7px;
+  border-bottom: 1px solid #27314a;
+  margin-bottom: 1px;
+}
+#panel #scenebox select {
+  color: #e6ecf8;
+  border-color: #3a4a6e;
+}
+
 /* ---- collapsible control groups (native <details class="grp">) ------------------------- */
 #panel details.grp {
   display: grid;

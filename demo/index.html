@@ -20,6 +20,16 @@
         <span>STARSCAPE · PLAYGROUND</span>
         <button id="keys" type="button" title="camera keys &amp; help">? keys</button>
       </h3>
+      <!-- SCENE PRESET: the most global pick — sets the whole scene (hierarchy + look + glow + view)
+           at once, independent of dataset size. Defaults to space4 on a fresh load. -->
+      <label id="scenebox"
+        >preset
+        <select id="scene" title="a whole curated scene: hierarchy + look + glow + view">
+          <option value="space4">space4 — spiral galaxy</option>
+          <option value="default">default — frozen field</option>
+          <option value="custom" disabled>· custom ·</option>
+        </select>
+      </label>
       <div id="find">
         <input id="search" type="text" placeholder="find a node /" autocomplete="off" spellcheck="false" />
         <div id="hits"></div>
