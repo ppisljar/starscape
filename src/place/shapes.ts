@@ -315,6 +315,46 @@ const dendrite: Shape = {
   },
 };
 
+/** `torusKnot` — a (p, q) torus knot: a single closed curve winding `p` times around the
+ *  Y axis while its tube angle advances `q` times, so it threads a torus as a genuine knot
+ *  (the default 2,3 is the trefoil). The predecessor had no knotted curve; this is the one
+ *  exotic 1-D manifold, and like `ring` it is bare bone — thickness is scatter's job.
+ *
+ *  Param axis: u0 = parameter fraction along the knot; θ = 2π·u0 drives BOTH windings, so a
+ *  density crowds members along the knot exactly as it does along a ring, and byIndex spaces
+ *  them evenly around the single closed loop.
+ *  Params: `p` — turns around the Y axis (default 2, rounded, ≥ 1);
+ *          `q` — turns around the tube (default 3, rounded, ≥ 1);
+ *          `tube` — tube radius as a fraction of `radius` (default 0.3, clamped to (0, 0.6]).
+ *  Size policy: distance from the origin is scale·(1 + tube·cos(qθ)) in the plane plus the
+ *  tube's vertical swing, maximal at cos(qθ)=1 where |p| = scale·(1+tube); with
+ *  scale = radius/(1+tube) that maximum is exactly `radius`.
+ *  Bound: |p| ≤ radius exactly. */
+const torusKnot: Shape = {
+  key: 'torusKnot',
+  dim: 1,
+  params: [
+    { key: 'p', label: 'p·axis', default: 2, min: 1, max: 8, step: 1 },
+    { key: 'q', label: 'q·tube', default: 3, min: 1, max: 8, step: 1 },
+    { key: 'tube', label: 'tube', default: 0.3, min: 0.05, max: 0.6, step: 0.05 },
+  ],
+  place(u, radius, count, out, outOffset, params): void {
+    const p = Math.max(1, Math.round(params['p'] ?? 2));
+    const q = Math.max(1, Math.round(params['q'] ?? 3));
+    const tube = Math.min(0.6, Math.max(1e-6, params['tube'] ?? 0.3));
+    const scale = radius / (1 + tube);
+    for (let k = 0; k < count; k++) {
+      const th = u[k]! * TAU;
+      const rr = (1 + tube * Math.cos(q * th)) * scale; // distance from the Y axis
+      const az = p * th;
+      const o = outOffset + k * 3;
+      out[o] = Math.cos(az) * rr;
+      out[o + 1] = tube * Math.sin(q * th) * scale;
+      out[o + 2] = Math.sin(az) * rr;
+    }
+  },
+};
+
 /* ================================================================== surfaces (dim 2) */
 
 /** `shell` — the surface of a sphere of radius `radius`, area-uniform.
@@ -405,6 +445,116 @@ const torus: Shape = {
   },
 };
 
+/* ------------------------------------------------------------------ superShape
+ * Gielis's superformula (Gielis, Am. J. Botany 90:333, 2003), the one-knob-too-many shape:
+ * a radius-vs-angle curve r(φ) = (|cos(mφ/4)|^n2 + |sin(mφ/4)|^n3)^(−1/n1) that turns into
+ * stars, polygons, flowers and blobs as its four exponents move — great for the playground.
+ * The 3-D form (dim 2 surface) is the spherical product of TWO superformulas, one for
+ * longitude and one for latitude, the standard Gielis supershape. */
+
+/** The superformula radius at `angle` (a = b = 1). Natural units; the shape scales by radius
+ *  and clamps. A vanishing bracket (both lobes zero at once) returns a large value that the
+ *  magnitude clamp reins back in, so exotic exponents never emit an infinite coordinate. */
+function superR(angle: number, m: number, n1: number, n2: number, n3: number): number {
+  const t = (m * angle) / 4;
+  const c = Math.pow(Math.abs(Math.cos(t)), n2);
+  const s = Math.pow(Math.abs(Math.sin(t)), n3);
+  const bracket = c + s;
+  if (bracket < 1e-9) return 1e9;
+  return Math.pow(bracket, -1 / n1);
+}
+
+/** `superShape` — a Gielis supershape surface (dim 2): the spherical product of two
+ *  superformulas, longitude × latitude, so one exponent set sculpts both sweeps.
+ *
+ *  Param axes: u0 = longitude fraction (θ = 2π·u0 − π); u1 = latitude fraction
+ *  (φ = π·u1 − π/2, poles on the Y axis). A density on axis 0 crowds the longitudinal sweep,
+ *  on axis 1 the latitudinal one.
+ *  Params: `m` — lobe/symmetry count (default 6, the classic six-point form; may be fractional
+ *          for asymmetric shapes); `n1`,`n2`,`n3` — the superformula exponents (default 1 each:
+ *          with m = 6 that is a gently six-lobed blob, natural radius in [√½, 1]).
+ *  Size policy: the natural radius of the default lobes never exceeds 1, so scaling by `radius`
+ *  fits the sphere; any point a wilder exponent set pushes past is projected back onto it.
+ *  Bound: |p| ≤ radius exactly (the final magnitude clamp guarantees it for every exponent). */
+const superShape: Shape = {
+  key: 'superShape',
+  dim: 2,
+  params: [
+    { key: 'm', label: 'm·sym', default: 6, min: 1, max: 20, step: 1 },
+    { key: 'n1', label: 'n1', default: 1, min: 0.1, max: 8, step: 0.1 },
+    { key: 'n2', label: 'n2', default: 1, min: 0.1, max: 8, step: 0.1 },
+    { key: 'n3', label: 'n3', default: 1, min: 0.1, max: 8, step: 0.1 },
+  ],
+  place(u, radius, count, out, outOffset, params): void {
+    const m = params['m'] ?? 6;
+    const n1 = params['n1'] ?? 1;
+    const n2 = params['n2'] ?? 1;
+    const n3 = params['n3'] ?? 1;
+    for (let k = 0; k < count; k++) {
+      const b = k * 2;
+      const lon = u[b]! * TAU - Math.PI; // θ ∈ [−π, π)
+      const lat = u[b + 1]! * Math.PI - Math.PI / 2; // φ ∈ [−π/2, π/2)
+      const r1 = superR(lon, m, n1, n2, n3);
+      const r2 = superR(lat, m, n1, n2, n3);
+      const cosLat = Math.cos(lat);
+      let x = r1 * Math.cos(lon) * r2 * cosLat * radius;
+      let y = r2 * Math.sin(lat) * radius;
+      let z = r1 * Math.sin(lon) * r2 * cosLat * radius;
+      const mg = Math.sqrt(x * x + y * y + z * z);
+      if (mg > radius) {
+        const f = radius / mg; // project a blown-up exotic point back onto the sphere
+        x *= f;
+        y *= f;
+        z *= f;
+      }
+      const o = outOffset + k * 3;
+      out[o] = x;
+      out[o + 1] = y;
+      out[o + 2] = z;
+    }
+  },
+};
+
+/** `phyllotaxis` — Vogel's sunflower spiral (dim 2 disc): member index i seats at angle
+ *  i·goldenAngle and radius ∝ √i, the golden-angle packing that fills a disc with no gaps or
+ *  seams (the florets of a sunflower head). Organic where `disc` is regular.
+ *
+ *  Param axes: u0 is read as the member's INDEX (i = floor(u0·count), the same rank→index
+ *  reading `dendrite` uses), which is what makes consecutive members step one golden angle
+ *  apart; u1 feeds the optional jitter. A density on axis 0 bends the index assignment and so
+ *  the radial crowding; with byIndex it is the clean Vogel disc.
+ *  Params: `jitter` — organic disorder (default 0 = the exact spiral): each member is nudged
+ *          up to ±½·jitter of a step ALONG the phyllotaxis flow (both its angle and radius
+ *          move together), so the rings soften into a natural scatter instead of a rigid grid.
+ *  Size policy: radius = `radius`·√((i+½)/count) ≤ radius.
+ *  Bound: |p| ≤ radius exactly (y = 0, flat in the XZ plane). */
+const phyllotaxis: Shape = {
+  key: 'phyllotaxis',
+  dim: 2,
+  params: [{ key: 'jitter', label: 'jitter', default: 0, min: 0, max: 1, step: 0.05 }],
+  place(u, radius, count, out, outOffset, params): void {
+    const jitter = params['jitter'] ?? 0;
+    const invN = 1 / Math.max(1, count);
+    for (let k = 0; k < count; k++) {
+      const b = k * 2;
+      let i = Math.floor(u[b]! * count);
+      if (i >= count) i = count - 1; // guard f32 rounding at u0 → 1⁻
+      if (i < 0) i = 0;
+      // perturb the continuous phyllotaxis index (jitter 0 ⇒ u1 is a no-op: exact spiral)
+      const idxF = i + (u[b + 1]! - 0.5) * jitter;
+      const angle = idxF * GOLDEN_ANGLE;
+      let frac = (idxF + 0.5) * invN;
+      if (frac < 0) frac = 0;
+      if (frac > 1) frac = 1;
+      const r = radius * Math.sqrt(frac);
+      const o = outOffset + k * 3;
+      out[o] = Math.cos(angle) * r;
+      out[o + 1] = 0;
+      out[o + 2] = Math.sin(angle) * r;
+    }
+  },
+};
+
 /* ================================================================== volumes (dim 3) */
 
 /** `ball` — a solid sphere, volume-uniform by default; optionally squashed.
@@ -480,6 +630,50 @@ const box: Shape = {
   },
 };
 
+/** `cone` — a solid cone, apex up (+Y), base a disc below, inscribed in the sphere.
+ *
+ *  Param axes: u0 = azimuth (θ = 2π·u0); u1 = height coordinate (s = √u1, so members spread
+ *  evenly along the SLANT rather than piling at the apex); u2 = radial coordinate within the
+ *  local disc, area-corrected (√) and lifted off the axis by `hollow`.
+ *  Params: `aperture` — the apex HALF-ANGLE in radians (default 0.6 ≈ 34°; clamped to
+ *          [0.05, 1.4] — a thin spike toward 0, a flat cap toward π/2);
+ *          `hollow` — 0 solid … 1 surface-only (default 0): the inner radial fraction floor,
+ *          so `hollow` 1 lays every member exactly on the lateral surface (a hollow cone) and
+ *          anything between fills an annular shell.
+ *  Size policy: for half-angle α the base radius is (radius − yB)·tanα with the base plane
+ *          yB = radius·(tan²α − 1)/(tan²α + 1), the value that lands both the apex and the base
+ *          rim exactly on the sphere |p| = radius; the solid is their convex hull.
+ *  Bound: |p| ≤ radius exactly. */
+const cone: Shape = {
+  key: 'cone',
+  dim: 3,
+  params: [
+    { key: 'aperture', label: 'aperture', default: 0.6, min: 0.1, max: 1.4, step: 0.05 },
+    { key: 'hollow', label: 'hollow', default: 0, min: 0, max: 1, step: 0.05 },
+  ],
+  place(u, radius, count, out, outOffset, params): void {
+    const aperture = Math.min(1.4, Math.max(0.05, params['aperture'] ?? 0.6));
+    const hollow = Math.min(1, Math.max(0, params['hollow'] ?? 0));
+    const t = Math.tan(aperture);
+    const t2 = t * t;
+    const yB = (radius * (t2 - 1)) / (t2 + 1); // base plane: apex(+radius) & rim both on sphere
+    const H = radius - yB; // apex-to-base height
+    const rb = H * t; // base radius
+    const g0 = hollow * hollow; // inner radial-fraction² floor (0 solid … 1 surface)
+    for (let k = 0; k < count; k++) {
+      const b = k * 3;
+      const th = u[b]! * TAU;
+      const s = Math.sqrt(u[b + 1]!); // height fraction, apex (0) → base (1), slant-even
+      const g = Math.sqrt(g0 + u[b + 2]! * (1 - g0)); // area-uniform fraction in [hollow, 1]
+      const localR = g * s * rb;
+      const o = outOffset + k * 3;
+      out[o] = Math.cos(th) * localR;
+      out[o + 1] = radius - s * H;
+      out[o + 2] = Math.sin(th) * localR;
+    }
+  },
+};
+
 /* `cloud` (dim 3, gaussian ball) is the engine's built-in — registered in ./engine, not
  * duplicated here; it needed no extension for the §3.3 set. */
 
@@ -488,8 +682,12 @@ registerShape(line);
 registerShape(helix);
 registerShape(spiralArm);
 registerShape(dendrite);
+registerShape(torusKnot);
 registerShape(shell);
 registerShape(disc);
 registerShape(torus);
+registerShape(superShape);
+registerShape(phyllotaxis);
 registerShape(ball);
 registerShape(box);
+registerShape(cone);

@@ -64,11 +64,17 @@ const BOUND: Array<{ spec: PlacementSpec; tol: number }> = [
   { spec: { shape: 'helix' }, tol: 1 + 1e-5 },
   { spec: { shape: 'spiralArm' }, tol: 1 + 1e-5 },
   { spec: { shape: 'dendrite' }, tol: 1 + 1e-5 },
+  { spec: { shape: 'torusKnot' }, tol: 1 + 1e-5 },
   { spec: { shape: 'shell' }, tol: 1 + 1e-5 },
   { spec: { shape: 'disc' }, tol: 1 + 1e-5 },
   { spec: { shape: 'torus' }, tol: 1 + 1e-5 },
+  { spec: { shape: 'superShape' }, tol: 1 + 1e-5 },
+  { spec: { shape: 'phyllotaxis' }, tol: 1 + 1e-5 },
   { spec: { shape: 'ball' }, tol: 1 + 1e-5 },
   { spec: { shape: 'box' }, tol: Math.sqrt(3) * (1 + 1e-5) },
+  { spec: { shape: 'cone' }, tol: 1 + 1e-5 },
+  // the superShape magnitude clamp holds for hostile exponents too (small n1 blows the raw radius)
+  { spec: { shape: 'superShape', params: { m: 7, n1: 0.2, n2: 0.4, n3: 0.4 } }, tol: 1 + 1e-5 },
 ];
 
 describe('radius bound', () => {
@@ -94,11 +100,15 @@ const GOLDEN: Array<{ spec: PlacementSpec; fnv: number }> = [
   { spec: { shape: 'helix', params: { turns: 3, coil: 0.4 } }, fnv: 253414273 },
   { spec: { shape: 'spiralArm', params: { arms: 2, swirl: 2.5 } }, fnv: 2298895269 },
   { spec: { shape: 'dendrite' }, fnv: 1806527155 },
+  { spec: { shape: 'torusKnot', params: { p: 2, q: 3, tube: 0.3 } }, fnv: 3622944349 },
   { spec: { shape: 'shell' }, fnv: 929740504 },
   { spec: { shape: 'disc' }, fnv: 236750619 },
   { spec: { shape: 'torus', params: { tube: 0.25 } }, fnv: 2576968585 },
+  { spec: { shape: 'superShape', params: { m: 6, n1: 1, n2: 1, n3: 1 } }, fnv: 2728218065 },
+  { spec: { shape: 'phyllotaxis' }, fnv: 1668539647 },
   { spec: { shape: 'ball' }, fnv: 3773177055 },
   { spec: { shape: 'box' }, fnv: 1949661858 },
+  { spec: { shape: 'cone', params: { aperture: 0.6, hollow: 0 } }, fnv: 2025580209 },
 ];
 
 describe('determinism', () => {
@@ -480,6 +490,168 @@ describe('box', () => {
   });
 });
 
+/* ---------------------------------------------------------------- added curve: torusKnot */
+
+describe('torusKnot', () => {
+  it('every member lies ON the torus tube (the knot threads a torus of minor radius tube·R)', () => {
+    const n = 400;
+    const tube = 0.3;
+    const p = place({ shape: 'torusKnot', params: { p: 2, q: 3, tube } }, n);
+    const scale = R / (1 + tube);
+    for (let k = 0; k < n; k++) {
+      const rho = Math.hypot(p[k * 3]!, p[k * 3 + 2]!); // distance from the Y axis
+      const u = rho / scale - 1;
+      const v = p[k * 3 + 1]! / scale;
+      expect(Math.hypot(u, v)).toBeCloseTo(tube, 3); // on the tube surface
+      expect(mag(p, k)).toBeLessThanOrEqual(R * (1 + 1e-5));
+    }
+  });
+
+  it('winds p times about the Y axis: the azimuth advances ~2π·p root to tip', () => {
+    const n = 2000;
+    const pw = 2;
+    const q = 3;
+    const pts = place({ shape: 'torusKnot', params: { p: pw, q, tube: 0.3 } }, n);
+    let total = 0;
+    let prev = Math.atan2(pts[2]!, pts[0]!);
+    for (let k = 1; k < n; k++) {
+      const a = Math.atan2(pts[k * 3 + 2]!, pts[k * 3]!);
+      let d = a - prev;
+      if (d > Math.PI) d -= 2 * Math.PI;
+      if (d < -Math.PI) d += 2 * Math.PI;
+      total += d;
+      prev = a;
+    }
+    expect(Math.abs(total)).toBeGreaterThan(2 * Math.PI * pw * 0.95);
+    expect(Math.abs(total)).toBeLessThan(2 * Math.PI * pw * 1.05);
+  });
+});
+
+/* ---------------------------------------------------------------- added surfaces */
+
+describe('superShape', () => {
+  it('bounded by R and NOT a sphere: |p| varies across the lobes (unlike shell)', () => {
+    const n = 1024;
+    const p = place({ shape: 'superShape', params: { m: 6, n1: 1, n2: 1, n3: 1 } }, n);
+    let lo = Infinity;
+    let hi = 0;
+    for (let k = 0; k < n; k++) {
+      const m = mag(p, k);
+      expect(m).toBeLessThanOrEqual(R * (1 + 1e-5));
+      lo = Math.min(lo, m);
+      hi = Math.max(hi, m);
+    }
+    expect(hi).toBeGreaterThan(0.9 * R); // the lobe tips reach the sphere
+    expect(hi - lo).toBeGreaterThan(0.1 * R); // …and the valleys dip in — a lobed surface
+  });
+
+  it('a hostile small-n1 exponent set stays on/inside the sphere (the clamp holds)', () => {
+    const n = 512;
+    const p = place({ shape: 'superShape', params: { m: 5, n1: 0.2, n2: 0.3, n3: 0.3 } }, n);
+    for (let k = 0; k < n; k++) {
+      expect(Number.isFinite(mag(p, k))).toBe(true);
+      expect(mag(p, k)).toBeLessThanOrEqual(R * (1 + 1e-5));
+    }
+  });
+});
+
+describe('phyllotaxis', () => {
+  it('flat disc (y = 0), r ≤ R, and the golden-angle step between consecutive indices', () => {
+    const n = 500;
+    const GOLDEN = 2.399963229728653;
+    const p = place({ shape: 'phyllotaxis' }, n);
+    for (let k = 0; k < n; k++) {
+      expect(p[k * 3 + 1]).toBe(0); // flat in the XZ plane
+      expect(Math.hypot(p[k * 3]!, p[k * 3 + 2]!)).toBeLessThanOrEqual(R * (1 + 1e-5));
+    }
+    // members 0..n-1 are ascending, so index k seats at angle k·goldenAngle: consecutive
+    // members differ by the golden angle (mod 2π) — the sunflower's defining step.
+    for (let k = 10; k < 20; k++) {
+      const a0 = Math.atan2(p[k * 3 + 2]!, p[k * 3]!);
+      const a1 = Math.atan2(p[(k + 1) * 3 + 2]!, p[(k + 1) * 3]!);
+      let d = a1 - a0;
+      while (d <= -Math.PI) d += 2 * Math.PI;
+      while (d > Math.PI) d -= 2 * Math.PI;
+      let g = GOLDEN;
+      while (g > Math.PI) g -= 2 * Math.PI; // golden angle folded into (−π, π]
+      expect(Math.abs(d - g)).toBeLessThan(1e-3);
+    }
+  });
+
+  it('area-correct: r²/R² quantiles are ~uniform (the √ radial packing)', () => {
+    const n = 4096;
+    const p = place({ shape: 'phyllotaxis' }, n);
+    const r2: number[] = [];
+    for (let k = 0; k < n; k++) r2.push((p[k * 3]! ** 2 + p[k * 3 + 2]! ** 2) / (R * R));
+    expect(chi2(r2, 0, 1 + 1e-6, 8)).toBeLessThan(30);
+  });
+
+  it('jitter 0 (the default) is byte-identical to omitting it (u1 is a no-op)', () => {
+    const a = place({ shape: 'phyllotaxis' }, 64);
+    const b = place({ shape: 'phyllotaxis', params: { jitter: 0 } }, 64);
+    expect(Array.from(a)).toEqual(Array.from(b));
+  });
+
+  it('jitter > 0 perturbs the points (the rings soften)', () => {
+    const a = place({ shape: 'phyllotaxis' }, 256);
+    const b = place({ shape: 'phyllotaxis', params: { jitter: 0.8 } }, 256);
+    let moved = 0;
+    for (let k = 0; k < 256; k++) {
+      if (Math.hypot(a[k * 3]! - b[k * 3]!, a[k * 3 + 2]! - b[k * 3 + 2]!) > 1e-4) moved++;
+    }
+    expect(moved).toBeGreaterThan(200); // most members shifted
+  });
+});
+
+/* ---------------------------------------------------------------- added volume: cone */
+
+describe('cone', () => {
+  it('apex up at +Y, base below; every member inside the cone envelope and the sphere', () => {
+    const n = 1000;
+    const aperture = 0.6;
+    const p = place({ shape: 'cone', params: { aperture } }, n);
+    const t = Math.tan(aperture);
+    const t2 = t * t;
+    const yB = (R * (t2 - 1)) / (t2 + 1);
+    const H = R - yB;
+    const rb = H * t;
+    let highY = -Infinity;
+    for (let k = 0; k < n; k++) {
+      const y = p[k * 3 + 1]!;
+      const rho = Math.hypot(p[k * 3]!, p[k * 3 + 2]!);
+      expect(y).toBeLessThanOrEqual(R + 1e-4); // never above the apex
+      expect(y).toBeGreaterThanOrEqual(yB - 1e-4); // never below the base
+      // in-plane radius bounded by the cone's radius at this height: rb·(R − y)/H
+      expect(rho).toBeLessThanOrEqual((rb * (R - y)) / H + 1e-4);
+      expect(mag(p, k)).toBeLessThanOrEqual(R * (1 + 1e-5));
+      highY = Math.max(highY, y);
+    }
+    expect(highY).toBeGreaterThan(0.9 * R); // members reach up toward the apex
+  });
+
+  it('hollow 1 lays every member ON the lateral surface (ρ = rb·(R−y)/H)', () => {
+    const n = 800;
+    const aperture = 0.6;
+    const p = place({ shape: 'cone', params: { aperture, hollow: 1 } }, n);
+    const t = Math.tan(aperture);
+    const t2 = t * t;
+    const yB = (R * (t2 - 1)) / (t2 + 1);
+    const H = R - yB;
+    const rb = H * t;
+    for (let k = 0; k < n; k++) {
+      const y = p[k * 3 + 1]!;
+      const rho = Math.hypot(p[k * 3]!, p[k * 3 + 2]!);
+      expect(rho).toBeCloseTo((rb * (R - y)) / H, 3); // on the slant, not inside it
+    }
+  });
+
+  it('hollow 0 (the default) is byte-identical to omitting it', () => {
+    const a = place({ shape: 'cone' }, 64);
+    const b = place({ shape: 'cone', params: { hollow: 0 } }, 64);
+    expect(Array.from(a)).toEqual(Array.from(b));
+  });
+});
+
 /* ---------------------------------------------------------------- spec plumbing */
 
 describe('spec plumbing', () => {
@@ -487,18 +659,22 @@ describe('spec plumbing', () => {
     expect(() => place({ shape: 'ring', densityAxis: 1 }, 4)).toThrow(/densityAxis/);
   });
 
-  it('all ten §3.3 shapes resolve from the registry via placeGroup', () => {
+  it('all §3.3 shapes — the originals and the new set — resolve via placeGroup', () => {
     for (const key of [
       'ring',
       'line',
       'helix',
       'spiralArm',
       'dendrite',
+      'torusKnot',
       'shell',
       'disc',
       'torus',
+      'superShape',
+      'phyllotaxis',
       'ball',
       'box',
+      'cone',
       'cloud', // the engine built-in the set completes
     ]) {
       expect(() => place({ shape: key }, 8)).not.toThrow();
