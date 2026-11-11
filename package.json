@@ -26,7 +26,12 @@
     "lint": "eslint .",
     "test": "vitest run",
     "build": "tsc -p tsconfig.build.json",
-    "check": "bash check.sh"
+    "check": "bash check.sh",
+    "build:playground": "vite build",
+    "build:api": "typedoc",
+    "build:site": "node scripts/build-site.mjs",
+    "build:pages": "npm run build:playground && npm run build:api && npm run build:site",
+    "preview:pages": "npm run build:pages && vite preview --outDir site-dist --base /starscape/"
   },
   "peerDependencies": {
     "three": ">=0.170.0"
@@ -34,7 +39,9 @@
   "devDependencies": {
     "@types/three": "^0.187.0",
     "eslint": "^9",
+    "marked": "^18.2.0",
     "three": "^0.187.0",
+    "typedoc": "^0.28.20",
     "typescript": "^5",
     "typescript-eslint": "^8.72.1",
     "vite": "^8.3.6",

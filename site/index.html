@@ -1,0 +1,362 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>starscape — fly a million-node graph</title>
+    <meta
+      name="description"
+      content="A WebGPU graph-visualization library that renders very large graphs (10⁶+ nodes) as a 3D field you fly through — N-level hierarchies, deterministic placement, two draw calls at any scale."
+    />
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ctext y='26' font-size='26'%3E%E2%9C%A8%3C/text%3E%3C/svg%3E" />
+    <style>
+      :root {
+        --bg: #05060d;
+        --bg-soft: #0b0e1c;
+        --panel: rgba(18, 22, 44, 0.55);
+        --panel-border: rgba(120, 140, 255, 0.18);
+        --ink: #eaf0ff;
+        --ink-dim: #9aa6cc;
+        --ink-faint: #6b7499;
+        --accent: #7aa2ff;
+        --accent-2: #c77dff;
+        --accent-3: #4dd6c1;
+        --glow: 0 0 40px rgba(122, 162, 255, 0.35);
+        --radius: 14px;
+        --maxw: 1080px;
+        --mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+        --sans: "Inter", ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+      }
+      * { box-sizing: border-box; }
+      html { scroll-behavior: smooth; }
+      body {
+        margin: 0;
+        font-family: var(--sans);
+        color: var(--ink);
+        background: var(--bg);
+        line-height: 1.6;
+        -webkit-font-smoothing: antialiased;
+        overflow-x: hidden;
+      }
+      #stars {
+        position: fixed;
+        inset: 0;
+        z-index: -2;
+        display: block;
+      }
+      body::before {
+        content: "";
+        position: fixed;
+        inset: 0;
+        z-index: -1;
+        background:
+          radial-gradient(1200px 700px at 72% -10%, rgba(122, 90, 248, 0.22), transparent 60%),
+          radial-gradient(900px 600px at 10% 10%, rgba(77, 214, 193, 0.12), transparent 55%),
+          radial-gradient(1000px 900px at 50% 120%, rgba(199, 125, 255, 0.14), transparent 60%);
+        pointer-events: none;
+      }
+      a { color: var(--accent); text-decoration: none; }
+      a:hover { text-decoration: underline; }
+      .wrap { max-width: var(--maxw); margin: 0 auto; padding: 0 24px; }
+
+      /* ---- top nav ---- */
+      header.nav {
+        position: sticky;
+        top: 0;
+        z-index: 10;
+        backdrop-filter: blur(10px);
+        background: linear-gradient(180deg, rgba(5, 6, 13, 0.85), rgba(5, 6, 13, 0.35));
+        border-bottom: 1px solid var(--panel-border);
+      }
+      .nav .wrap { display: flex; align-items: center; gap: 20px; height: 60px; }
+      .brand { font-weight: 700; letter-spacing: 0.2px; font-size: 18px; display: flex; gap: 8px; align-items: center; }
+      .brand .dot { width: 10px; height: 10px; border-radius: 50%; background: radial-gradient(circle at 30% 30%, #fff, var(--accent) 60%, transparent); box-shadow: var(--glow); }
+      .nav nav { margin-left: auto; display: flex; gap: 22px; align-items: center; font-size: 14px; }
+      .nav nav a { color: var(--ink-dim); }
+      .nav nav a:hover { color: var(--ink); text-decoration: none; }
+      .nav .gh { color: var(--ink); }
+
+      /* ---- hero ---- */
+      .hero { padding: 90px 0 70px; text-align: center; }
+      .eyebrow {
+        display: inline-block;
+        font-family: var(--mono);
+        font-size: 12.5px;
+        letter-spacing: 1.5px;
+        text-transform: uppercase;
+        color: var(--accent-3);
+        border: 1px solid rgba(77, 214, 193, 0.3);
+        border-radius: 999px;
+        padding: 5px 14px;
+        margin-bottom: 26px;
+      }
+      .hero h1 {
+        font-size: clamp(38px, 7vw, 76px);
+        line-height: 1.02;
+        margin: 0 0 20px;
+        font-weight: 800;
+        letter-spacing: -1.5px;
+        background: linear-gradient(180deg, #ffffff 20%, #b9c6ff 75%, #8f7df0);
+        -webkit-background-clip: text;
+        background-clip: text;
+        color: transparent;
+      }
+      .hero p.lead {
+        font-size: clamp(17px, 2.4vw, 21px);
+        color: var(--ink-dim);
+        max-width: 680px;
+        margin: 0 auto 36px;
+      }
+      .cta { display: flex; gap: 14px; justify-content: center; flex-wrap: wrap; }
+      .btn {
+        display: inline-flex;
+        align-items: center;
+        gap: 9px;
+        padding: 13px 24px;
+        border-radius: 12px;
+        font-weight: 600;
+        font-size: 15px;
+        border: 1px solid transparent;
+        transition: transform 0.15s ease, box-shadow 0.15s ease, background 0.15s ease;
+      }
+      .btn:hover { transform: translateY(-2px); text-decoration: none; }
+      .btn-primary {
+        background: linear-gradient(135deg, var(--accent), var(--accent-2));
+        color: #0a0a18;
+        box-shadow: var(--glow);
+      }
+      .btn-primary:hover { box-shadow: 0 0 56px rgba(122, 162, 255, 0.55); }
+      .btn-ghost { background: var(--panel); color: var(--ink); border-color: var(--panel-border); }
+      .btn-ghost:hover { border-color: var(--accent); }
+
+      .hero .meta { margin-top: 30px; font-family: var(--mono); font-size: 13px; color: var(--ink-faint); display: flex; gap: 22px; justify-content: center; flex-wrap: wrap; }
+      .hero .meta b { color: var(--ink); font-weight: 600; }
+
+      /* ---- sections ---- */
+      section { padding: 56px 0; }
+      .section-title { font-size: clamp(24px, 4vw, 34px); font-weight: 750; letter-spacing: -0.5px; margin: 0 0 8px; }
+      .section-sub { color: var(--ink-dim); margin: 0 0 36px; max-width: 620px; }
+
+      /* ---- feature grid ---- */
+      .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 18px; }
+      .card {
+        background: var(--panel);
+        border: 1px solid var(--panel-border);
+        border-radius: var(--radius);
+        padding: 24px;
+        transition: transform 0.18s ease, border-color 0.18s ease;
+      }
+      .card:hover { transform: translateY(-3px); border-color: rgba(122, 162, 255, 0.5); }
+      .card .ic { font-size: 22px; margin-bottom: 12px; }
+      .card h3 { margin: 0 0 7px; font-size: 17px; font-weight: 650; }
+      .card p { margin: 0; color: var(--ink-dim); font-size: 14.5px; }
+
+      /* ---- perf table ---- */
+      .tablewrap { overflow-x: auto; border: 1px solid var(--panel-border); border-radius: var(--radius); background: var(--panel); }
+      table { border-collapse: collapse; width: 100%; font-family: var(--mono); font-size: 13.5px; min-width: 560px; }
+      th, td { padding: 12px 16px; text-align: right; border-bottom: 1px solid rgba(120, 140, 255, 0.1); white-space: nowrap; }
+      th { color: var(--accent-3); font-weight: 600; text-transform: uppercase; letter-spacing: 0.6px; font-size: 11.5px; }
+      td:last-child, th:last-child { text-align: left; color: var(--ink-dim); }
+      tbody tr:last-child td { border-bottom: none; }
+      td b { color: var(--ink); }
+      .fps-hi { color: var(--accent-3); }
+      caption { caption-side: bottom; color: var(--ink-faint); font-size: 12px; padding: 12px 16px; text-align: left; font-family: var(--sans); }
+
+      /* ---- code ---- */
+      pre {
+        background: #080a16;
+        border: 1px solid var(--panel-border);
+        border-radius: var(--radius);
+        padding: 22px;
+        overflow-x: auto;
+        font-family: var(--mono);
+        font-size: 13px;
+        line-height: 1.7;
+        color: #cdd6f4;
+      }
+      pre .k { color: var(--accent-2); }
+      pre .s { color: var(--accent-3); }
+      pre .c { color: var(--ink-faint); font-style: italic; }
+      pre .f { color: var(--accent); }
+
+      .split { display: grid; grid-template-columns: 1fr 1fr; gap: 32px; align-items: center; }
+      @media (max-width: 820px) { .split { grid-template-columns: 1fr; } }
+
+      /* ---- depth list ---- */
+      .depths { display: grid; gap: 14px; }
+      .depth { display: flex; gap: 16px; align-items: flex-start; padding: 18px 20px; background: var(--panel); border: 1px solid var(--panel-border); border-radius: var(--radius); }
+      .depth .n { font-family: var(--mono); color: var(--accent); font-size: 13px; border: 1px solid var(--panel-border); border-radius: 8px; padding: 3px 10px; flex: none; margin-top: 2px; }
+      .depth h4 { margin: 0 0 4px; font-size: 16px; }
+      .depth p { margin: 0; color: var(--ink-dim); font-size: 14px; }
+
+      /* ---- big CTA ---- */
+      .bigcta { text-align: center; background: linear-gradient(135deg, rgba(122, 162, 255, 0.12), rgba(199, 125, 255, 0.1)); border: 1px solid var(--panel-border); border-radius: 22px; padding: 56px 24px; }
+      .bigcta h2 { font-size: clamp(26px, 4.5vw, 40px); margin: 0 0 14px; letter-spacing: -0.5px; }
+      .bigcta p { color: var(--ink-dim); margin: 0 0 28px; }
+
+      footer { border-top: 1px solid var(--panel-border); padding: 40px 0; color: var(--ink-faint); font-size: 14px; }
+      footer .wrap { display: flex; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
+      footer a { color: var(--ink-dim); }
+    </style>
+  </head>
+  <body>
+    <canvas id="stars"></canvas>
+
+    <header class="nav">
+      <div class="wrap">
+        <span class="brand"><span class="dot"></span> starscape</span>
+        <nav>
+          <a href="playground/">Playground</a>
+          <a href="docs/">Docs</a>
+          <a href="api/">API</a>
+          <a class="gh" href="https://github.com/ppisljar/starscape">GitHub ↗</a>
+        </nav>
+      </div>
+    </header>
+
+    <main>
+      <section class="hero wrap">
+        <span class="eyebrow">WebGPU · TypeScript · three.js</span>
+        <h1>Fly through a million-node graph.</h1>
+        <p class="lead">
+          starscape renders very large graphs as a 3D field you navigate like a game — nested
+          rotating hierarchies of galaxies and systems, levels of detail that resolve from a mote
+          to a readable page as you approach, and <b>two draw calls at every scale</b>.
+        </p>
+        <div class="cta">
+          <a class="btn btn-primary" href="playground/">▶ Open the playground</a>
+          <a class="btn btn-ghost" href="docs/">Read the docs</a>
+          <a class="btn btn-ghost" href="api/">API reference</a>
+        </div>
+        <div class="meta">
+          <span><b>10⁶</b> nodes, flyable</span>
+          <span><b>3</b> draw calls, any size</span>
+          <span><b>0</b> RNG — fully deterministic</span>
+        </div>
+      </section>
+
+      <section class="wrap">
+        <h2 class="section-title">What it does</h2>
+        <p class="section-sub">A small, data-agnostic, heavily customizable library — not a framework. You bring typed arrays and content callbacks; it renders and lets you fly.</p>
+        <div class="grid">
+          <div class="card"><div class="ic">🌌</div><h3>Scale that stays flyable</h3><p>A million nodes and their links at interactive framerates on an ordinary laptop GPU — not merely rendered, but navigated at 6-DOF.</p></div>
+          <div class="card"><div class="ic">🪐</div><h3>N-level hierarchies</h3><p>Group nodes on arbitrarily many levels. Each level picks its own shape, ordering, density, scatter and spin — galaxies of systems of worlds.</p></div>
+          <div class="card"><div class="ic">🔭</div><h3>Zoom ladder</h3><p>Distance-driven levels of detail: a node resolves from mote → label → card → full content as you fly toward it, with hysteresis so it never flickers.</p></div>
+          <div class="card"><div class="ic">⚡</div><h3>GPU morphing</h3><p>Switch arrangements, transpose 2D↔3D, and animate — all on the GPU. Per-frame CPU is O(pivots), never O(nodes).</p></div>
+          <div class="card"><div class="ic">🎛️</div><h3>Customizable at three depths</h3><p>Themes (pure data), shader hooks (inject TSL logic), and custom layers (bring your own objects, read our buffers).</p></div>
+          <div class="card"><div class="ic">🎯</div><h3>Deterministic placement</h3><p>Every position is a pure function of (data, spec). No RNG, no clock — byte-identical buffers forever, so screenshots reproduce and tests go golden.</p></div>
+        </div>
+      </section>
+
+      <section class="wrap">
+        <h2 class="section-title">Measured, not aspirational</h2>
+        <p class="section-sub">Median of 90 frames at an asserted home framing, MacBook / Chrome WebGPU. The full methodology and bands live in the docs.</p>
+        <div class="tablewrap">
+          <table>
+            <thead>
+              <tr><th>Nodes</th><th>Links drawn</th><th>Boot</th><th>ms / frame</th><th>FPS</th><th>Draw calls</th><th>State</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><b>10⁴</b></td><td>35,562</td><td>0.28 s</td><td>8.3</td><td class="fps-hi">120</td><td>3</td><td>frozen, dpr 2</td></tr>
+              <tr><td><b>10⁵</b></td><td>189,273</td><td>0.5 s</td><td>8.4</td><td class="fps-hi">120</td><td>3</td><td>frozen, half links</td></tr>
+              <tr><td><b>10⁵</b></td><td>189,273</td><td>—</td><td>25.5</td><td>39</td><td>3</td><td>galaxies, all spins on</td></tr>
+              <tr><td><b>10⁶</b></td><td>155,758</td><td>1.8 s</td><td>15.1</td><td class="fps-hi">66</td><td>3</td><td>frozen, dpr 1, 4% links</td></tr>
+              <tr><td><b>10⁶</b></td><td>155,758</td><td>—</td><td>24.8</td><td>40</td><td>3</td><td>galaxies, all spins on</td></tr>
+            </tbody>
+            <caption>Three draw calls at every scale — the node field, its halos, and the link set. <a href="docs/scale.html">See the full numbers →</a></caption>
+          </table>
+        </div>
+      </section>
+
+      <section class="wrap">
+        <div class="split">
+          <div>
+            <h2 class="section-title">Compose the pieces you need</h2>
+            <p class="section-sub">The core never fetches and never knows what your data means. You map a format to typed arrays; starscape gives you a field, cameras, a pick grid, the zoom ladder and a schema-driven panel.</p>
+            <p><a class="btn btn-ghost" href="docs/readme.html">Full usage guide →</a></p>
+          </div>
+<pre><span class="c">// map your data to typed arrays + callbacks</span>
+<span class="k">const</span> graph = <span class="f">buildGraph</span>({ n, positions, links, columns, facets, labels });
+
+<span class="c">// two draw calls, TSL materials, WebGL2 fallback</span>
+<span class="k">const</span> field = <span class="f">createField</span>(graph, { heightCss: innerHeight, fov: <span class="s">55</span> });
+<span class="k">const</span> scene = <span class="k">new</span> <span class="f">Scene</span>();
+<span class="k">for</span> (<span class="k">const</span> o <span class="k">of</span> field.objects) scene.<span class="f">add</span>(o);
+
+<span class="c">// fly it: a camera, a pick grid, the zoom ladder,</span>
+<span class="c">// and the schema-driven tuning panel</span>
+<span class="k">const</span> cam = <span class="f">createFlycam</span>(/* … */);
+<span class="k">const</span> levels = <span class="f">compileHierarchy</span>(graph, spec);</pre>
+        </div>
+      </section>
+
+      <section class="wrap">
+        <h2 class="section-title">Customizable at three depths</h2>
+        <p class="section-sub">Reach for exactly as much power as the task needs — no forking required.</p>
+        <div class="depths">
+          <div class="depth"><span class="n">01</span><div><h4>Themes — pure data</h4><p>Palettes, ramps, node shapes, bloom and tonemap curves, the zoom-ladder thresholds. Change behavior by changing config, not code.</p></div></div>
+          <div class="depth"><span class="n">02</span><div><h4>Shader hooks — inject TSL</h4><p>Splice your own Three Shading Language nodes into the glyph, halo and link materials to recolor, displace or light the field however you like.</p></div></div>
+          <div class="depth"><span class="n">03</span><div><h4>Custom layers — your own objects</h4><p>Add arbitrary three.js objects that read starscape's live GPU buffers, so your overlays ride the same morph and spin as the field.</p></div></div>
+        </div>
+      </section>
+
+      <section class="wrap">
+        <div class="bigcta">
+          <h2>The Milky Way test</h2>
+          <p>The north star: fly the full galaxy continuously — from the rim down to a single planet, close enough that Earth shows oceans and continents. The playground is where you feel it.</p>
+          <a class="btn btn-primary" href="playground/">▶ Launch the playground</a>
+        </div>
+      </section>
+    </main>
+
+    <footer>
+      <div class="wrap">
+        <span>starscape — a graph-visualization library. MIT.</span>
+        <span>
+          <a href="docs/">Docs</a> ·
+          <a href="api/">API</a> ·
+          <a href="playground/">Playground</a> ·
+          <a href="https://github.com/ppisljar/starscape">GitHub</a>
+        </span>
+      </div>
+    </footer>
+
+    <script>
+      // Decorative starfield (page chrome only — not library geometry, so Math.random is fine here).
+      (function () {
+        const c = document.getElementById("stars");
+        const ctx = c.getContext("2d");
+        let stars = [];
+        function resize() {
+          const dpr = Math.min(window.devicePixelRatio || 1, 2);
+          c.width = innerWidth * dpr;
+          c.height = innerHeight * dpr;
+          ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+          const count = Math.floor((innerWidth * innerHeight) / 7000);
+          stars = Array.from({ length: count }, () => ({
+            x: Math.random() * innerWidth,
+            y: Math.random() * innerHeight,
+            r: Math.random() * 1.3 + 0.2,
+            a: Math.random() * 0.6 + 0.2,
+            tw: Math.random() * 0.02 + 0.004,
+            p: Math.random() * Math.PI * 2,
+          }));
+        }
+        function draw(t) {
+          ctx.clearRect(0, 0, innerWidth, innerHeight);
+          for (const s of stars) {
+            const alpha = s.a * (0.6 + 0.4 * Math.sin(t * s.tw + s.p));
+            ctx.beginPath();
+            ctx.arc(s.x, s.y, s.r, 0, Math.PI * 2);
+            ctx.fillStyle = "rgba(200, 215, 255, " + alpha.toFixed(3) + ")";
+            ctx.fill();
+          }
+          requestAnimationFrame(draw);
+        }
+        addEventListener("resize", resize);
+        resize();
+        requestAnimationFrame(draw);
+      })();
+    </script>
+  </body>
+</html>

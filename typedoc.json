@@ -1,0 +1,18 @@
+{
+  "$schema": "https://typedoc.org/schema.json",
+  "entryPoints": ["src/index.ts"],
+  "out": "site-dist/api",
+  "name": "starscape API",
+  "readme": "none",
+  "skipErrorChecking": true,
+  "gitRevision": "main",
+  "excludePrivate": true,
+  "excludeInternal": true,
+  "categorizeByGroup": true,
+  "navigationLinks": {
+    "Home": "/starscape/",
+    "Playground": "/starscape/playground/",
+    "Docs": "/starscape/docs/",
+    "GitHub": "https://github.com/ppisljar/starscape"
+  }
+}
