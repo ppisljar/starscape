@@ -2617,6 +2617,68 @@ async function main(): Promise<void> {
     console.debug(`[near-image] ${e.type} node ${e.node} tier@${e.px}px · cache ${mb} MB`);
   };
 
+  /* ---- 3D-NODES as a first-class part of the SCENE (mirrors GLOW/VIEWDIST/LEVELS exactly). The
+     group is demo-side UI state governed by the top-level scene preset: a scene pick sets the whole
+     near config (applyScene → applyNear3d), editing any near control diverges the scene to 'custom'
+     (onNearEdit → markSceneCustom), and the group persists under its OWN key — the parallel of
+     LEVELS_KEY/GLOW_KEY/VIEWDIST_KEY — restored early (before the scene boot) so a preset boot can
+     override it and a 'custom' boot keeps it. So it survives a reload AND a dataset-size switch.
+     The pinned node id is stored raw: synth ids are stable for a given size/seed, so it re-pins
+     after a reload, and is dropped on a size switch when the id no longer exists (guard in apply). */
+  const NEAR3D_KEY = 'starscape-playground:near3d:v1';
+  interface Near3dState {
+    near: boolean;
+    shape: string;
+    tex: string;
+    glyphTex: string;
+    surfaceDetail: string;
+    terrain: boolean;
+    promote: number;
+    count: number;
+    pinned: number; // the pinned image-planet node id (-1 = none)
+  }
+  /* The canonical OFF default — the shipped first-run state (index.html values + the init block's
+     shape-by 'type'). Both built-in scenes (space4, default) use it: picking either turns the LOD
+     off, exactly as a clean scene should. A future scene is free to ship its own near spec here. */
+  const NEAR3D_DEFAULT: Near3dState = {
+    near: false,
+    shape: Object.keys(graph.facets).includes('type') ? 'type' : 'none',
+    tex: 'none',
+    glyphTex: 'off',
+    surfaceDetail: 'baked',
+    terrain: false,
+    promote: 18,
+    count: 128,
+    pinned: -1,
+  };
+  const nearSpecOf = (_scene: string): Near3dState => NEAR3D_DEFAULT; // both presets ⇒ off
+  const saveNear3d = (): void => {
+    try {
+      const state: Near3dState = {
+        near: ui.near.checked,
+        shape: ui.nearShape.value,
+        tex: ui.nearTex.value,
+        glyphTex: ui.glyphTex.value,
+        surfaceDetail: ui.surfaceDetail.value,
+        terrain: ui.nearTerrain.checked,
+        promote: Number(ui.nearPromote.value),
+        count: Number(ui.nearCount.value),
+        pinned: pinnedImageNode,
+      };
+      localStorage.setItem(NEAR3D_KEY, JSON.stringify(state));
+    } catch {
+      /* storage denied/full — the controls still work this session, they just will not persist */
+    }
+  };
+  /* The single reaction every near-control edit fires: persist the group under its own key AND
+     diverge the scene to 'custom' — the same two-step the look/glow/view/hierarchy edits run
+     (own save + markSceneCustom). markSceneCustom is guarded by applyingScene, so the programmatic
+     applyNear3d (from applyScene) never trips it. */
+  const onNearEdit = (): void => {
+    saveNear3d();
+    markSceneCustom();
+  };
+
   const ensureNear = (): NearMesh => {
     if (nearMesh) return nearMesh;
     nearMesh = createNearMesh(graph, field, {
@@ -2652,24 +2714,31 @@ async function main(): Promise<void> {
     if (on) ensureNear().setEnabled(true);
     else nearMesh?.setEnabled(false);
     updateStats();
+    onNearEdit();
   });
-  ui.nearShape.addEventListener('change', () => nearMesh?.setShapeFacet(nearShapeFacet()));
+  ui.nearShape.addEventListener('change', () => {
+    nearMesh?.setShapeFacet(nearShapeFacet());
+    onNearEdit();
+  });
   ui.nearTex.addEventListener('change', () => {
     nearMesh?.setTextureFacet(nearTexFacet());
     // the far billboards key their planet off the SAME facet, so a facet change relayers them too
     if (glyphMode() !== 'off') applyGlyphTexture();
+    onNearEdit();
   });
   // FAR TEXTURE: off (default) leaves the billboards solid facet colour, byte-identical to today;
   // tint/full texture them to match the near planets, killing the promote-time colour→texture pop.
   ui.glyphTex.addEventListener('change', () => {
     applyGlyphTexture();
     updateStats();
+    onNearEdit();
   });
   // SURFACE DETAIL: baked = today's shader (zero cost); procedural = the hard-edge planets (earth,
   // ice, lava, moon) resolve infinite close-up detail in the fragment shader, seamlessly blended from
   // baked, with their poles guarded against the equirect pinch.
   ui.surfaceDetail.addEventListener('change', () => {
     nearMesh?.setProceduralDetail(ui.surfaceDetail.value === 'procedural');
+    onNearEdit();
   });
   /* DISPLACED TERRAIN prereqs: terrain needs a texture facet (so nodes have a planet layer — earth is
    * layer 0) AND procedural surface detail (the terrain reuses the earth colour, seamless at the swap).
@@ -2694,16 +2763,20 @@ async function main(): Promise<void> {
     if (on) ensureTerrainPrereqs();
     nearMesh?.setTerrain(on);
     updateStats();
+    // ensureTerrainPrereqs may have forced the tex facet + surface detail — save the group after.
+    onNearEdit();
   });
   ui.nearPromote.addEventListener('input', () => {
     ui.nearPromotev.textContent = `${ui.nearPromote.value} px`;
     nearMesh?.setPromotePx(Number(ui.nearPromote.value));
+    onNearEdit();
   });
   ui.nearCount.addEventListener('input', () => {
     ui.nearCountv.textContent = ui.nearCount.value;
   });
   ui.nearCount.addEventListener('change', () => {
     // count sizes the per-pool buffers, so a change re-creates the layer (preserving on/off + pickers).
+    onNearEdit();
     if (!nearMesh) return;
     const wasOn = ui.near.checked;
     disposeNear();
@@ -2732,11 +2805,86 @@ async function main(): Promise<void> {
       handle?.['flyToNode']?.(i, 0.35);
     }
     updateStats();
+    // pinImageNode is the single mutation point for the pin (and it may auto-enable near) — persist
+    // + diverge the scene to 'custom', like every other near edit.
+    onNearEdit();
   };
   ui.nearImg.addEventListener('change', () => {
     if (ui.nearImg.checked) pinImageNode(field.select >= 0 ? field.select : Math.floor(n / 2));
     else pinImageNode(-1);
   });
+
+  /* ---- applyNear3d: route a WHOLE near-mesh spec through the controls + subsystems WITHOUT firing
+     change events, so it never trips the onNearEdit save/divergence path. The ONE apply used by both
+     the scene preset (applyScene) and the boot restore. ORDER matters — ensureNear bakes count +
+     facets + terrain + pin at creation, so we (1) set every control VALUE, (2) reconcile terrain's
+     prereqs, (3) push the far-texture (field-side), then (4) rebuild or tear down the mesh so the
+     LIVE effect matches the spec: near on ⇒ a fresh mesh adopts the new count/facets/pin, near off
+     ⇒ fully disposed (back to zero cost, the point of a clean scene). Effects apply with no user
+     action. The pinned id is best-effort — kept only if that id still exists at this size/seed. */
+  const applyNear3d = (spec: Near3dState): void => {
+    const setSelect = (el: HTMLSelectElement, v: string): void => {
+      if (Array.from(el.options).some((o) => o.value === v)) el.value = v;
+    };
+    const setRange = (el: HTMLInputElement, v: number): void => {
+      if (!Number.isFinite(v)) return;
+      el.value = String(Math.min(Number(el.max), Math.max(Number(el.min), v)));
+    };
+    // (1) control VALUES — selects (option still-present guarded) and ranges (clamped to the slider).
+    setSelect(ui.nearShape, spec.shape);
+    setSelect(ui.nearTex, spec.tex);
+    setSelect(ui.glyphTex, spec.glyphTex);
+    setSelect(ui.surfaceDetail, spec.surfaceDetail);
+    setRange(ui.nearPromote, spec.promote);
+    setRange(ui.nearCount, spec.count);
+    ui.nearPromotev.textContent = `${ui.nearPromote.value} px`;
+    ui.nearCountv.textContent = ui.nearCount.value;
+    ui.nearTerrain.checked = spec.terrain === true;
+    pinnedImageNode = spec.pinned >= 0 && spec.pinned < n ? spec.pinned : -1;
+    ui.nearImg.checked = pinnedImageNode >= 0;
+    // (2) terrain prereqs: reconcile the ui (tex facet + procedural detail) BEFORE the mesh reads it.
+    if (ui.nearTerrain.checked) ensureTerrainPrereqs();
+    // (3) far texture is field-side (independent of the mesh): off ⇒ null (zero cost), tint/full push.
+    applyGlyphTexture();
+    // (4) (re)build or tear down the mesh so the live state matches — a fresh build adopts the spec.
+    const on = spec.near === true;
+    ui.near.checked = on;
+    ui.nearbox.classList.toggle('on', on);
+    disposeNear(); // drop any stale mesh (null-safe); off ⇒ stays torn down
+    if (on) ensureNear().setEnabled(true);
+    updateStats();
+  };
+
+  /* ---- 3D-NODES boot restore: re-apply the group's OWN persisted key (the parallel of
+     loadLevels / GLOW_KEY / VIEWDIST_KEY), so it survives a reload and a dataset-size switch. Runs
+     BEFORE the scene boot: a preset boot then overrides it via applyScene, a 'custom' boot keeps it.
+     No blob ⇒ leave the first-run defaults untouched (applyScene(space4) sets the group for a fresh
+     visitor). Missing/corrupt fields fall back onto NEAR3D_DEFAULT. */
+  const restoreNear3d = (): void => {
+    let s: Partial<Near3dState> | null = null;
+    try {
+      const raw = localStorage.getItem(NEAR3D_KEY);
+      if (raw !== null) s = JSON.parse(raw) as Partial<Near3dState>;
+    } catch {
+      /* storage denied/corrupt: the defaults (near off) are a safe session */
+    }
+    if (!s) return; // first visit / no stored group → today's defaults, unchanged
+    const d = NEAR3D_DEFAULT;
+    const str = (v: unknown, dv: string): string => (typeof v === 'string' ? v : dv);
+    const numv = (v: unknown, dv: number): number =>
+      typeof v === 'number' && Number.isFinite(v) ? v : dv;
+    applyNear3d({
+      near: s.near === true,
+      shape: str(s.shape, d.shape),
+      tex: str(s.tex, d.tex),
+      glyphTex: str(s.glyphTex, d.glyphTex),
+      surfaceDetail: str(s.surfaceDetail, d.surfaceDetail),
+      terrain: s.terrain === true,
+      promote: numv(s.promote, d.promote),
+      count: numv(s.count, d.count),
+      pinned: numv(s.pinned, -1),
+    });
+  };
 
   /* ======================================================================================
    * THE ROUTING TABLE — one place a config key meets its subsystem (the demo's pattern).
@@ -3475,6 +3623,11 @@ async function main(): Promise<void> {
     applyViewDistance();
     ui.proj.value = view.projection;
     applyProjection();
+    // 4b. 3D NODES: the scene governs the near-mesh group too (both presets ⇒ off). Direct-apply
+    //     under the applyingScene guard (no events, so no spurious divergence), then persist its own
+    //     key — the exact parallel of saveLevels above, so NEAR3D_KEY stays consistent with the scene.
+    applyNear3d(nearSpecOf(name));
+    saveNear3d();
     // 5. route the config through every subsystem + sync the panels
     applyAll();
     panel.sync();
@@ -3615,10 +3768,15 @@ async function main(): Promise<void> {
     if (mode === 'custom') applyCustomNow(false);
   }
 
+  /* ---- 3D-NODES boot: restore the group's own persisted key, exactly like the levels block above
+     restores LEVELS_KEY. Runs BEFORE the scene boot so a preset boot overrides it (applyScene) and a
+     'custom' boot keeps it — the single rule the whole scene system follows. */
+  restoreNear3d();
+
   /* ---- SCENE boot: a fresh visitor (no stored scene) opens directly on space4; a returning
      visitor re-applies whichever scene they chose, so it survives reloads AND dataset-size
-     switches (which reload the page). 'custom' keeps the state restored above and just reflects
-     it in the selector. */
+     switches (which reload the page). 'custom' keeps the state restored above (levels + 3D-nodes)
+     and just reflects it in the selector. */
   {
     const storedScene = localStorage.getItem(SCENE_KEY);
     if (storedScene === null || storedScene === 'space4') {
@@ -4014,6 +4172,7 @@ async function main(): Promise<void> {
         nearMesh?.setTerrain(false);
       }
       updateStats();
+      onNearEdit(); // the debug toggle changes the same scene group — persist + diverge to custom
     },
     terrainState: (): string =>
       JSON.stringify({
