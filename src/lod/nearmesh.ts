@@ -99,6 +99,7 @@ import {
   type TerrainColorNode,
   type TerrainHeightSource,
 } from './terrain';
+import { createTerrainPatch, type TerrainPatch } from './terrainpatch';
 
 /* ---- registries (v1) ------------------------------------------------------------------- */
 
@@ -777,6 +778,11 @@ export interface NearMeshOpts {
   /** Finest terrain icosphere subdivision near the ground (default 8 = 1,310,720 tris; the coarser
    *  altitude bands are floored at subdiv 6 for a smooth limb at the swap). */
   terrainMaxSubdiv?: number;
+  /** Opt-in: overlay the ADAPTIVE clipmap PATCH on the near region when terrain is active — metre-scale
+   *  triangles concentrated under the camera (so you can fly between hills) over the uniform icosphere,
+   *  which keeps drawing the distant surface + the limb. Default true (costs nothing until terrain
+   *  activates). Set false to see the icosphere alone. */
+  terrainPatch?: boolean;
   /** Override the built-in shape registry (unit-radius geometries, index 0 the default). */
   shapes?: BufferGeometry[];
   /** Override the built-in textures: one DataArrayTexture (RGBA, A = emissive), or a raw
@@ -845,6 +851,11 @@ export interface NearMesh {
    *  activate (it reuses the earth colour). The terrain subsystem is created lazily on first
    *  activation ⇒ off, or never close to earth, costs nothing. Live. */
   setTerrain(on: boolean): void;
+  /** Toggle the ADAPTIVE clipmap patch overlay (metre-scale triangles under the camera) independently
+   *  of the icosphere. On by default when terrain is on; off ⇒ the uniform icosphere alone. Live. */
+  setTerrainPatch(on: boolean): void;
+  /** Debug: render the terrain (icosphere + patch) as a wireframe — the triangle-density view. Live. */
+  setTerrainWireframe(on: boolean): void;
   /** Replace the per-node texture-source overrides live. Passing null/`{}` removes every override
    *  (image nodes return to the instanced procedural pools) and disposes the image-tier cache. */
   setOverrides(map: Record<number, NodeSource> | null): void;
@@ -860,6 +871,8 @@ export interface NearMesh {
   readonly terrainActive: boolean;
   /** Current terrain LOD triangle count (0 when inactive) and subdivision level (telemetry). */
   readonly terrainTriangles: number;
+  /** Adaptive clipmap patch triangle count (0 when inactive) — concentrated under the camera. */
+  readonly terrainPatchTriangles: number;
   readonly terrainSubdiv: number;
   /** Current estimated image-tier LRU cache size in bytes (telemetry; 0 with no image overrides). */
   readonly imageCacheBytes: number;
@@ -905,6 +918,7 @@ export function createNearMesh(graph: Graph, field: Field, opts: NearMeshOpts = 
   const terrainMaxSubdiv = Number.isFinite(opts.terrainMaxSubdiv)
     ? (opts.terrainMaxSubdiv as number)
     : undefined;
+  let terrainPatchEnabled = opts.terrainPatch ?? true;
 
   /* ---- per-node texture-source overrides (opt-in; empty ⇒ zero machinery). ------------------- */
   let overrides: Record<number, NodeSource> = opts.overrides ?? {};
@@ -1493,12 +1507,14 @@ export function createNearMesh(graph: Graph, field: Field, opts: NearMeshOpts = 
    * the handoff is seamless (amplitude ramps from 0 at the swap altitude). Everything is created lazily
    * on the first activation, so the feature off — or never close to earth — costs nothing. */
   let terrain: Terrain | null = null;
+  let terrainPatch: TerrainPatch | null = null; // the adaptive clipmap overlay (stage C)
   let heightSrc: TerrainHeightSource | null = null;
   let terrainActive = false; // drawing this frame (gates the collision sampler + telemetry)
   let terrainSurfIdx = -1; // which `surfCenters`/`surfRadii` slot is the terrain planet
   let terrainRadius = 0;
   let terrainAmpFrac = 0; // displacement fraction in play (matches the GPU uniform) — collision height
   let terrainDetail = 0;
+  let terrainWire = false; // debug wireframe (patch + icosphere), for the tri-density view
 
   /** The earth colour drape for the terrain mesh: byte-for-byte the instanced earth shading (baked
    *  texel ↔ procedural blend by `detail`, pole cap, node tint, the fixed key light) but lit by the
@@ -1530,13 +1546,22 @@ export function createNearMesh(graph: Graph, field: Field, opts: NearMeshOpts = 
   const ensureTerrain = (): Terrain => {
     if (terrain) return terrain;
     heightSrc = earthTerrainSource(earthSalt);
+    const colorNode = buildTerrainColor();
     terrain = createTerrain({
       height: heightSrc,
-      colorNode: buildTerrainColor(),
+      colorNode,
       heightScale: terrainHeightScale,
       maxSubdiv: terrainMaxSubdiv,
     });
+    if (terrainWire) terrain.setWireframe(true);
     group.add(terrain.object);
+    // the adaptive clipmap patch shares the SAME height field + draped colour so it overlays the
+    // icosphere invisibly, just denser under the camera. Built lazily alongside the icosphere.
+    if (terrainPatchEnabled) {
+      terrainPatch = createTerrainPatch({ height: heightSrc, colorNode });
+      if (terrainWire) terrainPatch.setWireframe(true);
+      group.add(terrainPatch.object);
+    }
     return terrain;
   };
 
@@ -1668,6 +1693,7 @@ export function createNearMesh(graph: Graph, field: Field, opts: NearMeshOpts = 
       restoreAll();
       if (imageSlots) hideAllImages();
       if (terrain) terrain.setVisible(false);
+      if (terrainPatch) terrainPatch.setVisible(false);
       terrainActive = false;
       promotedCount = 0;
       return;
@@ -1879,8 +1905,29 @@ export function createNearMesh(graph: Graph, field: Field, opts: NearMeshOpts = 
       terrainRadius = r;
       terrainAmpFrac = t.ampFrac;
       terrainDetail = det;
+      // overlay the adaptive patch on the near region. It reads back the icosphere's EXACT ampFrac +
+      // detail so the two displace identically (seamless), and follows the camera's own sub-point.
+      if (terrainPatchEnabled && terrainPatch) {
+        terrainPatch.update({
+          cx: candPos[p3]!,
+          cy: candPos[p3 + 1]!,
+          cz: candPos[p3 + 2]!,
+          radius: r,
+          camX: cam.x,
+          camY: cam.y,
+          camZ: cam.z,
+          detail: det,
+          ampFrac: t.ampFrac,
+          tintR: colors[terrainNode * 3]!,
+          tintG: colors[terrainNode * 3 + 1]!,
+          tintB: colors[terrainNode * 3 + 2]!,
+        });
+      } else if (terrainPatch) {
+        terrainPatch.setVisible(false); // feature toggled off ⇒ icosphere alone
+      }
     } else {
       if (terrain) terrain.setVisible(false);
+      if (terrainPatch) terrainPatch.setVisible(false);
       terrainActive = false;
     }
 
@@ -1925,6 +1972,7 @@ export function createNearMesh(graph: Graph, field: Field, opts: NearMeshOpts = 
         restoreAll();
         if (imageSlots) hideAllImages();
         if (terrain) terrain.setVisible(false);
+        if (terrainPatch) terrainPatch.setVisible(false);
         terrainActive = false;
         promotedCount = 0;
       } else {
@@ -1938,8 +1986,28 @@ export function createNearMesh(graph: Graph, field: Field, opts: NearMeshOpts = 
       // update lazily creates the mesh once you are actually close to an earth planet.
       if (!on && terrain) {
         terrain.setVisible(false);
+        if (terrainPatch) terrainPatch.setVisible(false);
         terrainActive = false;
       }
+    },
+    /** Opt-in: toggle the adaptive clipmap PATCH overlay (metre-scale triangles under the camera) while
+     *  keeping the uniform icosphere. Off ⇒ the icosphere alone (the stage-B look). */
+    setTerrainPatch(on: boolean): void {
+      if (on === terrainPatchEnabled) return;
+      terrainPatchEnabled = on;
+      if (!on && terrainPatch) terrainPatch.setVisible(false);
+      // on with the terrain already built: create the patch now so it shows on the next update.
+      if (on && terrain && !terrainPatch && heightSrc) {
+        terrainPatch = createTerrainPatch({ height: heightSrc, colorNode: buildTerrainColor() });
+        if (terrainWire) terrainPatch.setWireframe(true);
+        group.add(terrainPatch.object);
+      }
+    },
+    /** Debug: render the terrain (icosphere + patch) as a wireframe — the tri-density proof. */
+    setTerrainWireframe(on: boolean): void {
+      terrainWire = on;
+      if (terrain) terrain.setWireframe(on);
+      if (terrainPatch) terrainPatch.setWireframe(on);
     },
     setView(heightCss: number, fovDeg: number): void {
       if (Number.isFinite(heightCss) && heightCss > 0) halfH = heightCss / 2;
@@ -1995,7 +2063,8 @@ export function createNearMesh(graph: Graph, field: Field, opts: NearMeshOpts = 
       let d = 0;
       for (const p of pools.values()) if (p.mesh.count > 0) d++;
       d += visibleImages; // each visible image node is its own draw call
-      if (terrainActive) d++; // the displaced terrain mesh is its own draw call
+      if (terrainActive) d++; // the displaced terrain icosphere is its own draw call
+      if (terrainActive && terrainPatch && terrainPatch.visible) d += 1; // patch (one group; ~levels meshes)
       return d;
     },
     get imageMeshes(): number {
@@ -2006,6 +2075,11 @@ export function createNearMesh(graph: Graph, field: Field, opts: NearMeshOpts = 
     },
     get terrainTriangles(): number {
       return enabled && terrain ? terrain.triangles : 0;
+    },
+    /** Adaptive clipmap patch triangle count (0 when inactive) — the triangles concentrated under the
+     *  camera, on top of the icosphere's `terrainTriangles`. */
+    get terrainPatchTriangles(): number {
+      return enabled && terrainActive && terrainPatch ? terrainPatch.triangles : 0;
     },
     get terrainSubdiv(): number {
       return terrain ? terrain.subdiv : 0;
@@ -2030,6 +2104,11 @@ export function createNearMesh(graph: Graph, field: Field, opts: NearMeshOpts = 
         group.remove(terrain.object);
         terrain.dispose();
         terrain = null;
+      }
+      if (terrainPatch) {
+        group.remove(terrainPatch.object);
+        terrainPatch.dispose();
+        terrainPatch = null;
       }
       for (const g of shapeGeos) if (g) g.dispose();
       if (texArray && ownsTexArray) texArray.dispose();

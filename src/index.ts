@@ -237,6 +237,18 @@ export type {
   TerrainUpdate,
 } from './lod/terrain';
 
+/* ---- ADAPTIVE terrain tessellation (near-mesh terrain stage C): a clipmap/CDLOD PATCH that follows
+ * the camera's ground sub-point, concentrating metre-scale triangles UNDER the camera (so you can fly
+ * between individual hills) and coarsening outward to match the uniform icosphere, which still draws the
+ * distant surface + the limb. Driven BY `createNearMesh` ({ terrain: true }); exported as the building
+ * block + the same pluggable height source the icosphere uses (so the two agree, seamlessly). */
+export { createTerrainPatch } from './lod/terrainpatch';
+export type {
+  TerrainPatch,
+  TerrainPatchOpts,
+  TerrainPatchUpdate,
+} from './lod/terrainpatch';
+
 /* ---- the HDR bloom post-process (DESIGN.md §5 "tier-3 post-sum pass reusing the tonemap
  * curves"): a helper the CONSUMER installs — scene → additive HDR buffer → bloom → one post-sum
  * tonemap → screen — replacing renderer.render in the loop with post.render(). The library owns

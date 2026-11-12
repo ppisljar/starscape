@@ -3922,6 +3922,7 @@ async function main(): Promise<void> {
       `${
         nearMesh && ui.near.checked && nearMesh.terrainActive
           ? ` · terrain L${nearMesh.terrainSubdiv} ${fmt(nearMesh.terrainTriangles)} tris` +
+            `${nearMesh.terrainPatchTriangles > 0 ? ` +patch ${fmt(nearMesh.terrainPatchTriangles)}` : ''}` +
             `${Number.isFinite(altitude) ? ` · alt ${altitude.toFixed(2)}` : ''}`
           : ''
       }` +
@@ -4378,11 +4379,21 @@ async function main(): Promise<void> {
       updateStats();
       onNearEdit(); // the debug toggle changes the same scene group — persist + diverge to custom
     },
+    // adaptive clipmap patch (stage C): toggle the dense-under-camera overlay independently of the
+    // uniform icosphere, and a wireframe view that proves the triangle concentration.
+    setTerrainPatch: (on: boolean): void => {
+      nearMesh?.setTerrainPatch(on);
+      updateStats();
+    },
+    setTerrainWire: (on: boolean): void => {
+      nearMesh?.setTerrainWireframe(on);
+    },
     terrainState: (): string =>
       JSON.stringify({
         active: nearMesh?.terrainActive ?? false,
         subdiv: nearMesh?.terrainSubdiv ?? 0,
         triangles: nearMesh?.terrainTriangles ?? 0,
+        patchTriangles: nearMesh?.terrainPatchTriangles ?? 0,
         promoted: nearMesh?.promoted ?? 0,
         drawCalls: nearMesh?.drawCalls ?? 0,
         altitude: Number.isFinite(altitude) ? Number(altitude.toFixed(3)) : null,

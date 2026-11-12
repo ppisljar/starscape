@@ -432,7 +432,21 @@ the flycam (§6) floors the camera at `terrain(surfN) + hover` and scales speed 
 so you land ON ridges and rise/fall with the relief, not at the bounding sphere. Absent the sampler it is
 the stage-A sphere floor.
 
+**Adaptive tessellation (the ground, up close).** The uniform icosphere spreads its triangles over the
+WHOLE sphere, so at the surface the local edge stays coarse and you cannot fly BETWEEN hills. A
+clipmap/CDLOD **patch** (`src/lod/terrainpatch.ts`) OVERLAYS the near region — nested concentric grid
+rings that follow the camera's ground sub-point, metre-scale under the camera and halving in density per
+ring outward until the rim matches the icosphere (which keeps drawing the distant surface + the limb).
+Each vertex maps its tangent-plane lattice offset onto the sphere by the azimuthal-equidistant
+exponential map and displaces by the SAME `TerrainHeightSource` at the SAME amplitude (read back from the
+icosphere), with the SAME draped colour — so the overlay is invisible except denser. Per-level centres
+SNAP to their own grid (no swimming as you fly); a CDLOD morph near each ring's outer edge collapses odd
+cells onto the coarser lattice (crack-free ring↔ring); a sub-pixel outward bias + an outer skirt hide the
+seam to the icosphere. Collision is unchanged — it still floors on the icosphere's CPU height sampler,
+the identical field. Opt-in via `createNearMesh({ terrain:true })` (patch on by default, `terrainPatch:false`
+for the icosphere alone); `setTerrainWireframe` renders the tri-density view.
+
 Still OPT-IN and bounded: terrain exists only when the LOD is on, the node is textured + detailed, and
 you are close to a solid planet — one planet at a time, created lazily, nothing allocated otherwise. The
-full-generality target (adaptive CDLOD tessellation, every solid planet, real tiered DEMs, erosion) is
-the §12 Milky Way test's last mile; this is its first true-ground implementation.
+remaining full-generality work (every solid planet, real tiered DEMs, erosion, true DEM-scale elevations)
+is the §12 Milky Way test's last mile; the patch above is the first adaptive, metre-scale ground.

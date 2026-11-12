@@ -241,6 +241,8 @@ export interface Terrain {
   update(u: TerrainUpdate): void;
   /** Hide it (far from any solid planet, or the feature toggled off). */
   setVisible(on: boolean): void;
+  /** Debug: render as a wireframe (the triangle-density view). */
+  setWireframe(on: boolean): void;
   readonly visible: boolean;
   /** Current displacement amplitude as a fraction of radius (= heightScale × ramp). The collision
    *  floor multiplies the height field by this, so it must match the GPU uniform. */
@@ -370,6 +372,9 @@ export function createTerrain(opts: TerrainOpts): Terrain {
       if (on === visible) return;
       visible = on;
       mesh.visible = on;
+    },
+    setWireframe(on: boolean): void {
+      mat.wireframe = on;
     },
     get visible(): boolean {
       return visible;
