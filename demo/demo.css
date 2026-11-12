@@ -594,6 +594,17 @@ body.light #panel #scenebox select {
   color: #1c2330;
   border-color: #bcb29a;
 }
+body.light #panel #sceneSave {
+  border-bottom-color: #d7cfbe;
+}
+body.light #panel #sceneSave input[type='text'] {
+  background: #fffdf8;
+  color: #2a3040;
+  border-color: #c9c0ad;
+}
+body.light #panel #sceneSave input[type='text']:focus {
+  border-color: #3d6ea3;
+}
 /* collapsible groups */
 body.light #panel details.grp {
   background: rgba(255, 253, 248, 0.55);
@@ -885,6 +896,39 @@ body.light .ss-cfg-r input[type='checkbox'] {
 #panel #scenebox select {
   color: #e6ecf8;
   border-color: #3a4a6e;
+}
+/* save-a-scene row under the scene selector: a name field + save + a delete (×) that only shows
+   for a saved preset */
+#panel #sceneSave {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  margin: -2px 0 1px;
+  padding-bottom: 7px;
+  border-bottom: 1px solid #27314a;
+}
+#panel #sceneSave input[type='text'] {
+  flex: 1;
+  min-width: 0;
+  background: #0d1322;
+  color: #cdd6e4;
+  border: 1px solid #27314a;
+  border-radius: 3px;
+  font: inherit;
+  font-size: 11px;
+  padding: 2px 6px;
+}
+#panel #sceneSave input[type='text']:focus {
+  border-color: #59a0ff;
+  outline: none;
+}
+#panel #sceneSave button {
+  flex: none;
+}
+#panel #sceneSave #sceneDelBtn {
+  padding: 1px 7px;
+  font-size: 13px;
+  line-height: 1.2;
 }
 
 /* ---- collapsible control groups (native <details class="grp">) ------------------------- */

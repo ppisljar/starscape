@@ -612,6 +612,9 @@ async function main(): Promise<void> {
   /* ---- the rail ------------------------------------------------------------------------- */
   const ui = {
     scene: document.getElementById('scene') as HTMLSelectElement,
+    sceneName: document.getElementById('sceneName') as HTMLInputElement,
+    sceneSaveBtn: document.getElementById('sceneSaveBtn') as HTMLButtonElement,
+    sceneDelBtn: document.getElementById('sceneDelBtn') as HTMLButtonElement,
     data: document.getElementById('data') as HTMLSelectElement,
     mode: document.getElementById('mode') as HTMLSelectElement,
     levelsbox: document.getElementById('levelsbox') as HTMLDivElement,
@@ -666,6 +669,7 @@ async function main(): Promise<void> {
     if (applyingScene || currentScene === 'custom') return;
     currentScene = 'custom';
     ui.scene.value = 'custom';
+    ui.sceneDelBtn.style.display = 'none'; // 'custom' is not a saved preset — never deletable
     try {
       localStorage.setItem(SCENE_KEY, 'custom');
     } catch {
@@ -994,11 +998,16 @@ async function main(): Promise<void> {
     }
     markSceneCustom(); // any hierarchy edit diverges from the active scene preset (guarded)
   };
-  const loadLevels = (): { mode: 'frozen' | 'custom'; preset: string; rows: LevelRow[] } | null => {
+  /* Validate a parsed { mode, preset, rows } blob against the LIVE registries (shapes, presets,
+     facets, columns…) — dropping unknown/ill-typed entries to declared defaults, returning null if
+     the shape is unusable. Shared by loadLevels (the LEVELS_KEY boot restore) and the scene system
+     (a saved scene's hierarchy, which may have been captured at a different dataset size). */
+  const sanitizeLevels = (
+    parsed: unknown,
+  ): { mode: 'frozen' | 'custom'; preset: string; rows: LevelRow[] } | null => {
     try {
-      const raw = localStorage.getItem(LEVELS_KEY);
-      if (raw === null) return null;
-      const s = JSON.parse(raw) as { mode?: unknown; preset?: unknown; rows?: unknown };
+      if (parsed === null || typeof parsed !== 'object') return null;
+      const s = parsed as { mode?: unknown; preset?: unknown; rows?: unknown };
       const list = s.rows;
       if (!Array.isArray(list) || list.length < 1 || list.length > UI_MAX_LEVELS) return null;
       const shapes = new Set(shapeKeys());
@@ -1070,6 +1079,14 @@ async function main(): Promise<void> {
         preset: typeof s.preset === 'string' ? s.preset : '',
         rows: out,
       };
+    } catch {
+      return null;
+    }
+  };
+  const loadLevels = (): { mode: 'frozen' | 'custom'; preset: string; rows: LevelRow[] } | null => {
+    try {
+      const raw = localStorage.getItem(LEVELS_KEY);
+      return raw === null ? null : sanitizeLevels(JSON.parse(raw));
     } catch {
       return null;
     }
@@ -2651,21 +2668,41 @@ async function main(): Promise<void> {
     count: 128,
     pinned: -1,
   };
-  const nearSpecOf = (_scene: string): Near3dState => NEAR3D_DEFAULT; // both presets ⇒ off
+  /** The near group's live state — what saveNear3d persists AND what a scene snapshot captures. */
+  const currentNearState = (): Near3dState => ({
+    near: ui.near.checked,
+    shape: ui.nearShape.value,
+    tex: ui.nearTex.value,
+    glyphTex: ui.glyphTex.value,
+    surfaceDetail: ui.surfaceDetail.value,
+    terrain: ui.nearTerrain.checked,
+    promote: Number(ui.nearPromote.value),
+    count: Number(ui.nearCount.value),
+    pinned: pinnedImageNode,
+  });
+  /** Coerce an untrusted partial (stored blob / scene bundle) onto NEAR3D_DEFAULT, so a missing or
+   *  ill-typed field falls back cleanly. applyNear3d still option-guards selects + clamps ranges. */
+  const coerceNear = (s: Partial<Near3dState> | null | undefined): Near3dState => {
+    const d = NEAR3D_DEFAULT;
+    if (!s || typeof s !== 'object') return { ...d };
+    const str = (v: unknown, dv: string): string => (typeof v === 'string' ? v : dv);
+    const numv = (v: unknown, dv: number): number =>
+      typeof v === 'number' && Number.isFinite(v) ? v : dv;
+    return {
+      near: s.near === true,
+      shape: str(s.shape, d.shape),
+      tex: str(s.tex, d.tex),
+      glyphTex: str(s.glyphTex, d.glyphTex),
+      surfaceDetail: str(s.surfaceDetail, d.surfaceDetail),
+      terrain: s.terrain === true,
+      promote: numv(s.promote, d.promote),
+      count: numv(s.count, d.count),
+      pinned: numv(s.pinned, -1),
+    };
+  };
   const saveNear3d = (): void => {
     try {
-      const state: Near3dState = {
-        near: ui.near.checked,
-        shape: ui.nearShape.value,
-        tex: ui.nearTex.value,
-        glyphTex: ui.glyphTex.value,
-        surfaceDetail: ui.surfaceDetail.value,
-        terrain: ui.nearTerrain.checked,
-        promote: Number(ui.nearPromote.value),
-        count: Number(ui.nearCount.value),
-        pinned: pinnedImageNode,
-      };
-      localStorage.setItem(NEAR3D_KEY, JSON.stringify(state));
+      localStorage.setItem(NEAR3D_KEY, JSON.stringify(currentNearState()));
     } catch {
       /* storage denied/full — the controls still work this session, they just will not persist */
     }
@@ -2869,21 +2906,7 @@ async function main(): Promise<void> {
       /* storage denied/corrupt: the defaults (near off) are a safe session */
     }
     if (!s) return; // first visit / no stored group → today's defaults, unchanged
-    const d = NEAR3D_DEFAULT;
-    const str = (v: unknown, dv: string): string => (typeof v === 'string' ? v : dv);
-    const numv = (v: unknown, dv: number): number =>
-      typeof v === 'number' && Number.isFinite(v) ? v : dv;
-    applyNear3d({
-      near: s.near === true,
-      shape: str(s.shape, d.shape),
-      tex: str(s.tex, d.tex),
-      glyphTex: str(s.glyphTex, d.glyphTex),
-      surfaceDetail: str(s.surfaceDetail, d.surfaceDetail),
-      terrain: s.terrain === true,
-      promote: numv(s.promote, d.promote),
-      count: numv(s.count, d.count),
-      pinned: numv(s.pinned, -1),
-    });
+    applyNear3d(coerceNear(s));
   };
 
   /* ======================================================================================
@@ -3582,18 +3605,109 @@ async function main(): Promise<void> {
       spinAxis: [0, 1, 0],
     }),
   ];
-  const applyScene = (name: string): void => {
-    if (name !== 'space4' && name !== 'default') return;
-    applyingScene = true;
-    // 1. LOOK (config): reset to the neutral 'field' baseline, then overlay the scene's diff.
-    store.applyPreset('field');
-    if (name === 'space4') {
-      for (const [k, v] of Object.entries(SPACE4_LOOK)) store.set(k, v);
-      panel.markCustom();
+  /* A SceneBundle snapshots the COMPLETE scene — the same per-group data the individual keys hold:
+     the look (config diff from defaults), glow, the hierarchy (mode + hpreset + rows), the view, and
+     the 3D-nodes spec. The built-ins express themselves as bundles too (builtinBundle), so ONE apply
+     path (applyBundle) drives space4, default and every user-saved scene identically. */
+  interface GlowBundle {
+    on: boolean;
+    strength: number;
+    radius: number;
+    threshold: number;
+  }
+  interface SceneBundle {
+    look: Record<string, ConfigValue>; // store.exportLook() — a diff from DEFAULTS
+    glow: GlowBundle;
+    levels: { mode: 'frozen' | 'custom'; preset: string; rows: LevelRow[] };
+    view: { distance: number; projection: '2d' | '3d' };
+    near: Near3dState;
+  }
+  const SCENES_KEY = 'starscape-playground:scenes:v1';
+  const loadScenes = (): Record<string, SceneBundle> => {
+    try {
+      const raw = localStorage.getItem(SCENES_KEY);
+      if (raw === null) return {};
+      const parsed: unknown = JSON.parse(raw);
+      if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) return {};
+      const out: Record<string, SceneBundle> = {};
+      for (const [name, v] of Object.entries(parsed as Record<string, unknown>)) {
+        if (v !== null && typeof v === 'object' && !Array.isArray(v)) out[name] = v as SceneBundle;
+      }
+      return out;
+    } catch {
+      return {};
     }
-    // 2. GLOW: set the bloom params + on/off (setGlow reroutes the tonemap seam, reflects the UI,
-    //    persists, and toggles the glow-box rows).
-    const g = name === 'space4' ? SPACE4_GLOW : { on: false, strength: 1.3, radius: 0.4, threshold: 1 };
+  };
+  const writeScenes = (scenes: Record<string, SceneBundle>): void => {
+    try {
+      localStorage.setItem(SCENES_KEY, JSON.stringify(scenes));
+    } catch {
+      /* storage denied/full — the save just will not persist this session */
+    }
+  };
+  const coerceGlow = (g: Partial<GlowBundle> | null | undefined): GlowBundle => {
+    const d = { on: false, strength: 1.3, radius: 0.4, threshold: 1 };
+    if (!g || typeof g !== 'object') return d;
+    const clamp = (v: unknown, dv: number, lo: number, hi: number): number =>
+      typeof v === 'number' && Number.isFinite(v) ? Math.min(hi, Math.max(lo, v)) : dv;
+    return {
+      on: g.on === true,
+      strength: clamp(g.strength, d.strength, 0, 3),
+      radius: clamp(g.radius, d.radius, 0, 1),
+      threshold: clamp(g.threshold, d.threshold, 0, 2),
+    };
+  };
+
+  /** Snapshot the live scene — exactly the per-group serialisations the individual keys already use,
+   *  so a saved scene reproduces reload-fidelity state. rows are deep-copied (snapshot, not alias). */
+  const snapshotScene = (): SceneBundle => ({
+    look: store.exportLook(),
+    glow: { on: glow.on, strength: glow.strength, radius: glow.radius, threshold: glow.threshold },
+    levels: {
+      mode,
+      preset: ui.hpreset.value,
+      rows: JSON.parse(JSON.stringify(rows)) as LevelRow[],
+    },
+    view: {
+      distance: Number(ui.viewdist.value) || 1,
+      projection: ui.proj.value === '2d' ? '2d' : '3d',
+    },
+    near: currentNearState(),
+  });
+
+  /** The two shipped scenes, as bundles. space4 = the curated galaxy-nebula; default = the neutral
+   *  frozen field. Both carry near OFF (NEAR3D_DEFAULT), so picking either turns the LOD off. */
+  const builtinBundle = (name: 'space4' | 'default'): SceneBundle =>
+    name === 'space4'
+      ? {
+          look: { ...SPACE4_LOOK },
+          glow: { ...SPACE4_GLOW },
+          levels: { mode: 'custom', preset: '', rows: buildSpace4Rows() },
+          view: { distance: SPACE4_VIEW.distance, projection: SPACE4_VIEW.projection },
+          near: { ...NEAR3D_DEFAULT },
+        }
+      : {
+          look: {},
+          glow: { on: false, strength: 1.3, radius: 0.4, threshold: 1 },
+          levels: { mode: 'frozen', preset: '', rows: [] },
+          view: { distance: 1, projection: '3d' },
+          near: { ...NEAR3D_DEFAULT },
+        };
+
+  /* Apply a COMPLETE bundle through the demo's existing per-group paths — the one body space4,
+     default and saved scenes all share. Does NOT touch the scene selector / SCENE_KEY (the caller,
+     applyScene, owns that), and assumes applyingScene is already true so the cascade never self-
+     diverges. Each group degrades independently: a bad/size-mismatched hierarchy keeps the live
+     rows; look/glow/view/near coerce onto their defaults. */
+  const applyBundle = (b: SceneBundle): void => {
+    // 1. LOOK (config): importLook resets every non-session key to its default, then overlays the
+    //    saved diff — reproducing the look exactly (apply(export(x)) is idempotent). A non-empty
+    //    diff means the LOOK selector reads 'custom'; mirror space4 and mark the tune panel custom.
+    const look = b.look && typeof b.look === 'object' ? b.look : {};
+    store.importLook(look);
+    if (Object.keys(look).length > 0) panel.markCustom();
+    // 2. GLOW
+    const g = coerceGlow(b.glow);
     glow.strength = g.strength;
     glow.radius = g.radius;
     glow.threshold = g.threshold;
@@ -3602,31 +3716,31 @@ async function main(): Promise<void> {
     ui.glowThreshold.value = String(g.threshold);
     setGlow(g.on);
     // 3. HIERARCHY / mode
-    if (name === 'space4') {
-      mode = 'custom';
-      ui.mode.value = 'custom';
+    const wantMode = b.levels?.mode === 'custom' ? 'custom' : 'frozen';
+    mode = wantMode;
+    ui.mode.value = wantMode;
+    if (wantMode === 'custom') {
+      // sanitise the saved rows against the LIVE registries; if unusable (e.g. a different dataset
+      // profile) keep the current valid rows rather than breaking the apply.
+      const san = sanitizeLevels(b.levels);
+      if (san && san.rows.length) rows = san.rows;
+      ui.hpreset.value = san ? san.preset : (typeof b.levels?.preset === 'string' ? b.levels.preset : '');
       ui.levelsbox.style.display = '';
-      rows = buildSpace4Rows();
-      ui.hpreset.value = '';
       renderLevels();
       applyCustomNow(false);
     } else {
-      mode = 'frozen';
-      ui.mode.value = 'frozen';
       ui.levelsbox.style.display = 'none';
       applyFrozen();
     }
     saveLevels();
     // 4. VIEW: distance + projection
-    const view = name === 'space4' ? SPACE4_VIEW : { distance: 1, projection: '3d' as const };
-    ui.viewdist.value = String(view.distance);
+    const dist = Number(b.view?.distance);
+    ui.viewdist.value = String(Number.isFinite(dist) ? Math.min(20, Math.max(0.5, dist)) : 1);
     applyViewDistance();
-    ui.proj.value = view.projection;
+    ui.proj.value = b.view?.projection === '2d' ? '2d' : '3d';
     applyProjection();
-    // 4b. 3D NODES: the scene governs the near-mesh group too (both presets ⇒ off). Direct-apply
-    //     under the applyingScene guard (no events, so no spurious divergence), then persist its own
-    //     key — the exact parallel of saveLevels above, so NEAR3D_KEY stays consistent with the scene.
-    applyNear3d(nearSpecOf(name));
+    // 4b. 3D NODES: the scene governs the near-mesh group too (direct-apply under the guard).
+    applyNear3d(coerceNear(b.near));
     saveNear3d();
     // 5. route the config through every subsystem + sync the panels
     applyAll();
@@ -3634,7 +3748,18 @@ async function main(): Promise<void> {
     panel.setInert(inertKeys());
     syncLook();
     store.save();
-    // 6. selector state + persistence
+  };
+
+  /** Resolve a scene NAME to its bundle (built-in or saved), apply it, and own the selector +
+   *  persistence. Unknown names (a deleted saved preset) are ignored — the guard the boot wants. */
+  const applyScene = (name: string): void => {
+    const bundle =
+      name === 'space4' || name === 'default'
+        ? builtinBundle(name)
+        : (loadScenes()[name] ?? null);
+    if (!bundle) return;
+    applyingScene = true;
+    applyBundle(bundle);
     currentScene = name;
     ui.scene.value = name;
     try {
@@ -3644,10 +3769,83 @@ async function main(): Promise<void> {
     }
     applyingScene = false;
     updateStats();
+    updateSceneDelBtn();
   };
+
+  /* ---- the #scene dropdown: built-ins, then the user's saved presets (sorted), then the disabled
+     '· custom ·' sentinel markSceneCustom selects on divergence. Rebuilt whenever the saved set
+     changes (boot, save, delete). */
+  const rebuildSceneOptions = (selected: string): void => {
+    const add = (value: string, label: string, disabled = false): void => {
+      const o = document.createElement('option');
+      o.value = value;
+      o.textContent = label;
+      if (disabled) o.disabled = true;
+      ui.scene.appendChild(o);
+    };
+    ui.scene.replaceChildren();
+    add('space4', 'space4 — spiral galaxy');
+    add('default', 'default — frozen field');
+    for (const nm of Object.keys(loadScenes()).sort()) add(nm, nm);
+    add('custom', '· custom ·', true);
+    ui.scene.value = Array.from(ui.scene.options).some((o) => o.value === selected)
+      ? selected
+      : 'custom';
+  };
+  /** The delete (×) button shows only when a SAVED preset is selected (never for a built-in/custom). */
+  const updateSceneDelBtn = (): void => {
+    ui.sceneDelBtn.style.display = ui.scene.value in loadScenes() ? '' : 'none';
+  };
+
+  const RESERVED_SCENE = new Set(['space4', 'default', 'custom']);
+  const saveSceneAs = (): void => {
+    const name = ui.sceneName.value.trim();
+    if (!name || RESERVED_SCENE.has(name)) {
+      ui.sceneName.focus(); // empty or reserved name → no-op, nudge the field
+      return;
+    }
+    const scenes = loadScenes();
+    scenes[name] = snapshotScene(); // upsert: a duplicate name overwrites, as a Save should
+    writeScenes(scenes);
+    rebuildSceneOptions(name); // list + select the new named preset (so it reads named, not custom)
+    currentScene = name;
+    try {
+      localStorage.setItem(SCENE_KEY, name);
+    } catch {
+      /* storage denied: the save still lives in SCENES_KEY, just not the selection */
+    }
+    ui.sceneName.value = '';
+    updateSceneDelBtn();
+  };
+  const deleteSelectedScene = (): void => {
+    const name = ui.scene.value;
+    const scenes = loadScenes();
+    if (!(name in scenes)) return; // only saved presets are deletable
+    delete scenes[name];
+    writeScenes(scenes);
+    // the live look is unchanged (we only drop the snapshot) — fall the selector back to custom.
+    currentScene = 'custom';
+    rebuildSceneOptions('custom');
+    try {
+      localStorage.setItem(SCENE_KEY, 'custom');
+    } catch {
+      /* storage denied */
+    }
+    updateSceneDelBtn();
+  };
+
   ui.scene.addEventListener('change', () => {
     const v = ui.scene.value;
-    if (v === 'space4' || v === 'default') applyScene(v);
+    if (v === 'custom') return; // the sentinel is not a real pick
+    applyScene(v); // built-in or saved name (applyScene guards unknown names)
+  });
+  ui.sceneSaveBtn.addEventListener('click', saveSceneAs);
+  ui.sceneDelBtn.addEventListener('click', deleteSelectedScene);
+  ui.sceneName.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      saveSceneAs();
+    }
   });
 
   /* ---- the stats overlay: rAF-interval median (SCALE.md's measurement) + jsFrameMs, and
@@ -3774,19 +3972,25 @@ async function main(): Promise<void> {
   restoreNear3d();
 
   /* ---- SCENE boot: a fresh visitor (no stored scene) opens directly on space4; a returning
-     visitor re-applies whichever scene they chose, so it survives reloads AND dataset-size
-     switches (which reload the page). 'custom' keeps the state restored above (levels + 3D-nodes)
-     and just reflects it in the selector. */
+     visitor re-applies whichever scene they chose — a built-in OR a user-saved named preset — so it
+     survives reloads AND dataset-size switches (which reload the page). 'custom', or a saved name
+     that no longer exists, keeps the per-group state restored above (levels + 3D-nodes) and just
+     reflects custom in the selector. The dropdown is populated with the saved presets first. */
   {
     const storedScene = localStorage.getItem(SCENE_KEY);
+    rebuildSceneOptions(storedScene ?? 'space4');
+    const savedScenes = loadScenes();
     if (storedScene === null || storedScene === 'space4') {
       applyScene('space4');
     } else if (storedScene === 'default') {
       applyScene('default');
+    } else if (storedScene in savedScenes) {
+      applyScene(storedScene); // a saved named preset — apply its full bundle, like a built-in
     } else {
       currentScene = 'custom';
       ui.scene.value = 'custom';
     }
+    updateSceneDelBtn();
   }
 
   const loop = (t: number): void => {

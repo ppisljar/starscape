@@ -24,12 +24,41 @@
            at once, independent of dataset size. Defaults to space4 on a fresh load. -->
       <label id="scenebox"
         >preset
-        <select id="scene" title="a whole curated scene: hierarchy + look + glow + view">
+        <select id="scene" title="a whole curated scene: hierarchy + look + glow + view + 3D nodes">
           <option value="space4">space4 — spiral galaxy</option>
           <option value="default">default — frozen field</option>
           <option value="custom" disabled>· custom ·</option>
         </select>
       </label>
+      <!-- SAVE a named scene: snapshots the whole live scene (hierarchy + look + glow + view + 3D
+           nodes) into the #scene dropdown, switchable like the built-ins. × deletes the selected
+           saved preset (shown only when one is selected). -->
+      <div id="sceneSave">
+        <input
+          id="sceneName"
+          type="text"
+          placeholder="save scene as…"
+          autocomplete="off"
+          spellcheck="false"
+          maxlength="40"
+          title="name this scene, then Save to add it to the preset dropdown"
+        />
+        <button
+          id="sceneSaveBtn"
+          type="button"
+          title="save the current scene (hierarchy + look + glow + view + 3D nodes) as a named preset"
+        >
+          save
+        </button>
+        <button
+          id="sceneDelBtn"
+          type="button"
+          title="delete the selected saved preset"
+          style="display: none"
+        >
+          ×
+        </button>
+      </div>
       <div id="find">
         <input id="search" type="text" placeholder="find a node /" autocomplete="off" spellcheck="false" />
         <div id="hits"></div>
