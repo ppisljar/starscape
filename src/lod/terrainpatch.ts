@@ -80,9 +80,20 @@ const DEFAULT_LEVELS = 6;
  *  Chosen so the OUTERMOST cell (= outerExtent·2/res) ≈ the uniform sphere's edge at subdiv 8, so the
  *  rim refines the sphere rather than clashing with it. */
 const DEFAULT_OUTER_EXTENT_FRAC = 0.22;
-/** Outward radial bias (fraction of radius) so the patch wins the depth test over the coarser icosphere
- *  it overlays. Sub-pixel at ground range; large enough to clear the sphere's tessellation undershoot. */
+/** Outward radial bias FLOOR (fraction of radius) so the patch wins the depth test over the coarser
+ *  icosphere it overlays. Sub-pixel at ground range; large enough to clear the sphere's tessellation
+ *  undershoot when the displacement amplitude is near zero (the swap altitude). */
 const DEFAULT_BIAS_FRAC = 0.0016;
+/** Amplitude-scaled bias term. The icosphere and the patch displace the SAME height field, but the
+ *  icosphere is coarse and LINEARLY interpolates between its vertices — so in concave areas (valley
+ *  floors, the inside of a bend) its interpolated surface sits ABOVE the patch's finer surface. Where
+ *  it does, the icosphere wins the depth test and POKES THROUGH the patch as flat, bright, under-lit
+ *  facets — the close-range "breakdown" (depth order / renderOrder cannot fix it: the icosphere is
+ *  physically higher there). That vertical discrepancy scales with the displacement amplitude, so the
+ *  bias does too: `bias = max(FLOOR, AMP_K · ampFrac) · radius`. At full amp (0.11R) this is ≈0.0143R,
+ *  well under the skirt depth (0.03R), which curtains the resulting sub-percent rim step. The collision
+ *  floor samples the field WITHOUT this bias, so the camera still hovers above the true relief. */
+const BIAS_AMP_K = 0.13;
 /** Outer-rim skirt depth (fraction of radius): the vertical wall that hides the gap to the sphere. */
 const DEFAULT_SKIRT_FRAC = 0.03;
 /** CDLOD morph band as a fraction of a level's half-extent: native below LO, fully morphed to the
@@ -440,7 +451,7 @@ export function createTerrainPatch(opts: TerrainPatchOpts): TerrainPatch {
       uBaseCell.value = c0;
       uAmp.value = amp;
       uDetail.value = u.detail;
-      uBias.value = DEFAULT_BIAS_FRAC * radius;
+      uBias.value = Math.max(DEFAULT_BIAS_FRAC, BIAS_AMP_K * amp) * radius;
       uSkirt.value = DEFAULT_SKIRT_FRAC * radius;
       (uTint.value as Vector3).set(u.tintR, u.tintG, u.tintB);
 

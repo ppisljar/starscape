@@ -441,8 +441,10 @@ Each vertex maps its tangent-plane lattice offset onto the sphere by the azimuth
 exponential map and displaces by the SAME `TerrainHeightSource` at the SAME amplitude (read back from the
 icosphere), with the SAME draped colour — so the overlay is invisible except denser. Per-level centres
 SNAP to their own grid (no swimming as you fly); a CDLOD morph near each ring's outer edge collapses odd
-cells onto the coarser lattice (crack-free ring↔ring); a sub-pixel outward bias + an outer skirt hide the
-seam to the icosphere. Collision is unchanged — it still floors on the icosphere's CPU height sampler,
+cells onto the coarser lattice (crack-free ring↔ring); an outward bias that scales with the displacement
+amplitude — the coarse icosphere linearly interpolates the SAME field, so in valleys at full relief its
+interpolated surface sits ABOVE the finer patch and would poke through as flat bright facets; the bias
+keeps the patch on top there — plus an outer skirt hide the seam to the icosphere. Collision is unchanged — it still floors on the icosphere's CPU height sampler,
 the identical field. Opt-in via `createNearMesh({ terrain:true })` (patch on by default, `terrainPatch:false`
 for the icosphere alone); `setTerrainWireframe` renders the tri-density view.
 
