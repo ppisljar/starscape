@@ -13,8 +13,8 @@
  *      Even after creation, `setEnabled(false)` frees the field of every per-frame cost and the
  *      first buffers allocate lazily on the first ENABLED update, not at construction.
  *   2. DEFAULT SPHERE ⇒ ONE DRAW CALL. With no shapeFacet every promoted node is a sphere, so a
- *      single InstancedBufferGeometry (one draw call) covers the whole near pool. Alternate shapes
- *      cost a pool each, created LAZILY only when a node of that shape actually promotes.
+ *      single InstancedMesh (one draw call) covers the whole near pool. Alternate shapes cost a
+ *      pool each, created LAZILY only when a node of that shape actually promotes.
  *   3. TEXTURES ARE SELF-CONTAINED AND OPT-IN. When textureFacet is null the material never
  *      samples a texture and NONE is generated (flat tinted shading). When it is set, the ~10
  *      planet textures are generated PROCEDURALLY from the lib's own `hash` (DESIGN §10.1) into one
@@ -40,11 +40,13 @@ import {
   CylinderGeometry,
   DataArrayTexture,
   DodecahedronGeometry,
+  DynamicDrawUsage,
   Group,
   IcosahedronGeometry,
   InstancedBufferAttribute,
-  InstancedBufferGeometry,
+  InstancedMesh,
   LinearFilter,
+  Matrix4,
   Mesh,
   MeshBasicNodeMaterial,
   OctahedronGeometry,
@@ -65,7 +67,6 @@ import {
   max,
   mix,
   normalLocal,
-  positionLocal,
   texture,
   uv,
   vec3,
@@ -404,14 +405,10 @@ export interface NearMesh {
 
 interface Pool {
   shape: number;
-  geo: InstancedBufferGeometry;
-  mesh: Mesh;
-  iPos: Float32Array;
-  iScale: Float32Array;
+  geo: BufferGeometry;
+  mesh: InstancedMesh;
   iTint: Float32Array;
   iTexLayer: Float32Array;
-  posAttr: InstancedBufferAttribute;
-  scaleAttr: InstancedBufferAttribute;
   tintAttr: InstancedBufferAttribute;
   texAttr: InstancedBufferAttribute;
 }
@@ -482,11 +479,10 @@ export function createNearMesh(graph: Graph, field: Field, opts: NearMeshOpts = 
     mat.transparent = false;
     mat.depthWrite = true;
     mat.depthTest = true;
-    // per-instance transform: unit geometry scaled by the node's world radius, placed at its
-    // live world position (the mesh object stays at the origin, so object space = world space).
-    const pos = attribute('iPos', 'vec3').add(positionLocal.mul(attribute('iScale', 'float')));
-    mat.positionNode = pos as unknown as typeof mat.positionNode;
-
+    // The per-instance transform rides on InstancedMesh.instanceMatrix (a uniform scale + a
+    // translation, composed per frame in the fill loop). three applies that matrix to BOTH the clip
+    // position and the depth it writes, in every pass — so a promoted body occludes the field
+    // billboards, the links and its peers natively, with no custom positionNode in the depth path.
     const tint = attribute('iTint', 'vec3');
     mat.colorNode = Fn(() => {
       // world normal — no per-instance rotation and a uniform scale, so the geometry normal IS
@@ -519,37 +515,25 @@ export function createNearMesh(graph: Graph, field: Field, opts: NearMeshOpts = 
   const group = new Group();
   group.renderOrder = 2;
   const pools = new Map<number, Pool>();
+  const instMat = new Matrix4(); // scratch: composed per instance in the fill loop
   const makePool = (shape: number): Pool => {
-    const geo = new InstancedBufferGeometry().copy(getShapeGeo(shape) as InstancedBufferGeometry);
-    geo.instanceCount = 0;
-    const iPos = new Float32Array(count * 3);
-    const iScale = new Float32Array(count);
+    // a unit-radius shape (cloned so this pool owns its per-instance attribute buffers); the
+    // placement is InstancedMesh.instanceMatrix, so the base geometry stays at the origin.
+    const geo = getShapeGeo(shape).clone();
     const iTint = new Float32Array(count * 3);
     const iTexLayer = new Float32Array(count);
-    const posAttr = new InstancedBufferAttribute(iPos, 3);
-    const scaleAttr = new InstancedBufferAttribute(iScale, 1);
     const tintAttr = new InstancedBufferAttribute(iTint, 3);
     const texAttr = new InstancedBufferAttribute(iTexLayer, 1);
-    geo.setAttribute('iPos', posAttr);
-    geo.setAttribute('iScale', scaleAttr);
+    tintAttr.setUsage(DynamicDrawUsage);
+    texAttr.setUsage(DynamicDrawUsage);
     geo.setAttribute('iTint', tintAttr);
     geo.setAttribute('iTexLayer', texAttr);
-    const mesh = new Mesh(geo, material);
+    const mesh = new InstancedMesh(geo, material, count);
+    mesh.count = 0;
+    mesh.instanceMatrix.setUsage(DynamicDrawUsage); // rewritten every active frame
     mesh.frustumCulled = false;
     mesh.renderOrder = 2;
-    const pool: Pool = {
-      shape,
-      geo,
-      mesh,
-      iPos,
-      iScale,
-      iTint,
-      iTexLayer,
-      posAttr,
-      scaleAttr,
-      tintAttr,
-      texAttr,
-    };
+    const pool: Pool = { shape, geo, mesh, iTint, iTexLayer, tintAttr, texAttr };
     pools.set(shape, pool);
     group.add(mesh);
     return pool;
@@ -672,7 +656,7 @@ export function createNearMesh(graph: Graph, field: Field, opts: NearMeshOpts = 
   let order = new Int32Array(0);
 
   const clearPools = (): void => {
-    for (const p of pools.values()) p.geo.instanceCount = 0;
+    for (const p of pools.values()) p.mesh.count = 0;
   };
 
   const update = (cam: { x: number; y: number; z: number }, _dt: number): void => {
@@ -814,10 +798,12 @@ export function createNearMesh(graph: Graph, field: Field, opts: NearMeshOpts = 
       if (w >= count) continue; // this shape's pool is full (rare — count is the global cap)
       const o3 = w * 3;
       const p3 = j * 3;
-      pool.iPos[o3] = candPos[p3]!;
-      pool.iPos[o3 + 1] = candPos[p3 + 1]!;
-      pool.iPos[o3 + 2] = candPos[p3 + 2]!;
-      pool.iScale[w] = field.sizeOf(i) * NODE_SCALE;
+      const r = field.sizeOf(i) * NODE_SCALE;
+      // instance matrix = uniform scale (the node's world radius) then translate to the live world
+      // position; three feeds it to the clip position AND the written depth, so the body is solid.
+      instMat.makeScale(r, r, r);
+      instMat.setPosition(candPos[p3]!, candPos[p3 + 1]!, candPos[p3 + 2]!);
+      pool.mesh.setMatrixAt(w, instMat);
       pool.iTint[o3] = colors[i * 3]!;
       pool.iTint[o3 + 1] = colors[i * 3 + 1]!;
       pool.iTint[o3 + 2] = colors[i * 3 + 2]!;
@@ -829,10 +815,9 @@ export function createNearMesh(graph: Graph, field: Field, opts: NearMeshOpts = 
     // commit pool counts + upload (tiny buffers; a full small upload each active frame)
     for (const p of pools.values()) {
       const w = fill.get(p.shape) ?? 0;
-      p.geo.instanceCount = w;
+      p.mesh.count = w;
       if (w > 0) {
-        p.posAttr.needsUpdate = true;
-        p.scaleAttr.needsUpdate = true;
+        p.mesh.instanceMatrix.needsUpdate = true;
         p.tintAttr.needsUpdate = true;
         if (textured) p.texAttr.needsUpdate = true;
       }
@@ -904,13 +889,14 @@ export function createNearMesh(graph: Graph, field: Field, opts: NearMeshOpts = 
     get drawCalls(): number {
       if (!enabled) return 0;
       let d = 0;
-      for (const p of pools.values()) if (p.geo.instanceCount > 0) d++;
+      for (const p of pools.values()) if (p.mesh.count > 0) d++;
       return d;
     },
     dispose(): void {
       restoreAll();
       alphaAttr.needsUpdate = true;
       for (const p of pools.values()) {
+        p.mesh.dispose();
         p.geo.dispose();
         group.remove(p.mesh);
       }
