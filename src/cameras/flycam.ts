@@ -488,39 +488,30 @@ export function createFlycam(camera: RigCamera, cfg: FlycamConfig, opts: FlycamO
        * each frame, so the floor tracks it as the body spins / morphs. */
       posT[0] = camera.position.x; posT[1] = camera.position.y; posT[2] = camera.position.z;
       const surf = surfaceAt ? surfaceAt(posT) : null;
-      let floor = 0;
+      let floor = 0, rSurf = 0, hover = 0, clearNow = 0;
       if (surf) {
         surfC.set(surf.center[0], surf.center[1], surf.center[2]);
-        const rSurf = surf.radius;
+        rSurf = surf.radius;
         surfN.subVectors(camera.position, surfC);
         const dist = surfN.length();
         if (dist > 1e-6) surfN.multiplyScalar(1 / dist); else surfN.set(0, 1, 0); // radial-out unit
         // TERRAIN floor (stage B): the displaced surface radius under the camera, else the sphere
         // (stage A). Sampled at the live radial direction, so the floor rises and falls with the
-        // relief as you skim over it. The speed-scale / brake bands keep using the sphere radius as
-        // their SCALE (the planet's size), so only the floor itself follows the terrain.
+        // relief as you skim over it. The speed-scale band keeps using the sphere radius as its SCALE
+        // (the planet's size); the floor itself + the clearance controller (below) follow the terrain.
         const rFloor = surf.terrain ? surf.terrain(surfN.x, surfN.y, surfN.z) : rSurf;
-        const hover = Math.max(rSurf * HOVER_FRAC, HOVER_MIN);
+        hover = Math.max(rSurf * HOVER_FRAC, HOVER_MIN);
         floor = rFloor + hover;
-        altitude = dist - rFloor; // height above the true (terrain) surface
-        // Holding (the CapsLock speed-lock) bypasses the smooth brake + speed-scale, exactly as it
-        // bypasses the node damp; the hard backstop (c) below still runs, so you cannot tunnel.
+        clearNow = dist - floor;  // clearance above the floor at the CURRENT position (pre-move)
+        altitude = dist - rFloor; // height above the true (terrain) surface (drives the speed-scale)
+        // Altitude-scaled speed — crawl near the ground, unchanged (scale 1) far away. Holding (the
+        // CapsLock speed-lock) bypasses it, exactly as it bypasses the node damp; the hard clamp in
+        // the clearance controller below STILL runs under hold, so you can never tunnel.
         if (!hold) {
-          // (a) altitude-scaled speed — crawl near the ground, unchanged (scale 1) far away.
           const altScale = MathUtils.clamp(
             altitude / Math.max(rSurf * SPEED_ALT_SCALE, 1e-6), SPEED_FLOOR, 1);
           TMP.multiplyScalar(altScale);
           effSpeed = speed * altScale;
-          // (b) soft-landing — damp only the DESCENDING (toward-centre) part of the step as the
-          //     floor nears; tangential + climbing motion is untouched, so you keep full control to
-          //     skim and orbit just above the surface.
-          const vrad = TMP.dot(surfN); // >0 climbing away, <0 descending into the planet
-          if (vrad < 0) {
-            const band = Math.max(rSurf * SURF_BRAKE_FRAC, hover);
-            const kk = MathUtils.clamp((dist - floor) / band, 0, 1); // 1 high, 0 at the floor
-            TMP.addScaledVector(surfN, (kk - 1) * vrad); // scale the radial-in component by kk
-            if (kk <= 0.2) blocked = true;
-          }
         }
       }
 
@@ -539,17 +530,40 @@ export function createFlycam(camera: RigCamera, cfg: FlycamConfig, opts: FlycamO
       camera.position.add(TMP);
       target.add(TMP);
 
-      // (c) hard floor backstop: never let the camera cross below radius+hover. Catches overshoot
-      //     (a large dt) and the hold case where the smooth damp is bypassed. The target moves by
-      //     the same delta, so the orbit radius and the aim survive the correction.
+      /* TERRAIN CLEARANCE CONTROLLER (stage B) — the soft-landing AND the hard anti-tunnel backstop,
+       * as one rule, sampled at the camera's ACTUAL POST-MOVE radial direction. That last point is the
+       * whole fix: the terrain floor must be read where the camera ENDED UP, not where it started, or
+       * flying HORIZONTALLY into a ridge (a step that barely changes the radius but sweeps the radial
+       * direction into much taller terrain) is never caught — the old backstop compared the new radius
+       * against the floor under the OLD position and let the camera pass straight through every peak.
+       *   Measure the clearance the step LEFT above the floor here. If the step moved us toward the
+       * floor (descending, OR skimming into rising ground), ease the loss with the existing brake band —
+       * allow only a `kk` fraction of this frame's clearance loss, kk→0 at the floor — and correct ONLY
+       * along the radial, so tangential + climbing motion is untouched: you ride smoothly up and over a
+       * rising ridge, settle onto a peak, and drop into a valley, in EVERY direction of motion. The
+       * clearance may never fall below 0 (the hard clamp), which also runs under the CapsLock hold. */
       if (surf) {
         surfN.subVectors(camera.position, surfC);
         const dNew = surfN.length();
-        if (dNew > 1e-6 && dNew < floor) {
-          surfN.multiplyScalar((floor - dNew) / dNew); // outward delta back onto the floor
-          camera.position.add(surfN);
-          target.add(surfN);
-          blocked = true;
+        if (dNew > 1e-6) {
+          surfN.multiplyScalar(1 / dNew); // post-move radial-out unit
+          const rFloorNew = surf.terrain ? surf.terrain(surfN.x, surfN.y, surfN.z) : rSurf;
+          const floorNew = rFloorNew + hover;
+          const clearNew = dNew - floorNew; // clearance above the floor the step actually left
+          let wantClear = 0;                // hard floor: clearance may never go below 0
+          if (!hold && clearNew < clearNow) {
+            const band = Math.max(rSurf * SURF_BRAKE_FRAC, hover);
+            const kk = MathUtils.clamp(clearNew / band, 0, 1); // 1 well clear, 0 at the floor
+            wantClear = Math.max(clearNow - kk * (clearNow - clearNew), 0);
+            if (kk <= 0.2) blocked = true;
+          }
+          if (clearNew < wantClear) {
+            const push = wantClear - clearNew; // outward, along the post-move radial
+            camera.position.addScaledVector(surfN, push);
+            target.addScaledVector(surfN, push);
+            blocked = true;
+          }
+          altitude = hover + Math.max(clearNew, wantClear); // telemetry: final height above terrain
         }
       }
     }

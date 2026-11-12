@@ -252,6 +252,76 @@ describe('flycam drag = orbit the universe', () => {
   });
 });
 
+describe('flycam terrain collision (surfaceAt — the planet floor)', () => {
+  const R = 1000;
+  const PEAK = 500; // the ridge rises to R + PEAK toward world +X; the -X hemisphere stays the sphere
+  /** Terrain floor: flat sphere (R) on the −X side, smoothly rising to a tall ridge/plateau toward +X.
+   *  `dx,dy,dz` arrive as a UNIT direction (as the flycam passes them), so dx IS the x-component. */
+  const terrain = (dx: number, dy: number, dz: number): number => {
+    const len = Math.hypot(dx, dy, dz) || 1;
+    const ax = Math.max(0, dx / len);
+    const t = Math.min(1, ax / 0.4);
+    return R + PEAK * (t * t * (3 - 2 * t)); // smoothstep ramp to the plateau by ax = 0.4
+  };
+  const withTerrain = (): FlycamOptions['surfaceAt'] =>
+    () => ({ center: [0, 0, 0] as const, radius: R, terrain });
+  const sphereOnly = (): FlycamOptions['surfaceAt'] =>
+    () => ({ center: [0, 0, 0] as const, radius: R });
+
+  it('skimming HORIZONTALLY into a ridge rides up and over it — never through', () => {
+    // Camera just above the flat surface at the +Z point, looking at the planet centre, so world +X is
+    // the ship's RIGHT axis: KeyD strafes TANGENTIALLY, straight at the ridge. The old backstop sampled
+    // the floor under the camera's OLD (pre-move) direction, so a tangential step — which barely changes
+    // the radius but sweeps the radial direction into much taller terrain — was never caught and the
+    // camera flew clean through every peak. The floor must follow the camera's ACTUAL direction.
+    const { camera, cam, keys } = rig({ surfaceAt: withTerrain() }, {}, [0, 0, R + 60]);
+    keys.fire('keydown', key('KeyD'));
+    let minClear = Infinity; // min (cameraRadius − terrainSurface) over the whole flight
+    let maxDir = 0;          // how far into the ridge (x-component of the radial dir) we reached
+    for (let t = 0; t < 400; t++) {
+      const tel = cam.update(0.016);
+      const rad = camera.position.length();
+      const dir = camera.position.clone().normalize();
+      const surf = terrain(dir.x, dir.y, dir.z);
+      minClear = Math.min(minClear, rad - surf);
+      maxDir = Math.max(maxDir, dir.x);
+      expect(tel.altitude).toBeGreaterThan(0); // telemetry never reports sinking below the surface
+    }
+    expect(maxDir).toBeGreaterThan(0.35);            // genuinely skimmed deep into the tall ridge
+    expect(minClear).toBeGreaterThan(-1e-6);         // and NEVER dipped below the terrain surface
+    expect(camera.position.length()).toBeGreaterThan(R + PEAK * 0.6); // it rode UP the ridge, not through
+  });
+
+  it('descending straight onto a peak stops ON the peak, not at the base sphere', () => {
+    // Over the plateau (dir ≈ +X, terrain = R + PEAK). Looking at the centre ⇒ KeyW is radial-IN (a
+    // vertical descent). The camera must settle on the terrain (≈ R + PEAK + hover), never sink to R.
+    const { camera, cam, keys } = rig({ surfaceAt: withTerrain() }, {}, [R + 600, 0, 0]);
+    const start = camera.position.length();
+    keys.fire('keydown', key('KeyW'));
+    let minRad = Infinity;
+    for (let t = 0; t < 600; t++) {
+      cam.update(0.016);
+      minRad = Math.min(minRad, camera.position.length());
+    }
+    const end = camera.position.length();
+    expect(end).toBeLessThan(start);            // it descended
+    expect(minRad).toBeGreaterThan(R + PEAK - 1e-3); // but never crossed below the peak surface (≈1500)
+    expect(end).toBeLessThan(R + PEAK + 120);   // and settled just above it, not out in space
+  });
+
+  it('stage-A sphere floor (no terrain sampler) still stops a radial descent at radius+hover', () => {
+    const { camera, cam, keys } = rig({ surfaceAt: sphereOnly() }, {}, [0, 0, R + 600]);
+    keys.fire('keydown', key('KeyW')); // toward the centre ⇒ descend onto the bare sphere
+    let minRad = Infinity;
+    for (let t = 0; t < 600; t++) {
+      cam.update(0.016);
+      minRad = Math.min(minRad, camera.position.length());
+    }
+    expect(minRad).toBeGreaterThan(R - 1e-3);   // never below the sphere
+    expect(minRad).toBeLessThan(R + 80);        // and it did settle down onto it (hover ≈ 40)
+  });
+});
+
 describe('flycam turning and flying', () => {
   it('arrows swing the NOSE: position still, target follows round at the same radius', () => {
     const { camera, cam, keys } = rig();
