@@ -26,10 +26,15 @@
  * sphere normal (seamless).
  *
  * LOD. A handful of discrete icosphere subdivisions swapped by altitude (coarse high up, finer near the
- * ground), each built lazily on first use. Not CDLOD/clipmaps — enough to judge the look + feel.
+ * ground), each built lazily on first use. The ladder is floored at subdiv 6 so even the coarsest band
+ * already has a smooth limb at the swap, and refines to subdiv 8 (1.31M tris) near the ground. Not
+ * CDLOD/clipmaps — uniform over the whole sphere, so close up the per-area density is still bounded;
+ * real metre-scale ground detail needs adaptive tessellation (triangles concentrated under the camera),
+ * which this prototype deliberately does not attempt. Enough to judge the look + feel of the descent.
  */
 
 import {
+  DoubleSide,
   Group,
   IcosahedronGeometry,
   Mesh,
@@ -205,8 +210,9 @@ export interface TerrainOpts {
   colorNode: TerrainColorNode;
   /** Peak displacement as a fraction of planet radius at full ramp. Default TERRAIN_HEIGHT_SCALE. */
   heightScale?: number;
-  /** Finest icosphere subdivision (the near-ground LOD). Default 6 (81,920 tris). Coarser levels at
-   *  `max-1`, `max-2` fill the higher altitudes. */
+  /** Finest icosphere subdivision (the near-ground LOD). Default 8 (1,310,720 tris). Coarser levels
+   *  at `max-1`, `max-2` fill the higher altitudes, floored at subdiv 6 so even the coarsest active
+   *  band has a smooth limb at the swap. */
   maxSubdiv?: number;
 }
 
@@ -253,8 +259,15 @@ export function createTerrain(opts: TerrainOpts): Terrain {
   const heightScale = Number.isFinite(opts.heightScale)
     ? (opts.heightScale as number)
     : TERRAIN_HEIGHT_SCALE;
-  const maxSubdiv = Math.max(1, (opts.maxSubdiv ?? 6) | 0);
-  const subdivLevels = [Math.max(1, maxSubdiv - 2), Math.max(2, maxSubdiv - 1), maxSubdiv];
+  const maxSubdiv = Math.max(1, (opts.maxSubdiv ?? 8) | 0);
+  // The COARSEST active band must already have a SMOOTH limb at the swap distance — subdiv 4 (5,120
+  // tris) shows an obviously faceted silhouette the instant it replaces the textured sphere, so the
+  // ladder is floored at subdiv 6 (81,920 tris, ~320 segments round a great circle ⇒ a smooth circle)
+  // and refines to `maxSubdiv` near the ground. With the default max 8 this is [6, 7, 8] =
+  // 82k → 328k → 1.31M tris; a consumer that forces a smaller max collapses the floor onto it.
+  const COARSEST_SMOOTH = 6;
+  const bandOf = (sd: number): number => Math.min(maxSubdiv, Math.max(COARSEST_SMOOTH, sd));
+  const subdivLevels = [bandOf(maxSubdiv - 2), bandOf(maxSubdiv - 1), maxSubdiv];
 
   // uniforms the fill drives each frame; the material reads them, so no rebuild on ramp / LOD swap.
   const uAmp = uniform(0);
@@ -266,6 +279,12 @@ export function createTerrain(opts: TerrainOpts): Terrain {
   mat.transparent = false;
   mat.depthWrite = true;
   mat.depthTest = true;
+  // DOUBLE-SIDED: the ground has to stay solid when the camera near-clips the front of the globe
+  // (skimming low, or the near-plane cutting into a ridge). FrontSide back-face-culls the clipped
+  // front shell and you see straight THROUGH the planet to the far inside; DoubleSide renders the
+  // inner faces too so the surface reads solid from any angle. The analytic normal is forced outward
+  // (sign(dot(nrm, dir)) below), so an inner face still lights as ground, not a dark hole.
+  mat.side = DoubleSide;
 
   // VERTEX: unit direction → displaced position + analytic displaced normal (two finite-difference
   // height taps along a tangent basis). At uAmp 0 the normal collapses to the smooth sphere normal.

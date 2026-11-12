@@ -770,10 +770,12 @@ export interface NearMeshOpts {
    *  proceduralDetail (it reuses the earth colour so the handoff is invisible). Default false ⇒ the
    *  terrain subsystem is never created, zero cost. Live via `setTerrain`. */
   terrain?: boolean;
-  /** Peak terrain displacement as a fraction of planet radius at full descent (default 0.05 —
-   *  exaggerated so silhouettes read in the prototype; a DEM would carry true scale). */
+  /** Peak terrain displacement as a fraction of planet radius at full descent (default
+   *  TERRAIN_HEIGHT_SCALE — exaggerated so silhouettes read in the prototype; a DEM would carry true
+   *  scale). */
   terrainHeightScale?: number;
-  /** Finest terrain icosphere subdivision near the ground (default 6 = 81,920 tris). */
+  /** Finest terrain icosphere subdivision near the ground (default 8 = 1,310,720 tris; the coarser
+   *  altitude bands are floored at subdiv 6 for a smooth limb at the swap). */
   terrainMaxSubdiv?: number;
   /** Override the built-in shape registry (unit-radius geometries, index 0 the default). */
   shapes?: BufferGeometry[];
