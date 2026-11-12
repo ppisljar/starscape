@@ -445,6 +445,21 @@ async function main(): Promise<void> {
     roomPos.z = p[2];
     return nearestDistance(grid, roomPos, { drift: gridDrift });
   };
+  /* The nearest promoted-planet SURFACE, fed to the flycam as a solid floor + altitude speed-scale
+     (near-mesh terrain stage A). nearMesh is created LAZILY when the 3D-nodes toggle is switched on
+     (declared far below); this closure late-binds it, so with the LOD off (default) it returns null
+     and the flycam is byte-identical to today. nearestSurface is O(promoted) and already null while
+     the layer is disabled. */
+  const surfaceQ = { x: 0, y: 0, z: 0 };
+  const surfaceAt = (
+    p: readonly [number, number, number],
+  ): { center: readonly [number, number, number]; radius: number } | null => {
+    if (!nearMesh) return null;
+    surfaceQ.x = p[0];
+    surfaceQ.y = p[1];
+    surfaceQ.z = p[2];
+    return nearMesh.nearestSurface(surfaceQ);
+  };
   /* softStop is the proximity-damp SCALE (flycam.ts): approaching the nearest node, the W/S step
      eases toward a floor once the room AHEAD falls under ~2.5× this — a SMOOTH soft-landing ramp
      (the damp never gates to zero, so you can still push through) that brings you to a gentle
@@ -473,7 +488,7 @@ async function main(): Promise<void> {
   let fly: Flycam | null = null;
   let cam: CameraController;
   if (camMode === 'fly') {
-    fly = createFlycam(camera, flyCfg, { roomAt, softStop, zoomRange });
+    fly = createFlycam(camera, flyCfg, { roomAt, softStop, zoomRange, surfaceAt });
     fly.spin = bool('cameraDrift');
     cam = fly;
   } else {
@@ -3467,6 +3482,7 @@ async function main(): Promise<void> {
   let room = Infinity;
   let speed = 0;
   let blocked = false;
+  let altitude = Infinity; // height above the nearest promoted-planet surface (near-mesh floor)
   let settledNow = true;
   let wasSettled = true;
 
@@ -3595,6 +3611,7 @@ async function main(): Promise<void> {
     room = telem.room;
     speed = telem.speed;
     blocked = telem.blocked;
+    altitude = telem.altitude ?? Infinity;
     if (pose.active) {
       // the app-side pose tween (see flyPoseTo): wins over the idle flycam this frame
       pose.t += dt * 1000;
@@ -3757,6 +3774,17 @@ async function main(): Promise<void> {
     // on the next reload (createField focus opts), unrouted keys have no live seam this version.
     routes: { live: Object.keys(ROUTE), boot: BOOT_KEYS, unrouted: UNROUTED_KEYS },
     settled: (): boolean => settledNow,
+    // live flycam telemetry (surface floor + altitude speed-scale observability, stage A)
+    get nearMesh() {
+      return nearMesh;
+    },
+    camInfo: (): { speed: number; altitude: number; room: number; blocked: boolean; radius: number } => ({
+      speed,
+      altitude,
+      room,
+      blocked,
+      radius: cam.radius,
+    }),
     fpsMedian,
     jsFrameMs,
     bootMs: (): number => bootMs,

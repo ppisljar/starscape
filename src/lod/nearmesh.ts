@@ -785,6 +785,14 @@ export interface NearMesh {
   /** Per frame: find the promoted set by projected size, place/scale/tint their meshes at their
    *  LIVE positions, and fade their billboards. O(local) — cheap when nothing promotes. */
   update(cameraWorldPos: { x: number; y: number; z: number }, dt: number): void;
+  /** The nearest promoted planet's LIVE centre + world radius to `cameraWorldPos`, measured by
+   *  SPHERE-surface distance — the body a flying camera would collide with — or null when the LOD
+   *  is off (or nothing is promoted). Reflects the most recent `update` (O(promoted), cheap). The
+   *  returned object is REUSED each call (mutated in place): read it, do not keep it. Feeds a
+   *  consumer camera's surface floor + altitude speed-scale (see flycam `surfaceAt`). */
+  nearestSurface(cameraWorldPos: { x: number; y: number; z: number }):
+    | { center: readonly [number, number, number]; radius: number }
+    | null;
   /** Turn the subsystem on/off. Off restores every faded billboard and does zero per-frame work;
    *  buffers allocate lazily on the first enabled update. Default: enabled. */
   setEnabled(on: boolean): void;
@@ -1139,6 +1147,24 @@ export function createNearMesh(graph: Graph, field: Field, opts: NearMeshOpts = 
     candPos = new Float32Array(candCap * 3);
   };
 
+  /* ---- nearest-surface query (for a flying camera; see `nearestSurface`) ---------------------
+   * Each ENABLED update records the promoted planets' LIVE centres + world radii this frame (the
+   * same values that place their meshes, so they track spin/morph exactly). `nearestSurface` then
+   * returns the nearest of them by SURFACE distance — the sphere a flycam would collide with — in
+   * O(promoted). Zero cost when nothing promotes (surfCount stays 0) and when the LOD is off. */
+  let surfCenters = new Float32Array(0);
+  let surfRadii = new Float32Array(0);
+  let surfCount = 0;
+  const ensureSurf = (cap: number): void => {
+    if (surfRadii.length >= cap) return;
+    const c = Math.max(cap, count);
+    surfCenters = new Float32Array(c * 3);
+    surfRadii = new Float32Array(c);
+  };
+  // reused result object (mutated each call) so the per-frame query allocates nothing.
+  const surfOut: { center: [number, number, number]; radius: number } =
+    { center: [0, 0, 0], radius: 0 };
+
   const worldPx = (sizeWorld: number, dist: number): number =>
     glyphPx(sizeWorld, dist, halfH, tanHalf, dRef, falloff);
 
@@ -1423,6 +1449,8 @@ export function createNearMesh(graph: Graph, field: Field, opts: NearMeshOpts = 
   const update = (cam: { x: number; y: number; z: number }, _dt: number): void => {
     if (!enabled) return;
     ensureBuffers();
+    ensureSurf(count);
+    surfCount = 0; // rebuilt below from the promoted set; 0 ⇒ nearestSurface returns null
 
     // keep the grid fresh: build once, on every settle edge, and throttled while in motion.
     const settled = field.settled();
@@ -1555,6 +1583,16 @@ export function createNearMesh(graph: Graph, field: Field, opts: NearMeshOpts = 
       const j = order[s]!;
       const i = candIdx[j]!;
       const p3 = j * 3;
+      // record this promoted body as a solid sphere for nearestSurface (both instanced planets and
+      // image-override planets are collidable ground); the live centre is candPos, already computed.
+      if (surfCount < surfRadii.length) {
+        const s3 = surfCount * 3;
+        surfCenters[s3] = candPos[p3]!;
+        surfCenters[s3 + 1] = candPos[p3 + 1]!;
+        surfCenters[s3 + 2] = candPos[p3 + 2]!;
+        surfRadii[surfCount] = field.sizeOf(i) * NODE_SCALE;
+        surfCount++;
+      }
       const src = hasOverrides ? (overrides[i] ?? null) : null;
       if (src && src.kind === 'image') {
         // an image-override node is NOT an instanced instance — it becomes its own textured mesh.
@@ -1649,6 +1687,29 @@ export function createNearMesh(graph: Graph, field: Field, opts: NearMeshOpts = 
   return {
     objects: [group],
     update,
+    nearestSurface(cam: { x: number; y: number; z: number }):
+      | { center: readonly [number, number, number]; radius: number }
+      | null {
+      if (!enabled || surfCount === 0) return null;
+      let best = -1;
+      let bestD = Infinity;
+      for (let k = 0; k < surfCount; k++) {
+        const dx = surfCenters[k * 3]! - cam.x;
+        const dy = surfCenters[k * 3 + 1]! - cam.y;
+        const dz = surfCenters[k * 3 + 2]! - cam.z;
+        const d = Math.sqrt(dx * dx + dy * dy + dz * dz) - surfRadii[k]!; // surface distance
+        if (d < bestD) {
+          bestD = d;
+          best = k;
+        }
+      }
+      if (best < 0) return null;
+      surfOut.center[0] = surfCenters[best * 3]!;
+      surfOut.center[1] = surfCenters[best * 3 + 1]!;
+      surfOut.center[2] = surfCenters[best * 3 + 2]!;
+      surfOut.radius = surfRadii[best]!;
+      return surfOut;
+    },
     setEnabled(on: boolean): void {
       if (on === enabled) return;
       enabled = on;

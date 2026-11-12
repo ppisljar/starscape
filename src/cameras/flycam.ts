@@ -41,6 +41,24 @@ const FINE = 0.28;
 /** Wheel dolly ratio per notch; left Shift raises it to the 2.4th power. */
 const WHEEL_K = 1.14;
 
+/* ---- planet-surface collision + altitude speed-scale (DESIGN: near-mesh terrain, stage A) ------
+ * Consulted ONLY through the opt-in `surfaceAt` callback, and only when it returns a promoted
+ * planet near the camera. Absent or returning null ⇒ none of this runs and the translation step is
+ * byte-identical to the node-only path — the whole feature is off with the near-mesh LOD off. */
+/** Hover clearance above a planet sphere the camera may never cross: max(radius × FRAC, MIN). The
+ *  absolute floor keeps a tiny planet clear of the adaptive near plane. */
+const HOVER_FRAC = 0.04;
+const HOVER_MIN = 0.02;
+/** Altitude-scaled speed: translation scales by altitude/(radius × SPEED_ALT_SCALE), clamped to
+ *  [SPEED_FLOOR, 1] — you crawl at the surface (a controllable skim) but never fully freeze, and
+ *  far from any planet the scale is 1 (unchanged). */
+const SPEED_ALT_SCALE = 2.0;
+const SPEED_FLOOR = 0.12;
+/** Soft-landing band: within SURF_BRAKE_FRAC × radius of the floor the DESCENDING component of the
+ *  step eases to zero (the same soft-stop shape the node field uses), so you settle onto the
+ *  surface instead of hitting a wall. */
+const SURF_BRAKE_FRAC = 0.6;
+
 const EDIT = 'input,textarea,select,[contenteditable=""],[contenteditable="true"]';
 
 type MoveAxis = 'f' | 'r' | 'u';
@@ -128,6 +146,16 @@ export interface FlycamOptions {
   softStop: () => number;
   /** [closest, farthest] dolly radius, world units. */
   zoomRange: () => readonly [number, number];
+  /** OPT-IN planet-surface floor (near-mesh LOD, terrain stage A). The nearest promoted planet's
+   *  LIVE centre + world radius to `pos`, or null when none is near (LOD off / nothing promoted).
+   *  When present the flycam treats that sphere as solid ground: translation decelerates smoothly
+   *  into it, cannot descend below `radius + hover`, and scales down with altitude so you can skim
+   *  and orbit it controllably. Omitted, or returning null, ⇒ the flycam behaves exactly as without
+   *  it (no collision, no speed change). The centre is read every frame, so the floor holds as the
+   *  body spins / morphs. */
+  surfaceAt?: (
+    pos: readonly [number, number, number],
+  ) => { center: readonly [number, number, number]; radius: number } | null;
   /** Fired on every user input (key, drag, wheel) — hosts use it to wake auto-behaviours. */
   onInput?: () => void;
   /** Where key events live. Defaults to `globalThis`; tests hand in a stub surface. */
@@ -172,6 +200,7 @@ export interface Flycam extends CameraController {
 
 export function createFlycam(camera: RigCamera, cfg: FlycamConfig, opts: FlycamOptions): Flycam {
   const { roomAt, softStop, zoomRange } = opts;
+  const surfaceAt = opts.surfaceAt;
   const onInput = opts.onInput ?? ((): void => {});
   const reduced = opts.reducedMotion ??
     (typeof matchMedia === 'function' && matchMedia('(prefers-reduced-motion: reduce)').matches);
@@ -194,9 +223,10 @@ export function createFlycam(camera: RigCamera, cfg: FlycamConfig, opts: FlycamO
   const F = new Vector3(), R = new Vector3(), U = new Vector3();
   const Q = new Quaternion(), TMP = new Vector3(), OFF = new Vector3();
   const AFTER = new Vector3(), M = new Matrix4();
+  const surfC = new Vector3(), surfN = new Vector3();   // planet centre + radial unit (surfaceAt)
   const posT: [number, number, number] = [0, 0, 0];
   const telem: CameraTelemetry =
-    { speed: 0, room: 0, flying: false, radius: 0, blocked: false, held: 0 };
+    { speed: 0, room: 0, flying: false, radius: 0, blocked: false, altitude: Infinity, held: 0 };
 
   const axes = (): void => {
     F.set(0, 0, -1).applyQuaternion(camera.quaternion);
@@ -372,7 +402,8 @@ export function createFlycam(camera: RigCamera, cfg: FlycamConfig, opts: FlycamO
       target.lerpVectors(tween.g0, tween.g1, e);
       if (k >= 1) tween = null;
       telem.speed = 0; telem.room = roomAtV(camera.position); telem.flying = true;
-      telem.radius = radius(); telem.blocked = false; telem.held = held.size;
+      telem.radius = radius(); telem.blocked = false; telem.altitude = Infinity;
+      telem.held = held.size;
       return telem;
     }
 
@@ -433,32 +464,84 @@ export function createFlycam(camera: RigCamera, cfg: FlycamConfig, opts: FlycamO
 
     // MOVING: camera and target together, so the orbit radius survives the flight.
     const moving = Math.abs(vel.f) + Math.abs(vel.r) + Math.abs(vel.u);
+    let altitude = Infinity;   // height above the nearest planet surface (telemetry)
+    let effSpeed = speed;      // the speed actually applied (altitude-scaled near a planet)
     if (moving > 1e-4) {
       TMP.set(0, 0, 0)
         .addScaledVector(F, vel.f).addScaledVector(R, vel.r).addScaledVector(U, vel.u)
         .multiplyScalar(speed * dt);
-      /* Proximity DAMPS, it never GATES. A gate that evaluates to exactly zero strands the
-       * ship: `room` is the distance to the nearest page ANYWHERE, not the nearest page
-       * ahead, so inside a dense region you are routinely within the stop radius of something
-       * off to the side, (room − stop) goes negative, and the step multiplies by nothing — W
-       * appears dead and re-pressing cannot help, because nothing about the geometry changed.
-       * The clamp floor (0.16) is the whole fix. */
+      blocked = false;
+
+      /* PLANET SURFACE (opt-in, stage A) — applied BEFORE the node soft-stop, so a promoted planet
+       * is an additional, stronger floor layered on top of the field's node braking (which is never
+       * removed). `surfaceAt` null (LOD off, or no planet near) ⇒ this whole block is skipped and
+       * the step is byte-identical to the node-only path below. The planet's LIVE centre is read
+       * each frame, so the floor tracks it as the body spins / morphs. */
+      posT[0] = camera.position.x; posT[1] = camera.position.y; posT[2] = camera.position.z;
+      const surf = surfaceAt ? surfaceAt(posT) : null;
+      let floor = 0;
+      if (surf) {
+        surfC.set(surf.center[0], surf.center[1], surf.center[2]);
+        const rSurf = surf.radius;
+        surfN.subVectors(camera.position, surfC);
+        const dist = surfN.length();
+        if (dist > 1e-6) surfN.multiplyScalar(1 / dist); else surfN.set(0, 1, 0); // radial-out unit
+        const hover = Math.max(rSurf * HOVER_FRAC, HOVER_MIN);
+        floor = rSurf + hover;
+        altitude = dist - rSurf; // height above the true surface
+        // Holding (the CapsLock speed-lock) bypasses the smooth brake + speed-scale, exactly as it
+        // bypasses the node damp; the hard backstop (c) below still runs, so you cannot tunnel.
+        if (!hold) {
+          // (a) altitude-scaled speed — crawl near the ground, unchanged (scale 1) far away.
+          const altScale = MathUtils.clamp(
+            altitude / Math.max(rSurf * SPEED_ALT_SCALE, 1e-6), SPEED_FLOOR, 1);
+          TMP.multiplyScalar(altScale);
+          effSpeed = speed * altScale;
+          // (b) soft-landing — damp only the DESCENDING (toward-centre) part of the step as the
+          //     floor nears; tangential + climbing motion is untouched, so you keep full control to
+          //     skim and orbit just above the surface.
+          const vrad = TMP.dot(surfN); // >0 climbing away, <0 descending into the planet
+          if (vrad < 0) {
+            const band = Math.max(rSurf * SURF_BRAKE_FRAC, hover);
+            const kk = MathUtils.clamp((dist - floor) / band, 0, 1); // 1 high, 0 at the floor
+            TMP.addScaledVector(surfN, (kk - 1) * vrad); // scale the radial-in component by kk
+            if (kk <= 0.2) blocked = true;
+          }
+        }
+      }
+
+      /* NODE soft-stop (the field behaviour, UNCHANGED). Proximity DAMPS, it never GATES: a gate
+       * that evaluates to exactly zero strands the ship, because `room` is the distance to the
+       * nearest page ANYWHERE, not the nearest page ahead — so inside a dense region you are
+       * routinely within the stop radius of something off to the side and the step would multiply
+       * by nothing. The clamp floor (0.16) is the whole fix. */
       AFTER.copy(TMP).add(camera.position);
       const ahead = roomAtV(AFTER);
-      blocked = false;
-      // Holding bypasses the damp as well as the cruise scaling — the damp is the half of the
-      // braking you actually feel when you fly into a cluster.
       if (!hold && Number.isFinite(ahead) && ahead < room && ahead < stop * 2.5) {
         const k = MathUtils.clamp(ahead / (stop * 2.5), 0.16, 1);
         TMP.multiplyScalar(k);
-        blocked = k <= 0.2;
+        if (k <= 0.2) blocked = true;
       }
       camera.position.add(TMP);
       target.add(TMP);
+
+      // (c) hard floor backstop: never let the camera cross below radius+hover. Catches overshoot
+      //     (a large dt) and the hold case where the smooth damp is bypassed. The target moves by
+      //     the same delta, so the orbit radius and the aim survive the correction.
+      if (surf) {
+        surfN.subVectors(camera.position, surfC);
+        const dNew = surfN.length();
+        if (dNew > 1e-6 && dNew < floor) {
+          surfN.multiplyScalar((floor - dNew) / dNew); // outward delta back onto the floor
+          camera.position.add(surfN);
+          target.add(surfN);
+          blocked = true;
+        }
+      }
     }
-    telem.speed = moving > 1e-4 ? speed : 0; telem.room = room;
+    telem.speed = moving > 1e-4 ? effSpeed : 0; telem.room = room;
     telem.flying = moving > 1e-4; telem.radius = radius();
-    telem.blocked = blocked; telem.held = held.size;
+    telem.blocked = blocked; telem.altitude = altitude; telem.held = held.size;
     return telem;
   }
 

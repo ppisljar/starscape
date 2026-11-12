@@ -38,6 +38,10 @@ export interface CameraTelemetry {
   radius: number;
   /** True when the proximity damp has the step pinned near its floor. */
   blocked: boolean;
+  /** Height above the nearest promoted planet's SPHERE surface (world units), or Infinity when no
+   *  planet-surface floor is in play (near-mesh LOD off, nothing promoted, or not flying). Set by
+   *  the flycam when a `surfaceAt` callback is wired; other controllers leave it undefined. */
+  altitude?: number;
   /** Number of movement/turn keys currently held. */
   held: number;
 }
