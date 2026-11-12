@@ -60,7 +60,7 @@ import {
   LINK_LEN_SOFT,
 } from './constants';
 import { buildNodeLayer, SHAPE_COUNT } from './nodes';
-import type { NodeStyle } from './nodes';
+import type { GlyphTextureParams, NodeStyle } from './nodes';
 import { buildLinkLayer } from './links';
 import type { LinkStyle } from './links';
 import { createFocus } from './focus';
@@ -235,6 +235,15 @@ export interface Field {
    *  `lenFloor` (0..1) is the fraction of itself the longest edge keeps. Both live uniform
    *  writes. Pass only the fields you are changing. */
   setLinkStyle(style: LinkStyle): void;
+  /** OPT-IN far-billboard texturing, to match the near-mesh LOD's planet look so a node does not
+   *  pop from a flat facet colour to a textured planet as it promotes (GlyphTextureMode). Pass the
+   *  SHARED planet DataArrayTexture (the same instance createNearMesh samples, via its `textures`
+   *  option), the per-node texture-layer index (the same `facetCode % layerCount` the LOD uses),
+   *  the per-layer average RGB (for the cheap 'tint' mode), and the mode. Mode 'off' (or null)
+   *  parks it; until the FIRST non-off call the glyph is byte-identical to today (nothing generated
+   *  or bound). The first non-off call compiles the textured glyph variant once; thereafter mode /
+   *  layer / colour changes are live writes with no recompile. */
+  setGlyphTexture(params: GlyphTextureParams | null): void;
   /** Hover node i (-1 clears): lights it, its CSR neighbourhood and its incident links.
    *  Repaints only the hovered degree — never the whole colour buffer (DESIGN.md §6).
    *  Returns true when the state actually changed. */
@@ -926,6 +935,12 @@ export function createField(graph: Graph, opts: FieldOpts = {}): Field {
       if (style.lenFloor !== undefined && Number.isFinite(style.lenFloor)) {
         link.uniforms.lenFloor.value = style.lenFloor;
       }
+    },
+
+    setGlyphTexture(params: GlyphTextureParams | null): void {
+      // A thin pass-through: the node layer owns the lazy opt-in (attribute + uniforms + the single
+      // recompile). The caller shares ONE texture array with createNearMesh so the two never differ.
+      node.setGlyphTexture(params);
     },
 
     stats(): FieldStats {

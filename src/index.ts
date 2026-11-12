@@ -18,7 +18,7 @@ export type { Facet, Graph, GraphInput, NumericColumn } from './core/types';
 export { createField, MORPH_DURATION } from './field/field';
 export type { Field, FieldOpts, FieldStats } from './field/field';
 export { NODE_SHAPES, SHAPE_COUNT } from './field/nodes';
-export type { NodeStyle, NodeShape } from './field/nodes';
+export type { GlyphTextureMode, GlyphTextureParams, NodeStyle, NodeShape } from './field/nodes';
 export type { LinkStyle } from './field/links';
 export {
   CHAIN_CAP,
@@ -193,7 +193,16 @@ export type { TonemapOp, TonemapRig } from './field/tonemap';
  * OPT-IN subsystem that draws genuine shaded, optionally textured 3D meshes for the few nodes
  * large on screen (projected-size promotion), fading their billboards — the CLOSE look to the
  * billboards' FAR look. Zero cost unless the consumer calls createNearMesh. */
-export { createNearMesh, generateNearTextures, NEAR_SHAPE_NAMES, NEAR_TEXTURE_NAMES, TEX_W, TEX_H } from './lod/nearmesh';
+export {
+  createNearMesh,
+  generateNearTextures,
+  nearTextureAverages,
+  wrapNearTextures,
+  NEAR_SHAPE_NAMES,
+  NEAR_TEXTURE_NAMES,
+  TEX_W,
+  TEX_H,
+} from './lod/nearmesh';
 export type { NearMesh, NearMeshOpts, NearShapeName, NearTextureName } from './lod/nearmesh';
 
 /* ---- the HDR bloom post-process (DESIGN.md §5 "tier-3 post-sum pass reusing the tonemap

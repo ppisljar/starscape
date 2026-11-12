@@ -317,6 +317,58 @@ const PLANETS: Record<NearTextureName, Planet> = {
   },
 };
 
+/** sRGB byte (0..255) → linear [0, 1]. The planet textures are authored/generated in sRGB and the
+ *  shader samples them through an SRGBColorSpace DataArrayTexture (three decodes to linear before
+ *  lighting), so a per-layer average that is to MATCH the sampled planet must be averaged in the
+ *  same linear space — otherwise the 'tint' billboards read brighter than the 'full'/mesh planet. */
+function srgbToLinear(b: number): number {
+  const c = b / 255;
+  return c <= 0.04045 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4);
+}
+
+/** The per-layer DOMINANT colour driving the billboards' cheap 'tint' mode: the linear-space mean
+ *  RGB of each texture layer, as a flat `depth*3` Float32Array (layer L at [L*3 .. L*3+2], 0..1).
+ *  Linear so it matches what the 'full' billboard and the near mesh sample — the three share ONE
+ *  texture array, so one average per layer keeps far/near identical. Pure (no three/GPU), so the
+ *  demo can precompute it once beside `generateNearTextures` and hand it to `Field.setGlyphTexture`. */
+export function nearTextureAverages(raw: Uint8Array, layerCount?: number): Float32Array {
+  const texels = TEX_W * TEX_H;
+  const depth = layerCount ?? Math.max(1, Math.round(raw.length / (texels * 4)));
+  const avg = new Float32Array(depth * 3);
+  for (let L = 0; L < depth; L++) {
+    let rs = 0;
+    let gs = 0;
+    let bs = 0;
+    const base = L * texels * 4;
+    for (let t = 0; t < texels; t++) {
+      const o = base + t * 4;
+      rs += srgbToLinear(raw[o]!);
+      gs += srgbToLinear(raw[o + 1]!);
+      bs += srgbToLinear(raw[o + 2]!);
+    }
+    avg[L * 3] = rs / texels;
+    avg[L * 3 + 1] = gs / texels;
+    avg[L * 3 + 2] = bs / texels;
+  }
+  return avg;
+}
+
+/** Wrap a raw layer-major RGBA buffer into a CONFIGURED planet DataArrayTexture (sRGB, longitude
+ *  wrap, linear filter, no mipmaps) — the one place that config lives, shared by this module's own
+ *  lazy `ensureTextures` and by a consumer that wants to hand the SAME array to both the LOD
+ *  (`createNearMesh({ textures })`) and the billboards (`Field.setGlyphTexture`). */
+export function wrapNearTextures(raw: Uint8Array): DataArrayTexture {
+  const depth = Math.max(1, Math.round(raw.length / (TEX_W * TEX_H * 4)));
+  const tex = new DataArrayTexture(raw, TEX_W, TEX_H, depth);
+  tex.colorSpace = SRGBColorSpace; // RGBA8 is the DataArrayTexture default format
+  tex.wrapS = RepeatWrapping; // longitude wraps (seamless)
+  tex.minFilter = LinearFilter;
+  tex.magFilter = LinearFilter;
+  tex.generateMipmaps = false;
+  tex.needsUpdate = true;
+  return tex;
+}
+
 /** Generate all ten planet textures into one interleaved RGBA Uint8 buffer (layer-major), seeded
  *  deterministically from `seed`. ~0.5 MB; built once, only when a textureFacet is actually used. */
 export function generateNearTextures(seed = 1): Uint8Array {
@@ -456,15 +508,7 @@ export function createNearMesh(graph: Graph, field: Field, opts: NearMeshOpts = 
       texArray = opts.textures;
       ownsTexArray = false;
     } else {
-      const raw = opts.textures ?? generateNearTextures(textureSeed);
-      const depth = raw.length / (TEX_W * TEX_H * 4);
-      texArray = new DataArrayTexture(raw, TEX_W, TEX_H, Math.max(1, Math.round(depth)));
-      texArray.colorSpace = SRGBColorSpace; // RGBA8 is the DataArrayTexture default format
-      texArray.wrapS = RepeatWrapping; // longitude wraps (seamless)
-      texArray.minFilter = LinearFilter;
-      texArray.magFilter = LinearFilter;
-      texArray.generateMipmaps = false;
-      texArray.needsUpdate = true;
+      texArray = wrapNearTextures(opts.textures ?? generateNearTextures(textureSeed));
       ownsTexArray = true;
     }
     return texArray;

@@ -59,9 +59,13 @@ import {
   injectPanelStyles,
   injectStyles,
   localStorageAdapter,
+  generateNearTextures,
   makeSynthProvider,
   namedPaletteBuffer,
   nearestDistance,
+  nearTextureAverages,
+  wrapNearTextures,
+  NEAR_TEXTURE_NAMES,
   neighbours,
   orderingKeys,
   paintFacetColors,
@@ -100,6 +104,7 @@ import type {
   ConfigValue,
   Flycam,
   FlycamConfig,
+  GlyphTextureMode,
   LadderCandidates,
   LadderView,
   LevelSpec,
@@ -598,6 +603,7 @@ async function main(): Promise<void> {
     nearbox: document.getElementById('nearbox') as HTMLDivElement,
     nearShape: document.getElementById('nearShape') as HTMLSelectElement,
     nearTex: document.getElementById('nearTex') as HTMLSelectElement,
+    glyphTex: document.getElementById('glyphTex') as HTMLSelectElement,
     nearPromote: document.getElementById('nearPromote') as HTMLInputElement,
     nearPromotev: document.getElementById('nearPromotev') as HTMLSpanElement,
     nearCount: document.getElementById('nearCount') as HTMLInputElement,
@@ -2396,6 +2402,61 @@ async function main(): Promise<void> {
   const nearShapeFacet = (): string | null =>
     ui.nearShape.value === 'none' ? null : ui.nearShape.value;
   const nearTexFacet = (): string | null => (ui.nearTex.value === 'none' ? null : ui.nearTex.value);
+  const glyphMode = (): GlyphTextureMode =>
+    ui.glyphTex.value === 'tint' ? 'tint' : ui.glyphTex.value === 'full' ? 'full' : 'off';
+
+  /* ---- the SHARED planet texture array (DESIGN §12 "mote → mesh"): built ONCE, from the same
+     seed the LOD defaults to, and handed to BOTH the near-mesh LOD (createNearMesh `textures`) AND
+     the FAR billboards (field.setGlyphTexture) so the two are byte-identical — a node's billboard
+     and the mesh it promotes to sample the same layer of the same array. Generated lazily, only
+     when something actually needs a texture (the LOD's texture-by facet is set, or the far-texture
+     mode is tint/full), so the default playground still pays zero. The per-layer averages (linear
+     dominant colour) drive the cheap 'tint' mode. */
+  const TEX_SEED = 1; // must match createNearMesh's default textureSeed so contents are identical
+  let sharedRaw: Uint8Array | null = null;
+  let sharedArray: ReturnType<typeof wrapNearTextures> | null = null;
+  let sharedAvg: Float32Array | null = null;
+  const ensureSharedTex = (): { array: ReturnType<typeof wrapNearTextures>; avg: Float32Array } => {
+    if (!sharedRaw) sharedRaw = generateNearTextures(TEX_SEED);
+    if (!sharedArray) sharedArray = wrapNearTextures(sharedRaw);
+    if (!sharedAvg) sharedAvg = nearTextureAverages(sharedRaw);
+    return { array: sharedArray, avg: sharedAvg };
+  };
+  const needShared = (): boolean => nearTexFacet() !== null || glyphMode() !== 'off';
+
+  /** The per-node texture LAYER buffer for the billboards — node i's layer is its 'texture by'
+   *  facet value mod the texture count, the SAME map the LOD uses internally (`texCodes[i] %
+   *  texCount`), so the faded billboard and the promoted mesh always agree. No facet → layer 0. */
+  const glyphLayers = (): Float32Array => {
+    const out = new Float32Array(n);
+    const facet = nearTexFacet();
+    const codes = facet && graph.facets[facet] ? graph.facets[facet]!.data : null;
+    if (codes) {
+      const texCount = NEAR_TEXTURE_NAMES.length;
+      for (let i = 0; i < n; i++) out[i] = codes[i]! % texCount;
+    }
+    return out;
+  };
+
+  /** Push the current far-texture mode (+ layers from the live 'texture by' facet) to the field.
+   *  Off parks it (null); tint/full ensure the shared array and hand it over. Called on either
+   *  select's change. */
+  const applyGlyphTexture = (): void => {
+    const mode = glyphMode();
+    if (mode === 'off') {
+      field.setGlyphTexture(null);
+      return;
+    }
+    const shared = ensureSharedTex();
+    field.setGlyphTexture({
+      array: shared.array,
+      layerCount: NEAR_TEXTURE_NAMES.length,
+      layers: glyphLayers(),
+      avg: shared.avg,
+      mode,
+    });
+  };
+
   const ensureNear = (): NearMesh => {
     if (nearMesh) return nearMesh;
     nearMesh = createNearMesh(graph, field, {
@@ -2403,6 +2464,10 @@ async function main(): Promise<void> {
       promotePx: Number(ui.nearPromote.value),
       shapeFacet: nearShapeFacet(),
       textureFacet: nearTexFacet(),
+      // share the ONE array with the billboards whenever either side needs textures (so the LOD
+      // and the far billboards sample the identical instance, not two deterministic copies).
+      textures: needShared() ? ensureSharedTex().array : undefined,
+      textureSeed: TEX_SEED,
       heightCss: window.innerHeight,
       fov: liveFov,
     });
@@ -2423,7 +2488,17 @@ async function main(): Promise<void> {
     updateStats();
   });
   ui.nearShape.addEventListener('change', () => nearMesh?.setShapeFacet(nearShapeFacet()));
-  ui.nearTex.addEventListener('change', () => nearMesh?.setTextureFacet(nearTexFacet()));
+  ui.nearTex.addEventListener('change', () => {
+    nearMesh?.setTextureFacet(nearTexFacet());
+    // the far billboards key their planet off the SAME facet, so a facet change relayers them too
+    if (glyphMode() !== 'off') applyGlyphTexture();
+  });
+  // FAR TEXTURE: off (default) leaves the billboards solid facet colour, byte-identical to today;
+  // tint/full texture them to match the near planets, killing the promote-time colour→texture pop.
+  ui.glyphTex.addEventListener('change', () => {
+    applyGlyphTexture();
+    updateStats();
+  });
   ui.nearPromote.addEventListener('input', () => {
     ui.nearPromotev.textContent = `${ui.nearPromote.value} px`;
     nearMesh?.setPromotePx(Number(ui.nearPromote.value));

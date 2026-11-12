@@ -108,6 +108,14 @@
             >texture by
             <select id="nearTex"></select>
           </label>
+          <label title="texture the FAR billboards too, so a node does not pop from a flat facet colour to a textured planet as it promotes. off = today's solid-colour dots (default, zero cost); tint = each far node takes its planet's DOMINANT colour (cheap, no texture fetch); full = each far node samples its planet's visible face (a tiny flat planet matching the 3D mesh). Uses the 'texture by' facet for each node's planet."
+            >far texture
+            <select id="glyphTex">
+              <option value="off">off (solid colour)</option>
+              <option value="tint">tint (planet colour)</option>
+              <option value="full">full (planet face)</option>
+            </select>
+          </label>
           <label class="row" title="a node becomes a 3D mesh when its on-screen glyph radius exceeds this many pixels — larger = promote later / closer"
             >promote &gt;
             <span class="vd"><input type="range" id="nearPromote" min="0" max="48" step="1" value="18" /><span id="nearPromotev">18 px</span></span>

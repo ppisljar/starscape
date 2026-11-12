@@ -22,17 +22,21 @@
  */
 
 import {
+  DynamicDrawUsage,
   Float32BufferAttribute,
   InstancedBufferAttribute,
   InstancedBufferGeometry,
   Mesh,
   NormalBlending,
   SpriteNodeMaterial,
+  Vector3,
 } from 'three/webgpu';
-import type { Node } from 'three/webgpu';
+import type { DataArrayTexture, Node } from 'three/webgpu';
 import {
   Fn,
   If,
+  asin,
+  atan,
   attribute,
   clamp,
   dot,
@@ -48,9 +52,12 @@ import {
   select,
   smoothstep,
   sqrt,
+  texture,
   uniform,
+  uniformArray,
   uv,
   varying,
+  vec2,
   vec3,
   vec4,
   Discard,
@@ -81,6 +88,28 @@ export const NODE_SHAPES = ['disc', 'square', 'diamond', 'ring', 'cross', 'discC
 export type NodeShape = (typeof NODE_SHAPES)[number];
 /** How many glyph families `iShape` selects between — the clamp/wrap modulus for setShapeFacet. */
 export const SHAPE_COUNT = NODE_SHAPES.length;
+
+/** How the FAR billboards are optionally textured to match the near-mesh LOD's planet look, so a
+ *  node does not pop from a flat facet colour (billboard) to a textured planet (mesh) as it
+ *  promotes. 'off' (the default) is today's behaviour, byte-identical — no texture, no new
+ *  attribute, no extra uniform. 'tint' paints each far node its planet's DOMINANT colour (one
+ *  precomputed average RGB per texture layer, no per-pixel fetch). 'full' SAMPLES the planet
+ *  texture on a hemisphere UV (the disc shows the planet's visible face), so a far node reads as
+ *  a tiny flat planet matching the mesh it becomes up close. */
+export type GlyphTextureMode = 'off' | 'tint' | 'full';
+
+/** The data `Field.setGlyphTexture` hands the node layer to texture the billboards. `array` is the
+ *  SHARED planet DataArrayTexture (the SAME instance the near-mesh LOD samples, so far and near are
+ *  identical); `layers` is the per-node texture-layer index (length n — node i's layer, the same
+ *  `facetCode % layerCount` the LOD uses, so the billboard and the mesh agree per node); `avg` is
+ *  the per-layer average RGB (length `layerCount*3`, linear 0..1) driving the cheap 'tint' mode. */
+export interface GlyphTextureParams {
+  array: DataArrayTexture;
+  layerCount: number;
+  layers: Float32Array;
+  avg: Float32Array;
+  mode: GlyphTextureMode;
+}
 
 export interface NodeLayer {
   mesh: Mesh;
@@ -132,6 +161,12 @@ export interface NodeLayer {
     /** Fake-sphere body shading, 0..1 (default SPHERE = 0 flat disc). */
     sphere: { value: number };
   };
+  /** OPT-IN billboard texturing (see GlyphTextureMode). Passing a 'tint'/'full' mode LAZILY adds
+   *  the `iTexLayer` attribute, binds the shared texture array + per-layer average colours, and
+   *  recompiles the glyph once (the textured variant); thereafter mode/layer/colour changes are
+   *  live uniform/attribute writes with no recompile. Passing mode 'off' (or null) parks it — and
+   *  until the FIRST non-off call the glyph is byte-identical to today (nothing generated/bound). */
+  setGlyphTexture(params: GlyphTextureParams | null): void;
   dispose(): void;
 }
 
@@ -231,6 +266,20 @@ export function buildNodeLayer(
      no geometry, so the two-draw-call billboard path is untouched. */
   const uSphere = uniform(s.sphere ?? SPHERE);
 
+  /* ---- OPT-IN billboard texturing (GlyphTextureMode). Everything here stays INERT until the
+     consumer's first non-off setGlyphTexture, so the default glyph is byte-identical to today: no
+     iTexLayer attribute on the geometry, no texture bound, and uGlyphTexMode never enters the
+     compiled shader (the default colorNode does not reference it). On the first activation the
+     textured colorNode variant is compiled ONCE; after that, switching off/tint/full is a bare
+     uniform write and relayering is an attribute write — no recompile. */
+  const uGlyphTexMode = uniform(0); // 0 off, 1 tint, 2 full (only read by the textured variant)
+  let textured = false; // has the textured colorNode variant been compiled yet
+  let texLayers: Float32Array | null = null; // per-node layer buffer backing the iTexLayer attribute
+  let texLayerAttr: InstancedBufferAttribute | null = null;
+  let texArray: DataArrayTexture | null = null; // the shared planet array (captured by the shader)
+  let avgVecs: Vector3[] = []; // per-layer average colours (mutated live; uniformArray re-reads them)
+  let uAvg: ReturnType<typeof uniformArray> | null = null;
+
   /* ---- vertex stage: world radius → projected px → clamp → world radius at this depth.
      The clamp is done from the REAL projection, so it is exact rather than an approximation
      of itself. uFalloff bends the perspective about the fixed pivot uDRef (1 = true
@@ -282,94 +331,201 @@ export function buildNodeLayer(
   /* ---- fragment stage. The distance metric IS the shape: one length() plus a couple of
      abs()es buys seven glyph families with no texture fetch (predecessor's formDist). All
      seven fields are cheap ALU, so a select chain (both sides evaluated) costs less than a
-     real branch would save. */
-  material.colorNode = Fn(() => {
-    const p = uv().sub(0.5); // quad coordinate in [-0.5, 0.5], predecessor's vUv
+     real branch would save.
 
-    const out = vec4(0.0).toVar();
+     The glyph is compiled in TWO variants (see setGlyphTexture): the DEFAULT, non-textured
+     variant below is byte-identical to the shipped glyph — it references no texture, no avg
+     uniform and no iTexLayer attribute, so `withTex === false` is exactly today's shader. The
+     textured variant (`withTex === true`, compiled lazily on the first non-off setGlyphTexture)
+     weaves the planet look in behind uGlyphTexMode: 'tint' repaints the body the planet's average
+     colour (cheap — one uniform-array fetch, NO texture read), 'full' samples the planet texture
+     on a hemisphere UV so the flat disc shows the planet's visible face — and 'off' (mode 0) is
+     the facet colour again, so toggling modes after opt-in costs only a uniform write. */
+  const INV_2PI = 0.159_154_943_091_895_4; // 1 / (2π): hemisphere longitude → [0.25, 0.75]
+  const INV_PI = 0.318_309_886_183_790_7; // 1 / π:    hemisphere latitude  → [0, 1]
+  const EMISSIVE_GAIN = 1.2; // far-dot glow for lava cracks / stars (the texture's A channel)
+  const makeColorNode = (withTex: boolean): Node<'vec4'> => {
+    // iTexLayer is per-INSTANCE: read it through a flat varying (constant across the quad, like
+    // iShape/iColor). Only the textured variant references it, so the default geometry needs no
+    // such attribute.
+    const vTexLayer = withTex ? varying(float(attribute('iTexLayer', 'float'))) : null;
+    return Fn(() => {
+      const p = uv().sub(0.5); // quad coordinate in [-0.5, 0.5], predecessor's vUv
 
-    If(vPx.lessThan(uFlatPx), () => {
-      /* LOD, the cheapest available: under a couple of px every glyph is the same blob and
-         the halo is the expensive half of it. One flat colour, no smoothsteps, no form test. */
-      const rr = length(p).mul(2.0);
-      Discard(rr.greaterThan(1.0));
-      const aa = vFog.mul(vAlpha);
-      Discard(aa.lessThan(0.004));
-      out.assign(vec4(vColor, aa));
-    }).Else(() => {
-      const ax = p.x.abs();
-      const ay = p.y.abs();
-      const ring = length(p).mul(2.0);
-      // the seven families: disc, square, diamond, ring, cross, disc-in-cross, bar
-      const dDisc = ring;
-      const dSquare = max(ax, ay).mul(2.0);
-      const dDiamond = ax.add(ay).mul(2.0);
-      const dRing = ring.sub(0.62).abs().mul(2.7);
-      const dCross = min(ax, ay).mul(8.0);
-      const dDiscCross = max(ring, min(ax, ay).mul(8.0).oneMinus());
-      const dBar = max(ax.mul(1.7), ay).mul(2.0);
-      const r = select(
-        vShape.lessThan(0.5),
-        dDisc,
-        select(
-          vShape.lessThan(1.5),
-          dSquare,
+      const out = vec4(0.0).toVar();
+
+      // the node's planet layer + its precomputed average colour (both cheap: no texture fetch).
+      // Only ever evaluated in the textured variant. `.element` is typed Node<unknown>; coerce it
+      // back to a vec3 node so the colour maths below type-check (a no-op at runtime).
+      const layerI = withTex ? int(vTexLayer!) : null;
+      const avgCol = withTex
+        ? (uAvg!.element(layerI!) as unknown as ReturnType<typeof vec3>)
+        : null;
+      const mode = uGlyphTexMode;
+
+      If(vPx.lessThan(uFlatPx), () => {
+        /* LOD, the cheapest available: under a couple of px every glyph is the same blob and
+           the halo is the expensive half of it. One flat colour, no smoothsteps, no form test. */
+        const rr = length(p).mul(2.0);
+        Discard(rr.greaterThan(1.0));
+        const aa = vFog.mul(vAlpha);
+        Discard(aa.lessThan(0.004));
+        if (withTex) {
+          // far/tiny: tint AND full collapse to the planet average — a texture fetch is invisible
+          // at < 2 px, so even 'full' uses the cheap average here (the dominant-colour continuity
+          // is all that reads at this size).
+          out.assign(vec4(select(mode.lessThan(0.5), vColor, avgCol!), aa));
+        } else {
+          out.assign(vec4(vColor, aa));
+        }
+      }).Else(() => {
+        const ax = p.x.abs();
+        const ay = p.y.abs();
+        const ring = length(p).mul(2.0);
+        // the seven families: disc, square, diamond, ring, cross, disc-in-cross, bar
+        const dDisc = ring;
+        const dSquare = max(ax, ay).mul(2.0);
+        const dDiamond = ax.add(ay).mul(2.0);
+        const dRing = ring.sub(0.62).abs().mul(2.7);
+        const dCross = min(ax, ay).mul(8.0);
+        const dDiscCross = max(ring, min(ax, ay).mul(8.0).oneMinus());
+        const dBar = max(ax.mul(1.7), ay).mul(2.0);
+        const r = select(
+          vShape.lessThan(0.5),
+          dDisc,
           select(
-            vShape.lessThan(2.5),
-            dDiamond,
+            vShape.lessThan(1.5),
+            dSquare,
             select(
-              vShape.lessThan(3.5),
-              dRing,
-              select(vShape.lessThan(4.5), dCross, select(vShape.lessThan(5.5), dDiscCross, dBar)),
+              vShape.lessThan(2.5),
+              dDiamond,
+              select(
+                vShape.lessThan(3.5),
+                dRing,
+                select(vShape.lessThan(4.5), dCross, select(vShape.lessThan(5.5), dDiscCross, dBar)),
+              ),
             ),
           ),
-        ),
-      );
-      Discard(r.greaterThan(1.0));
+        );
+        Discard(r.greaterThan(1.0));
 
-      /* A SOLID body with a one-CSS-pixel edge, plus a halo whose width is also in pixels —
-         edge softness is a property of the screen, not of the object. vPx is this glyph's
-         radius in CSS px and r runs 0..1 across exactly that, so one pixel is 1/vPx in
-         r units; no derivatives required. */
-      const e = clamp(float(1.0).div(max(vPx, 1.0)), 0.004, 0.45);
-      const body = smoothstep(uBodyR.sub(e), uBodyR.add(e), r).oneMinus();
-      const hw = clamp(uHaloPx.div(max(vPx, 1.0)), e, max(uBodyR.oneMinus(), e));
-      const halo = smoothstep(uBodyR, uBodyR.add(hw), r).oneMinus();
-      const a = body.add(halo.mul(uHaloGain).mul(body.oneMinus())).mul(vFog).mul(vAlpha);
-      Discard(a.lessThan(0.004));
+        /* A SOLID body with a one-CSS-pixel edge, plus a halo whose width is also in pixels —
+           edge softness is a property of the screen, not of the object. vPx is this glyph's
+           radius in CSS px and r runs 0..1 across exactly that, so one pixel is 1/vPx in
+           r units; no derivatives required. */
+        const e = clamp(float(1.0).div(max(vPx, 1.0)), 0.004, 0.45);
+        const body = smoothstep(uBodyR.sub(e), uBodyR.add(e), r).oneMinus();
+        const hw = clamp(uHaloPx.div(max(vPx, 1.0)), e, max(uBodyR.oneMinus(), e));
+        const halo = smoothstep(uBodyR, uBodyR.add(hw), r).oneMinus();
+        const a = body.add(halo.mul(uHaloGain).mul(body.oneMinus())).mul(vFog).mul(vAlpha);
+        Discard(a.lessThan(0.004));
 
-      /* A small bright centre, not the whole body — with a solid body, reusing `body` here
-         would wash the entire glyph toward white. Fog attenuates alpha only; mixing colour
-         toward the ground as well dims twice (predecessor's measured mistake). The boost
-         term (capped, predecessor's `min(vBoost, 1.6)`) burns a hovered/selected core
-         hotter, so emphasis reads in colour as well as size. */
-      const hot = smoothstep(0.0, uBodyR.mul(0.5), r).oneMinus();
-      const c = mix(vColor, vec3(1.0), hot.mul(uCoreHot).mul(min(vBoost, 1.6)));
+        /* The fake-sphere hemisphere normal over the disc (nz = sqrt(1 − ring²)): the sphere
+           shade below lights it, and the 'full' texture mode maps it to an equirectangular UV so
+           the flat disc shows the planet's visible (camera-facing) face. */
+        const nx = p.x.mul(2.0);
+        const ny = p.y.mul(2.0);
+        const nz = sqrt(max(float(1.0).sub(ring.mul(ring)), 0.0));
+        const N = vec3(nx, ny, nz);
 
-      /* Fake-sphere body shading (uSphere): the camera-facing billowy body reads as a lit BALL,
-         not a flat disc. A hemisphere normal over the disc (nz = sqrt(1 - ring²), ring the radial
-         distance), a Lambert diffuse lit from the UPPER-LEFT (L and the half-vector H are the
-         precomputed unit directions below) that keeps a 0.6 ambient floor so the shaded side stays
-         matte ink rather than black, plus a soft specular glint. All faked in-fragment — NO
-         geometry, so the two-draw-call path is untouched. uSphere lerps flat → shaded; at 0 this is
-         the exact disc the dark looks ship, so field/nebula/space4 are unchanged. */
-      const nx = p.x.mul(2.0);
-      const ny = p.y.mul(2.0);
-      const nz = sqrt(max(float(1.0).sub(ring.mul(ring)), 0.0));
-      const N = vec3(nx, ny, nz);
-      const ndl = max(dot(N, vec3(-0.3932, 0.4423, 0.8061)), 0.0); // L: upper-left, toward camera
-      const diffuse = float(0.6).add(ndl.mul(0.4)); // 0.6 (shaded) .. 1.0 (fully lit)
-      const ndh = max(dot(N, vec3(-0.2069, 0.2327, 0.9503)), 0.0); // H = normalize(L + view)
-      const spec = pow(ndh, 18.0).mul(0.4); // a soft white glint upper-left
-      const cSphere = c.mul(diffuse).add(vec3(spec));
-      const cShaded = mix(c, cSphere, uSphere);
-      out.assign(vec4(cShaded, a));
-    });
+        /* A small bright centre, not the whole body — with a solid body, reusing `body` here
+           would wash the entire glyph toward white. Fog attenuates alpha only; mixing colour
+           toward the ground as well dims twice (predecessor's measured mistake). The boost
+           term (capped, predecessor's `min(vBoost, 1.6)`) burns a hovered/selected core
+           hotter, so emphasis reads in colour as well as size. */
+        const hot = smoothstep(0.0, uBodyR.mul(0.5), r).oneMinus();
 
-    /* Stage 8 (§7): the highlight roll-off, in-fragment behind one selectable uniform —
-       identity when the op uniform is 0, so 'none' is the stage-6 pipeline untouched. */
-    return vec4(opts.tonemap.apply(out.xyz as unknown as Node<'vec3'>), out.w);
-  })();
+        /* The body albedo, by glyph-texture mode. Off → the facet colour (today's path). Tint →
+           the planet's average colour, so a far node matches the dominant colour of the mesh it
+           becomes. Full → the sampled planet texel on the hemisphere UV, with a light facet-colour
+           hint (the mesh's `mix(white, tint, 0.25)`) so the node still carries its colour, plus the
+           texture's emissive mask (lava cracks / stars). Non-textured variant: just the facet
+           colour, no branches — byte-identical to today. */
+        const bodyCol = withTex ? vColor.toVar() : vColor;
+        const emis = withTex ? vec3(0.0).toVar() : null;
+        if (withTex) {
+          If(mode.greaterThan(0.5), () => {
+            bodyCol.assign(avgCol!); // tint (and the starting point full overrides below)
+          });
+          If(mode.greaterThan(1.5), () => {
+            const uLon = atan(N.x, N.z).mul(INV_2PI).add(0.5); // longitude of the visible face
+            const vLat = asin(clamp(N.y, -1.0, 1.0)).mul(INV_PI).add(0.5); // latitude
+            const sampled = texture(texArray!, vec2(uLon, vLat)).depth(layerI!).level(float(0.0));
+            bodyCol.assign(sampled.rgb.mul(mix(vec3(1.0, 1.0, 1.0), vColor, float(0.25))));
+            emis!.assign(sampled.rgb.mul(sampled.a).mul(EMISSIVE_GAIN));
+          });
+        }
+        const c = mix(bodyCol, vec3(1.0), hot.mul(uCoreHot).mul(min(vBoost, 1.6)));
+
+        /* Fake-sphere body shading (uSphere): the camera-facing billowy body reads as a lit BALL,
+           not a flat disc. A Lambert diffuse lit from the UPPER-LEFT (L and the half-vector H are
+           the precomputed unit directions below) that keeps a 0.6 ambient floor so the shaded side
+           stays matte ink rather than black, plus a soft specular glint. All faked in-fragment — NO
+           geometry, so the two-draw-call path is untouched. uSphere lerps flat → shaded; at 0 this
+           is the exact disc the dark looks ship, so field/nebula/space4 are unchanged. */
+        const ndl = max(dot(N, vec3(-0.3932, 0.4423, 0.8061)), 0.0); // L: upper-left, toward camera
+        const diffuse = float(0.6).add(ndl.mul(0.4)); // 0.6 (shaded) .. 1.0 (fully lit)
+        const ndh = max(dot(N, vec3(-0.2069, 0.2327, 0.9503)), 0.0); // H = normalize(L + view)
+        const spec = pow(ndh, 18.0).mul(0.4); // a soft white glint upper-left
+        const cSphere = c.mul(diffuse).add(vec3(spec));
+        const cShaded = withTex ? mix(c, cSphere, uSphere).add(emis!) : mix(c, cSphere, uSphere);
+        out.assign(vec4(cShaded, a));
+      });
+
+      /* Stage 8 (§7): the highlight roll-off, in-fragment behind one selectable uniform —
+         identity when the op uniform is 0, so 'none' is the stage-6 pipeline untouched. */
+      return vec4(opts.tonemap.apply(out.xyz as unknown as Node<'vec3'>), out.w);
+    })() as unknown as Node<'vec4'>;
+  };
+  material.colorNode = makeColorNode(false) as unknown as typeof material.colorNode;
+
+  /** Opt-in billboard texturing. First non-off call: allocate the iTexLayer attribute, capture the
+   *  shared array + build the avg uniform array, compile the textured variant ONCE. Later calls are
+   *  live writes (mode uniform, layer attribute, avg vectors) with no recompile — unless the shared
+   *  array instance or the layer count changes, which forces a fresh compile that recaptures them. */
+  const setGlyphTexture = (params: GlyphTextureParams | null): void => {
+    if (params === null || params.mode === 'off') {
+      uGlyphTexMode.value = 0; // park it; inert if the textured variant was never compiled
+      return;
+    }
+    const modeCode = params.mode === 'full' ? 2 : 1;
+    let recompile = false;
+
+    // per-node layer buffer + attribute (lazy — the default geometry carries no iTexLayer)
+    if (!texLayers || texLayers.length !== n) texLayers = new Float32Array(n);
+    texLayers.set(params.layers.subarray(0, n));
+    if (!texLayerAttr) {
+      texLayerAttr = new InstancedBufferAttribute(texLayers, 1);
+      texLayerAttr.setUsage(DynamicDrawUsage);
+      geo.setAttribute('iTexLayer', texLayerAttr);
+      recompile = true; // a never-textured glyph gains the attribute + the textured variant
+    } else {
+      texLayerAttr.needsUpdate = true; // relayer (facet change): same buffer, new values
+    }
+
+    // per-layer average colours (mutated in place; uniformArray re-reads them each render)
+    if (avgVecs.length !== params.layerCount) {
+      avgVecs = Array.from({ length: params.layerCount }, () => new Vector3());
+      uAvg = uniformArray(avgVecs, 'vec3');
+      recompile = true; // the uniform-array node changed identity — recapture it
+    }
+    for (let k = 0; k < params.layerCount; k++) {
+      avgVecs[k]!.set(params.avg[k * 3]!, params.avg[k * 3 + 1]!, params.avg[k * 3 + 2]!);
+    }
+
+    // the shared planet array (captured by the shader; a new instance forces a recompile)
+    if (texArray !== params.array) {
+      texArray = params.array;
+      recompile = true;
+    }
+
+    uGlyphTexMode.value = modeCode;
+    if (recompile || !textured) {
+      material.colorNode = makeColorNode(true) as unknown as typeof material.colorNode;
+      material.needsUpdate = true; // rebuild the node program once
+      textured = true;
+    }
+  };
 
   const mesh = new Mesh(geo, material);
   mesh.frustumCulled = false; // one object covering the whole field; nothing to cull
@@ -401,6 +557,7 @@ export function buildNodeLayer(
       falloff: uFalloff,
       sphere: uSphere,
     },
+    setGlyphTexture,
     dispose() {
       geo.dispose();
       material.dispose();
