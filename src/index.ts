@@ -197,14 +197,25 @@ export {
   createNearMesh,
   generateNearTextures,
   nearTextureAverages,
+  pickImageTier,
   wrapNearTextures,
+  IMAGE_CACHE_BUDGET,
+  IMAGE_MESH_CAP,
   NEAR_SHAPE_NAMES,
   NEAR_TEXTURE_NAMES,
   PROCEDURAL_LAYERS,
   TEX_W,
   TEX_H,
 } from './lod/nearmesh';
-export type { NearMesh, NearMeshOpts, NearShapeName, NearTextureName } from './lod/nearmesh';
+export type {
+  ImageEvent,
+  ImageTier,
+  NearMesh,
+  NearMeshOpts,
+  NearShapeName,
+  NearTextureName,
+  NodeSource,
+} from './lod/nearmesh';
 
 /* ---- the HDR bloom post-process (DESIGN.md §5 "tier-3 post-sum pass reusing the tonemap
  * curves"): a helper the CONSUMER installs — scene → additive HDR buffer → bloom → one post-sum

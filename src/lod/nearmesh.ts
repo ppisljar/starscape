@@ -39,6 +39,7 @@ import {
   ConeGeometry,
   CylinderGeometry,
   DataArrayTexture,
+  DataTexture,
   DodecahedronGeometry,
   DynamicDrawUsage,
   Group,
@@ -57,7 +58,7 @@ import {
   TorusGeometry,
   Vector3,
 } from 'three/webgpu';
-import type { BufferGeometry, Node, Object3D } from 'three/webgpu';
+import type { BufferGeometry, Node, Object3D, Texture } from 'three/webgpu';
 import {
   Fn,
   If,
@@ -671,6 +672,65 @@ function moonProceduralRGBA(
   return vec4(poleCap(surf, lat, rgb255(120, 119, 114)), 0) as unknown as Node<'vec4'>; // mean-grey pole
 }
 
+/* ---- per-node texture-source overrides (tiered image sources + progressive LOD) --------------
+ *
+ * Most promoted nodes are procedural planets rendered in the shared instanced pools (the millions-
+ * scale path, above — unchanged). A consumer may PIN a specific node id to a different source:
+ *   - a forced built-in planet (`procedural`): still an instanced instance, just a fixed texture
+ *     layer rather than the facet-derived one — zero extra draw calls.
+ *   - a real IMAGE (`image`), e.g. a Blue-Marble Earth: each needs its OWN texture, so it cannot
+ *     share one instanced material. Image nodes are drawn as INDIVIDUAL meshes (a small managed set,
+ *     cap 16 — overrides are rare) sampling that node's CURRENT best-loaded tier. Draw calls grow by
+ *     the number of VISIBLE image nodes (bounded, few).
+ *
+ * Tiers are consumer-supplied async loaders keyed by resolution: as a node grows on screen the layer
+ * requests the highest tier whose `px` fits the node's on-screen px, loads it once (async, never
+ * blocking the frame), keeps showing the best already-loaded tier meanwhile, and swaps the material's
+ * map when the sharper tier resolves. A small LRU cache (keyed by node+tier, ~64 MB budget) disposes
+ * the least-recently-shown GPU textures under pressure, so flying away reclaims a node's high tiers.
+ *
+ * OPT-IN, like the rest of the file: with no `overrides` NONE of this machinery exists — no image
+ * meshes, no loaders, no cache, byte-identical to today, zero added cost. */
+
+/** A per-node texture SOURCE: pin a node to a forced built-in planet, or to a real tiered image. */
+export type NodeSource =
+  | { kind: 'procedural'; planet: NearTextureName | string }
+  | { kind: 'image'; tiers: ImageTier[] };
+
+/** One resolution tier of an image source. `px` is this tier's pixel resolution (the on-screen px at
+ *  which it becomes worth loading — bigger on screen ⇒ sharper tier); `load` is a consumer-supplied
+ *  async loader resolving a three Texture (e.g. `() => new THREE.TextureLoader().loadAsync(url)` or an
+ *  in-memory DataTexture). Called at most ONCE per (node, tier); list tiers in ascending `px`. */
+export interface ImageTier {
+  px: number;
+  load: () => Promise<Texture>;
+}
+
+/** Telemetry a consumer may observe (opts.onImageEvent): a tier finished loading, the displayed tier
+ *  for a node changed (progressive swap), or an LRU entry was evicted and its GPU texture disposed. */
+export interface ImageEvent {
+  type: 'load' | 'swap' | 'evict';
+  node: number;
+  tier: number;
+  px: number;
+  /** Total estimated image-cache size (bytes) after the event. */
+  cacheBytes: number;
+}
+
+/** Highest tier index whose `px` is ≤ the node's on-screen px (bigger on screen ⇒ sharper), falling
+ *  back to tier 0 when the node is smaller than every tier. Pure — tiers assumed ascending in `px`. */
+export function pickImageTier(tiers: ImageTier[], nodePx: number): number {
+  let d = 0;
+  for (let t = 0; t < tiers.length; t++) if (tiers[t]!.px <= nodePx) d = t;
+  return d;
+}
+
+/** Hard cap on how many image-override nodes render as individual meshes at once (overrides are rare;
+ *  each is its own draw call). */
+export const IMAGE_MESH_CAP = 16;
+/** Default image-tier LRU memory budget in bytes (~64 MB); estimate per tier is px·px·4 (RGBA8). */
+export const IMAGE_CACHE_BUDGET = 64 * 1024 * 1024;
+
 /* ---- the factory --------------------------------------------------------------------------- */
 
 export interface NearMeshOpts {
@@ -707,6 +767,16 @@ export interface NearMeshOpts {
   fov?: number;
   /** Perspective falloff the field uses for glyph sizing (match the field). Default FALLOFF (1). */
   falloff?: number;
+  /** Per-node texture-source overrides: node id → source (forced planet, or a tiered real image).
+   *  Absent/empty ⇒ no image meshes, no loaders, no cache — byte-identical to today. Live via
+   *  `setOverrides`. */
+  overrides?: Record<number, NodeSource>;
+  /** Image-tier LRU memory budget in bytes (over which least-recently-shown tiers are disposed).
+   *  Default IMAGE_CACHE_BUDGET (~64 MB). */
+  imageCacheBudget?: number;
+  /** Optional telemetry for image-source nodes: a tier loaded, a progressive tier swap, or an LRU
+   *  eviction. Never called when there are no image overrides. */
+  onImageEvent?: (e: ImageEvent) => void;
 }
 
 export interface NearMesh {
@@ -731,10 +801,22 @@ export interface NearMesh {
   /** Toggle procedural surface detail for the `PROCEDURAL_LAYERS` planets. Rebuilds the material
    *  (like a texture-facet switch); off restores the exact shipped shader. Live. */
   setProceduralDetail(on: boolean): void;
+  /** Replace the per-node texture-source overrides live. Passing null/`{}` removes every override
+   *  (image nodes return to the instanced procedural pools) and disposes the image-tier cache. */
+  setOverrides(map: Record<number, NodeSource> | null): void;
   /** How many nodes are drawn as meshes right now (telemetry). */
   readonly promoted: number;
-  /** How many draw calls the near pools add this frame (telemetry; 0 when nothing promotes). */
+  /** How many draw calls the near pools add this frame (telemetry; 0 when nothing promotes).
+   *  Includes the instanced shape pools AND the individual image meshes visible this frame. */
   readonly drawCalls: number;
+  /** How many individual image-override meshes are visible this frame (telemetry; 0 with no image
+   *  overrides). */
+  readonly imageMeshes: number;
+  /** Current estimated image-tier LRU cache size in bytes (telemetry; 0 with no image overrides). */
+  readonly imageCacheBytes: number;
+  /** The visible image nodes this frame with their active tier index (-1 = loading, nothing shown
+   *  yet) and on-screen px — telemetry for the progressive LOD. A fresh array each frame. */
+  readonly imageInfo: ReadonlyArray<{ node: number; tier: number; px: number }>;
   dispose(): void;
 }
 
@@ -767,6 +849,25 @@ export function createNearMesh(graph: Graph, field: Field, opts: NearMeshOpts = 
   let shapeFacet: string | null = opts.shapeFacet ?? null;
   let textureFacet: string | null = opts.textureFacet ?? null;
   let proceduralDetail = opts.proceduralDetail ?? false;
+
+  /* ---- per-node texture-source overrides (opt-in; empty ⇒ zero machinery). ------------------- */
+  let overrides: Record<number, NodeSource> = opts.overrides ?? {};
+  let hasOverrides = false; // any override at all (procedural or image) — gates the per-node lookup
+  let hasImageOverride = false; // any IMAGE override — gates the individual-mesh + loader + cache path
+  const imageBudget =
+    Number.isFinite(opts.imageCacheBudget) && (opts.imageCacheBudget as number) > 0
+      ? (opts.imageCacheBudget as number)
+      : IMAGE_CACHE_BUDGET;
+  const emitImage = opts.onImageEvent;
+  const refreshOverrideFlags = (): void => {
+    hasOverrides = false;
+    hasImageOverride = false;
+    for (const k in overrides) {
+      hasOverrides = true;
+      if (overrides[k]!.kind === 'image') hasImageOverride = true;
+    }
+  };
+  refreshOverrideFlags();
   // each promoted planet's seeded salt — must equal `generateNearTextures`' per-layer salt so the
   // shader's low octaves reproduce that planet's baked texel exactly (seamless blend).
   const layerSalt = (L: number): number => (textureSeed * 0x1000193 + L * 0x9e3779b1) | 0;
@@ -1041,6 +1142,274 @@ export function createNearMesh(graph: Graph, field: Field, opts: NearMeshOpts = 
   const worldPx = (sizeWorld: number, dist: number): number =>
     glyphPx(sizeWorld, dist, halfH, tanHalf, dRef, falloff);
 
+  /* ---- individual image-override meshes + progressive tier LOD + LRU cache -------------------
+   * Everything here is created LAZILY on the first image-override promotion; with no image override
+   * NONE of it is allocated (hasImageOverride gates every entry point). An image node cannot share
+   * the instanced material (each needs its own texture), so it is drawn as its own unit-sphere Mesh
+   * with a self-lit textured material (the SAME fixed key light + hemisphere ambient as the pools)
+   * whose sampled texture is swapped to the node's current best-loaded tier. */
+  const imgCap = Math.min(IMAGE_MESH_CAP, count);
+  let imgIds: Int32Array | null = null; // promoted image nodes this frame (ids / px / world pos)
+  let imgPx: Float32Array | null = null;
+  let imgPos: Float32Array | null = null;
+  const ensureImageScratch = (): void => {
+    if (imgIds) return;
+    imgIds = new Int32Array(imgCap);
+    imgPx = new Float32Array(imgCap);
+    imgPos = new Float32Array(imgCap * 3);
+  };
+
+  const planetLayer = (name: string): number => NEAR_TEXTURE_NAMES.indexOf(name as NearTextureName);
+
+  interface ImageSlot {
+    mesh: Mesh;
+    texNode: { value: Texture }; // the TextureNode the material samples — swap .value to change tier
+    node: number; // which node id this slot shows (-1 = free)
+    shownKey: string; // the (node:tier) currently bound, '' = nothing shown yet
+  }
+  interface CacheEntry {
+    tex: Texture;
+    bytes: number;
+    px: number;
+  }
+  let imageGeo: BufferGeometry | null = null;
+  let placeholderTex: DataTexture | null = null;
+  let imageSlots: ImageSlot[] | null = null;
+  const imageMaterials: MeshBasicNodeMaterial[] = [];
+  // LRU cache: a Map is insertion-ordered, so the FIRST key is the least-recently-shown (we re-set a
+  // key on show to move it to the end). Keyed by `${node}:${tier}`.
+  const imgCache = new Map<string, CacheEntry>();
+  let cacheBytes = 0;
+  const inFlight = new Set<string>();
+  const currentShown = new Set<string>(); // keys displayed on the last frame (protected from eviction)
+  let imageGen = 0; // bumped on setOverrides/dispose — in-flight loads from an old gen are discarded
+  let imageInfoArr: { node: number; tier: number; px: number }[] = [];
+  let visibleImages = 0;
+  const keyOf = (node: number, tier: number): string => `${node}:${tier}`;
+
+  /** The self-lit textured material for an image slot: same lighting as the pools, but sampling a
+   *  per-slot swappable 2D texture (the node's current tier) rather than the shared planet array. */
+  const buildImageMaterial = (): ImageSlot['texNode'] => {
+    if (!placeholderTex) {
+      // a 1×1 opaque placeholder so the TextureNode has a value before the first tier resolves.
+      placeholderTex = new DataTexture(new Uint8Array([40, 40, 48, 255]), 1, 1);
+      placeholderTex.colorSpace = SRGBColorSpace;
+      placeholderTex.needsUpdate = true;
+    }
+    const mat = new MeshBasicNodeMaterial();
+    mat.transparent = false;
+    mat.depthWrite = true;
+    mat.depthTest = true;
+    const texNode = texture(placeholderTex, uv());
+    mat.colorNode = Fn(() => {
+      const N = normalLocal.normalize();
+      const L = vec3(0.412, 0.7726, 0.4827); // same fixed key light as the pools
+      const ndl = max(dot(N, L), float(0));
+      const hemi = N.y.mul(0.5).add(0.5);
+      const ambient = float(0.26).add(hemi.mul(0.22));
+      const lightAmt = ambient.add(ndl.mul(0.85));
+      return vec4(texNode.rgb.mul(lightAmt), 1) as unknown as ReturnType<typeof vec4>;
+    })() as unknown as typeof mat.colorNode;
+    imageMaterials.push(mat);
+    const slot: ImageSlot = {
+      mesh: new Mesh(imageGeo!, mat),
+      texNode: texNode as unknown as ImageSlot['texNode'],
+      node: -1,
+      shownKey: '',
+    };
+    slot.mesh.visible = false;
+    slot.mesh.frustumCulled = false; // positioned every frame; a bounding sphere at origin would cull
+    slot.mesh.renderOrder = 2;
+    group.add(slot.mesh);
+    imageSlots!.push(slot);
+    return slot.texNode;
+  };
+
+  const ensureImageInfra = (): void => {
+    if (imageSlots) return;
+    imageGeo = builtinShape(0); // one shared unit sphere (equirect uv) — slots share geometry
+    imageSlots = [];
+    for (let s = 0; s < imgCap; s++) buildImageMaterial();
+  };
+
+  const touch = (key: string): void => {
+    const e = imgCache.get(key);
+    if (!e) return;
+    imgCache.delete(key);
+    imgCache.set(key, e); // move to most-recent (end)
+  };
+  const evictToBudget = (): void => {
+    if (cacheBytes <= imageBudget) return;
+    for (const [key, e] of imgCache) {
+      if (cacheBytes <= imageBudget) break;
+      if (currentShown.has(key)) continue; // never evict a texture on screen this frame
+      imgCache.delete(key);
+      cacheBytes -= e.bytes;
+      e.tex.dispose();
+      const colon = key.indexOf(':');
+      emitImage?.({
+        type: 'evict',
+        node: Number(key.slice(0, colon)),
+        tier: Number(key.slice(colon + 1)),
+        px: e.px,
+        cacheBytes,
+      });
+    }
+  };
+  const kickLoad = (node: number, tierIdx: number, tier: ImageTier): void => {
+    const key = keyOf(node, tierIdx);
+    if (imgCache.has(key) || inFlight.has(key)) return;
+    inFlight.add(key);
+    const gen = imageGen;
+    tier
+      .load()
+      .then((tex) => {
+        inFlight.delete(key);
+        if (gen !== imageGen) {
+          tex.dispose(); // overrides changed while loading — this tier is stale
+          return;
+        }
+        tex.colorSpace = SRGBColorSpace;
+        tex.wrapS = RepeatWrapping; // longitude wraps (equirect)
+        tex.minFilter = LinearFilter;
+        tex.magFilter = LinearFilter;
+        tex.generateMipmaps = false;
+        tex.needsUpdate = true;
+        const bytes = Math.max(1, (tier.px | 0) * (tier.px | 0) * 4);
+        imgCache.set(key, { tex, bytes, px: tier.px });
+        cacheBytes += bytes;
+        emitImage?.({ type: 'load', node, tier: tierIdx, px: tier.px, cacheBytes });
+        evictToBudget();
+      })
+      .catch(() => {
+        inFlight.delete(key); // allow a later retry
+      });
+  };
+  const bestLoaded = (node: number, tierCount: number, desired: number): number => {
+    for (let t = desired; t >= 0; t--) if (imgCache.has(keyOf(node, t))) return t; // best ≤ desired
+    for (let t = desired + 1; t < tierCount; t++) if (imgCache.has(keyOf(node, t))) return t; // else any
+    return -1;
+  };
+  const slotOf = (node: number): ImageSlot | null => {
+    for (const s of imageSlots!) if (s.node === node) return s;
+    return null;
+  };
+  const acquireSlot = (node: number): ImageSlot | null => {
+    for (const s of imageSlots!) {
+      if (s.node < 0) {
+        s.node = node;
+        s.shownKey = '';
+        return s;
+      }
+    }
+    return null; // all slots busy (cap reached) — this node stays a billboard
+  };
+  const hideAllImages = (): void => {
+    if (!imageSlots) return;
+    for (const s of imageSlots) {
+      s.mesh.visible = false;
+      s.node = -1;
+      s.shownKey = '';
+    }
+    currentShown.clear();
+    visibleImages = 0;
+    imageInfoArr = [];
+  };
+
+  /** Place/scale/texture the promoted image nodes as individual meshes; decide which fade their
+   *  billboard (only once a texture is actually on screen). Returns nothing; mutates nextFaded. */
+  const updateImages = (cnt: number, nextFaded: Set<number>): void => {
+    ensureImageInfra();
+    const slots = imageSlots!;
+    const ids = imgIds!;
+    const pxs = imgPx!;
+    const pos = imgPos!;
+    const active = new Set<number>();
+    currentShown.clear();
+    imageInfoArr = [];
+    visibleImages = 0;
+    for (let k = 0; k < cnt; k++) {
+      const node = ids[k]!;
+      const src = overrides[node];
+      if (!src || src.kind !== 'image' || src.tiers.length === 0) continue;
+      active.add(node);
+      let slot = slotOf(node);
+      if (!slot) slot = acquireSlot(node);
+      if (!slot) continue; // no free slot → stays a billboard
+      const tiers = src.tiers;
+      const px = pxs[k]!;
+      // place at the node's live world position, scaled to its world radius (same as the pools).
+      const r = field.sizeOf(node) * NODE_SCALE;
+      slot.mesh.position.set(pos[k * 3]!, pos[k * 3 + 1]!, pos[k * 3 + 2]!);
+      slot.mesh.scale.setScalar(r);
+      // choose the sharpest tier that fits the on-screen px; always ensure the base tier so SOMETHING
+      // can show. Clamp down past any tier whose own bytes exceed the whole budget — it could never be
+      // retained, so requesting it would thrash (load → evict → load …) forever.
+      let desired = pickImageTier(tiers, px);
+      while (desired > 0) {
+        const tpx = tiers[desired]!.px | 0;
+        if (tpx * tpx * 4 <= imageBudget) break;
+        desired--;
+      }
+      kickLoad(node, 0, tiers[0]!);
+      if (desired > 0) kickLoad(node, desired, tiers[desired]!);
+      const best = bestLoaded(node, tiers.length, desired);
+      if (best >= 0) {
+        const key = keyOf(node, best);
+        const entry = imgCache.get(key)!;
+        touch(key);
+        currentShown.add(key);
+        if (slot.shownKey !== key) {
+          slot.texNode.value = entry.tex; // swap the sampled texture (no material rebuild)
+          slot.shownKey = key;
+          emitImage?.({ type: 'swap', node, tier: best, px: tiers[best]!.px, cacheBytes });
+        }
+        slot.mesh.visible = true;
+        visibleImages++;
+        nextFaded.add(node); // hand off: fade the billboard only when the image is actually up
+        imageInfoArr.push({ node, tier: best, px });
+      } else {
+        slot.mesh.visible = false; // nothing loaded yet → keep the billboard (no hole)
+        imageInfoArr.push({ node, tier: -1, px });
+      }
+      // reclaim this node's REDUNDANT tiers — keep only the base (instant fallback), the tier on
+      // screen (best) and the tier being loaded toward (desired). This bounds the per-node working set
+      // so even a budget smaller than two adjacent tiers cannot pile intermediates up and thrash, and
+      // it drops a node's high tiers back toward the base as it shrinks / flies away (desired falls, so
+      // the sharp tiers become redundant and are released — the LRU budget is the cross-node backstop).
+      for (let t = 1; t < tiers.length; t++) {
+        if (t === desired || t === best) continue;
+        const rk = keyOf(node, t);
+        const e = imgCache.get(rk);
+        if (e && !currentShown.has(rk)) {
+          imgCache.delete(rk);
+          cacheBytes -= e.bytes;
+          e.tex.dispose();
+          emitImage?.({ type: 'evict', node, tier: t, px: e.px, cacheBytes });
+        }
+      }
+    }
+    // release slots whose node is no longer a promoted image node
+    for (const s of slots) {
+      if (s.node >= 0 && !active.has(s.node)) {
+        s.mesh.visible = false;
+        s.node = -1;
+        s.shownKey = '';
+      }
+    }
+    evictToBudget();
+  };
+
+  const disposeImages = (): void => {
+    imageGen++;
+    for (const e of imgCache.values()) e.tex.dispose();
+    imgCache.clear();
+    cacheBytes = 0;
+    inFlight.clear();
+    currentShown.clear();
+    hideAllImages();
+  };
+
   let enabled = true;
   let promotedCount = 0;
 
@@ -1154,6 +1523,7 @@ export function createNearMesh(graph: Graph, field: Field, opts: NearMeshOpts = 
     if (m === 0) {
       clearPools();
       restoreAll();
+      if (imageSlots) hideAllImages();
       promotedCount = 0;
       return;
     }
@@ -1179,9 +1549,26 @@ export function createNearMesh(graph: Graph, field: Field, opts: NearMeshOpts = 
 
     // the new promoted set (to diff against `faded`)
     const nextFaded = new Set<number>();
+    if (hasImageOverride) ensureImageScratch();
+    let imgN = 0; // promoted IMAGE-override nodes, collected for the individual-mesh manager
     for (let s = 0; s < take; s++) {
       const j = order[s]!;
       const i = candIdx[j]!;
+      const p3 = j * 3;
+      const src = hasOverrides ? (overrides[i] ?? null) : null;
+      if (src && src.kind === 'image') {
+        // an image-override node is NOT an instanced instance — it becomes its own textured mesh.
+        // Its billboard is faded later by updateImages, only once a tier is actually on screen.
+        if (hasImageOverride && imgN < imgCap && src.tiers.length > 0) {
+          imgIds![imgN] = i;
+          imgPx![imgN] = candPx[j]!;
+          imgPos![imgN * 3] = candPos[p3]!;
+          imgPos![imgN * 3 + 1] = candPos[p3 + 1]!;
+          imgPos![imgN * 3 + 2] = candPos[p3 + 2]!;
+          imgN++;
+        }
+        continue;
+      }
       nextFaded.add(i);
       const shape = shapeCodes ? shapeCodes[i]! % shapeCount : 0;
       let pool = pools.get(shape);
@@ -1189,7 +1576,6 @@ export function createNearMesh(graph: Graph, field: Field, opts: NearMeshOpts = 
       let w = fill.get(shape) ?? 0;
       if (w >= count) continue; // this shape's pool is full (rare — count is the global cap)
       const o3 = w * 3;
-      const p3 = j * 3;
       const r = field.sizeOf(i) * NODE_SCALE;
       // instance matrix = uniform scale (the node's world radius) then translate to the live world
       // position; three feeds it to the clip position AND the written depth, so the body is solid.
@@ -1199,7 +1585,12 @@ export function createNearMesh(graph: Graph, field: Field, opts: NearMeshOpts = 
       pool.iTint[o3] = colors[i * 3]!;
       pool.iTint[o3 + 1] = colors[i * 3 + 1]!;
       pool.iTint[o3 + 2] = colors[i * 3 + 2]!;
-      const layer = texCodes ? texCodes[i]! % texCount : 0;
+      let layer = texCodes ? texCodes[i]! % texCount : 0;
+      // a `procedural` override forces a specific built-in planet layer (still an instanced instance).
+      if (src && src.kind === 'procedural') {
+        const pl = planetLayer(src.planet);
+        if (pl >= 0) layer = pl;
+      }
       pool.iTexLayer[w] = layer;
       // procedural detail blend: ramp 0→1 as the node's projected radius crosses the kick-in band,
       // but ONLY for a promoted hard-edge layer (every other layer, and every far node, stays baked).
@@ -1214,6 +1605,11 @@ export function createNearMesh(graph: Graph, field: Field, opts: NearMeshOpts = 
       w++;
       fill.set(shape, w);
     }
+
+    // individual image-override meshes: place/scale/texture them and (once a tier is up) fade their
+    // billboards. Gated on hasImageOverride so the default path never touches this.
+    if (hasImageOverride) updateImages(imgN, nextFaded);
+    else if (imageSlots) hideAllImages();
 
     // commit pool counts + upload (tiny buffers; a full small upload each active frame)
     for (const p of pools.values()) {
@@ -1259,6 +1655,7 @@ export function createNearMesh(graph: Graph, field: Field, opts: NearMeshOpts = 
       if (!on) {
         clearPools();
         restoreAll();
+        if (imageSlots) hideAllImages();
         promotedCount = 0;
       } else {
         builtOnce = false; // rebuild the grid against the current arrangement on the next update
@@ -1303,6 +1700,13 @@ export function createNearMesh(graph: Graph, field: Field, opts: NearMeshOpts = 
       }
       old.dispose();
     },
+    setOverrides(map: Record<number, NodeSource> | null): void {
+      overrides = map ?? {};
+      refreshOverrideFlags();
+      // overrides changed: drop every cached tier (the old keys may be stale) and release slots; the
+      // next update re-promotes and re-loads against the new map. Cheap — overrides change rarely.
+      disposeImages();
+    },
     get promoted(): number {
       return promotedCount;
     },
@@ -1310,7 +1714,17 @@ export function createNearMesh(graph: Graph, field: Field, opts: NearMeshOpts = 
       if (!enabled) return 0;
       let d = 0;
       for (const p of pools.values()) if (p.mesh.count > 0) d++;
+      d += visibleImages; // each visible image node is its own draw call
       return d;
+    },
+    get imageMeshes(): number {
+      return enabled ? visibleImages : 0;
+    },
+    get imageCacheBytes(): number {
+      return cacheBytes;
+    },
+    get imageInfo(): ReadonlyArray<{ node: number; tier: number; px: number }> {
+      return imageInfoArr;
     },
     dispose(): void {
       restoreAll();
@@ -1324,6 +1738,16 @@ export function createNearMesh(graph: Graph, field: Field, opts: NearMeshOpts = 
       material.dispose();
       for (const g of shapeGeos) if (g) g.dispose();
       if (texArray && ownsTexArray) texArray.dispose();
+      // image infra: dispose every cached tier, the slot meshes/materials, the shared geo + placeholder.
+      disposeImages();
+      if (imageSlots) {
+        for (const s of imageSlots) group.remove(s.mesh);
+        imageSlots = null;
+      }
+      for (const mat of imageMaterials) mat.dispose();
+      imageMaterials.length = 0;
+      if (imageGeo) imageGeo.dispose(); // one shared sphere across all slots
+      if (placeholderTex) placeholderTex.dispose();
     },
   };
 }

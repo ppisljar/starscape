@@ -381,3 +381,21 @@ a mesh tracks the spinning/morphing field exactly and sits precisely where its b
 billboard is faded (`iAlpha` → 0) while the node is a mesh and restored when it leaves the near set,
 so the two never double-draw. The grid buckets a view snapshot rebuilt on settle / throttled under
 motion — never per frame.
+
+**Per-node texture-source overrides (tiered images + progressive LOD).** `opts.overrides` (node id →
+`NodeSource`, live via `setOverrides`) pins a specific node to a different source than the facet
+default: a forced built-in planet (`{ kind: 'procedural', planet }` — still an instanced instance,
+just a fixed texture layer, zero extra draw calls) or a real image (`{ kind: 'image', tiers }`, e.g.
+a Blue-Marble Earth). An image node can't share the pools' single material (each needs its own
+texture), so it renders as its own unit-sphere `Mesh` with a self-lit textured material (the same
+fixed key light + hemisphere ambient; opaque, `depthWrite`/`depthTest` so it occludes) — a small
+managed set, cap `IMAGE_MESH_CAP` (16; overrides are rare). It is positioned/scaled/gated and its
+billboard faded exactly like an instanced node, so draw calls grow only by the number of VISIBLE
+image nodes (bounded, few). Each `ImageTier` is `{ px, load }`: `px` is the tier's resolution and
+doubles as its on-screen threshold; `load` is a consumer-supplied async loader (`pickImageTier` picks
+the sharpest tier whose `px` ≤ the node's on-screen px). Tiers load once (tracked in-flight), never
+blocking the frame — the best already-loaded tier shows meanwhile and the material's map swaps when a
+sharper tier resolves. A per-node working set of `{base, shown, desired}` plus an LRU budget
+(`imageCacheBudget`, ~64 MB; `.dispose()` on eviction) bounds GPU memory and drops a node's high tiers
+back toward the base as it shrinks or flies away. Still OPT-IN: with no `overrides`, no image meshes,
+loaders, or cache exist — byte-identical to today, zero added cost.

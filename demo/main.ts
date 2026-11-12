@@ -26,6 +26,7 @@
  * budgets are reported (§10.4), and nothing producing geometry reads the wall clock (§10.1). */
 
 import {
+  CanvasTexture,
   Color,
   Matrix4,
   PerspectiveCamera,
@@ -34,7 +35,13 @@ import {
   Vector3,
   WebGPURenderer,
 } from 'three/webgpu';
-import type { BufferAttribute, InstancedBufferAttribute, LineSegments, Mesh } from 'three/webgpu';
+import type {
+  BufferAttribute,
+  InstancedBufferAttribute,
+  LineSegments,
+  Mesh,
+  Texture,
+} from 'three/webgpu';
 import {
   bootQuality,
   buildGrid,
@@ -56,6 +63,7 @@ import {
   fovPxOf,
   getPreset,
   getShape,
+  hash,
   injectPanelStyles,
   injectStyles,
   localStorageAdapter,
@@ -105,10 +113,13 @@ import type {
   Flycam,
   FlycamConfig,
   GlyphTextureMode,
+  ImageEvent,
+  ImageTier,
   LadderCandidates,
   LadderView,
   LevelSpec,
   NearMesh,
+  NodeSource,
   PaletteName,
   ParamDesc,
   PlacementSpec,
@@ -226,6 +237,11 @@ async function main(): Promise<void> {
      sizes — 1k and 1M look like the same field at different zooms. */
   const synthN = Math.max(1, Math.min(2_000_000, Number(params.get('n') ?? 10000) | 0));
   const synthSeed = Number(params.get('seed') ?? 42) | 0;
+  // optional image-tier LRU budget override (MB), for demonstrating cache eviction under pressure;
+  // omitted ⇒ the library default (~64 MB). e.g. ?imgbudget=16 forces the high tiers to evict.
+  // (guard the absent param: Number(null) === 0, which would wrongly force a zero-byte budget.)
+  const imgBudgetRaw = params.get('imgbudget');
+  const imgBudgetMB = imgBudgetRaw !== null ? Number(imgBudgetRaw) : NaN;
 
   const t0 = performance.now();
   // generateSynth(10⁶) is synchronous and takes seconds: paint the message FIRST (rAF runs
@@ -609,6 +625,7 @@ async function main(): Promise<void> {
     nearPromotev: document.getElementById('nearPromotev') as HTMLSpanElement,
     nearCount: document.getElementById('nearCount') as HTMLInputElement,
     nearCountv: document.getElementById('nearCountv') as HTMLSpanElement,
+    nearImg: document.getElementById('nearImg') as HTMLInputElement,
     home: document.getElementById('home') as HTMLButtonElement,
     tune: document.getElementById('tune') as HTMLButtonElement,
     search: document.getElementById('search') as HTMLInputElement,
@@ -2458,6 +2475,128 @@ async function main(): Promise<void> {
     });
   };
 
+  /* ---- IMAGE-PLANET showcase (library per-node texture overrides + progressive tiers) ----------
+   * Pin ONE node to a real IMAGE texture instead of a procedural planet. The library serves it in
+   * resolution TIERS: it loads the sharpest tier that fits the node's on-screen px (async, never
+   * blocking), shows the best already-loaded tier meanwhile, swaps the material's map when a sharper
+   * tier resolves, and releases high tiers (LRU, ~64 MB) when you fly away. Procedural neighbours are
+   * untouched — they stay in the shared instanced pool (the millions-scale path).
+   *
+   * Here each tier is generated IN-MEMORY on a 2:1 equirect canvas (ocean + hashed continents + a big
+   * resolution LABEL), resolving after a short delay to exercise async + progressive + swap + cache
+   * with NO external photo. The label makes the low→high swap legible; the console logs load/swap/evict.
+   *
+   * SWAP IN A REAL EARTH IN ONE LINE: drop a same-origin assets/earth-4k.jpg (CSP-clean) and use
+   * realEarthTiers() below instead of demoEarthTiers() — one TextureLoader().loadAsync per tier. */
+  const drawEarthTier = (px: number): HTMLCanvasElement => {
+    const w = px;
+    const h = Math.max(1, px >> 1); // 2:1 equirectangular (sphere uv maps full [0,1]²)
+    const cv = document.createElement('canvas');
+    cv.width = w;
+    cv.height = h;
+    const ctx = cv.getContext('2d')!;
+    const oc = ctx.createLinearGradient(0, 0, 0, h); // ocean
+    oc.addColorStop(0, '#0a2f63');
+    oc.addColorStop(0.5, '#0e63a6');
+    oc.addColorStop(1, '#0a2f63');
+    ctx.fillStyle = oc;
+    ctx.fillRect(0, 0, w, h);
+    // hashed "continents" sampled at the tier's resolution: a higher tier resolves finer coastlines
+    // (visibly sharper). Deterministic via the lib `hash` — field geometry is untouched.
+    const cells = 7;
+    const land = (u: number, v: number): number => {
+      const x = u * cells;
+      const y = v * cells;
+      const x0 = Math.floor(x);
+      const y0 = Math.floor(y);
+      const xf = x - x0;
+      const yf = y - y0;
+      const sx = xf * xf * (3 - 2 * xf);
+      const sy = yf * yf * (3 - 2 * yf);
+      const hv = (ix: number, iy: number): number =>
+        hash((((ix % cells) + cells) % cells) + iy * 131, 20260);
+      const a = hv(x0, y0);
+      const b = hv(x0 + 1, y0);
+      const c = hv(x0, y0 + 1);
+      const d = hv(x0 + 1, y0 + 1);
+      return a + (b - a) * sx + (c - a) * sy + (a - b - c + d) * sx * sy;
+    };
+    const img = ctx.getImageData(0, 0, w, h);
+    const data = img.data;
+    for (let py = 0; py < h; py++) {
+      const v = (py + 0.5) / h;
+      const lat = Math.abs(v - 0.5) * 2;
+      for (let pxi = 0; pxi < w; pxi++) {
+        const l = land((pxi + 0.5) / w, v);
+        const o = (py * w + pxi) * 4;
+        if (l > 0.56) {
+          const t = Math.min(1, (l - 0.56) / 0.3);
+          data[o] = 70 + t * 90;
+          data[o + 1] = 120 + t * 40;
+          data[o + 2] = 55 + t * 30;
+        }
+        if (lat > 0.86) {
+          const t = Math.min(1, (lat - 0.86) / 0.1); // ice caps
+          data[o] = data[o]! + (235 - data[o]!) * t;
+          data[o + 1] = data[o + 1]! + (240 - data[o + 1]!) * t;
+          data[o + 2] = data[o + 2]! + (245 - data[o + 2]!) * t;
+        }
+      }
+    }
+    ctx.putImageData(img, 0, 0);
+    ctx.strokeStyle = 'rgba(255,255,255,0.12)'; // graticule
+    ctx.lineWidth = Math.max(1, px / 1024);
+    for (let gx = 1; gx < 8; gx++) {
+      const x = (gx / 8) * w;
+      ctx.beginPath();
+      ctx.moveTo(x, 0);
+      ctx.lineTo(x, h);
+      ctx.stroke();
+    }
+    for (let gy = 1; gy < 4; gy++) {
+      const y = (gy / 4) * h;
+      ctx.beginPath();
+      ctx.moveTo(0, y);
+      ctx.lineTo(w, y);
+      ctx.stroke();
+    }
+    ctx.fillStyle = 'rgba(255,255,255,0.85)'; // a legible resolution label (which tier is showing)
+    ctx.font = `bold ${Math.round(h * 0.22)}px system-ui, sans-serif`;
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(`${px}px`, w * 0.5, h * 0.5);
+    return cv;
+  };
+  const makeEarthTier = (px: number, delayMs: number): ImageTier => ({
+    px, // doubles as the on-screen threshold: loaded when the node grows past ~px on screen
+    load: () =>
+      new Promise<Texture>((resolve) => {
+        window.setTimeout(() => resolve(new CanvasTexture(drawEarthTier(px))), delayMs);
+      }),
+  });
+  const demoEarthTiers = (): ImageTier[] => [
+    makeEarthTier(160, 120), // base: loads first, soft
+    makeEarthTier(420, 170),
+    makeEarthTier(900, 240),
+    makeEarthTier(1600, 340), // sharpest: only when the planet nearly fills the view
+  ];
+  // DROP-IN REAL EARTH (same-origin, CSP-clean): drop assets/earth-4k.jpg next to the demo and swap
+  // demoEarthTiers() → realEarthTiers() in imageOverrides() below. One TextureLoader call per tier:
+  //   const realEarthTiers = (): ImageTier[] => [
+  //     { px: 1024, load: () => new TextureLoader().loadAsync('assets/earth-2k.jpg') },
+  //     { px: 4096, load: () => new TextureLoader().loadAsync('assets/earth-4k.jpg') },
+  //   ];
+
+  let pinnedImageNode = -1; // the node pinned to an image planet (-1 = none)
+  const imageOverrides = (): Record<number, NodeSource> | undefined =>
+    pinnedImageNode >= 0
+      ? { [pinnedImageNode]: { kind: 'image', tiers: demoEarthTiers() } }
+      : undefined;
+  const onImageEvent = (e: ImageEvent): void => {
+    const mb = (e.cacheBytes / (1024 * 1024)).toFixed(1);
+    console.debug(`[near-image] ${e.type} node ${e.node} tier@${e.px}px · cache ${mb} MB`);
+  };
+
   const ensureNear = (): NearMesh => {
     if (nearMesh) return nearMesh;
     nearMesh = createNearMesh(graph, field, {
@@ -2472,6 +2611,10 @@ async function main(): Promise<void> {
       textureSeed: TEX_SEED,
       heightCss: window.innerHeight,
       fov: liveFov,
+      overrides: imageOverrides(), // undefined unless a node is pinned ⇒ zero image machinery
+      imageCacheBudget:
+        Number.isFinite(imgBudgetMB) && imgBudgetMB > 0 ? imgBudgetMB * 1024 * 1024 : undefined,
+      onImageEvent,
     });
     for (const o of nearMesh.objects) scene.add(o);
     return nearMesh;
@@ -2520,6 +2663,34 @@ async function main(): Promise<void> {
     const wasOn = ui.near.checked;
     disposeNear();
     if (wasOn) ensureNear().setEnabled(true);
+  });
+
+  /* PIN AS IMAGE PLANET: pin the selected node (or a fixed showcase node if none is selected) to a
+   *  tiered image source via the library's setOverrides. Turns 3D nodes on if needed and flies onto
+   *  the node so it promotes and progresses through the tiers. Off clears the override (the node
+   *  returns to its procedural planet). */
+  const pinImageNode = (i: number): void => {
+    pinnedImageNode = i;
+    ui.nearImg.checked = i >= 0;
+    if (i >= 0 && !ui.near.checked) {
+      ui.near.checked = true;
+      ui.nearbox.classList.add('on');
+      ensureNear().setEnabled(true);
+    }
+    // setOverrides drives it live when the layer exists; otherwise the next ensureNear picks it up.
+    nearMesh?.setOverrides(imageOverrides() ?? null);
+    if (i >= 0) {
+      field.setSelect(i);
+      const handle = (window as unknown as Record<string, Record<string, (a: number, b?: number) => void>>)[
+        '__starscape'
+      ];
+      handle?.['flyToNode']?.(i, 0.35);
+    }
+    updateStats();
+  };
+  ui.nearImg.addEventListener('change', () => {
+    if (ui.nearImg.checked) pinImageNode(field.select >= 0 ? field.select : Math.floor(n / 2));
+    else pinImageNode(-1);
   });
 
   /* ======================================================================================
@@ -3350,7 +3521,16 @@ async function main(): Promise<void> {
       `${ladder.state.suspended ? ' · suspended' : ''}` +
       `${field.select >= 0 ? ' · pinned' : ''}` +
       ` · look ${store.preset}` +
-      `${nearMesh && ui.near.checked ? ` · 3D ${nearMesh.promoted} meshes / ${nearMesh.drawCalls} dc` : ''}`;
+      `${nearMesh && ui.near.checked ? ` · 3D ${nearMesh.promoted} meshes / ${nearMesh.drawCalls} dc` : ''}` +
+      `${
+        nearMesh && ui.near.checked && (nearMesh.imageMeshes > 0 || pinnedImageNode >= 0)
+          ? ` · img ${nearMesh.imageMeshes}${
+              nearMesh.imageInfo[0]
+                ? ` t${nearMesh.imageInfo[0].tier} @${Math.round(nearMesh.imageInfo[0].px)}px`
+                : ''
+            } · cache ${(nearMesh.imageCacheBytes / 1048576).toFixed(1)}MB`
+          : ''
+      }`;
   }
 
   /* GLOW boot: the 'nebula' look implies the glow on (the signature look); any other persisted
@@ -3753,6 +3933,15 @@ async function main(): Promise<void> {
     setTurntable: (on: boolean): void => {
       if (fly) fly.spin = on;
     },
+    pinImage: (i: number): void => pinImageNode(i),
+    nearImageState: (): string =>
+      JSON.stringify({
+        pinned: pinnedImageNode,
+        meshes: nearMesh?.imageMeshes ?? 0,
+        drawCalls: nearMesh?.drawCalls ?? 0,
+        cacheBytes: nearMesh?.imageCacheBytes ?? 0,
+        info: nearMesh ? nearMesh.imageInfo.map((x) => ({ ...x })) : [],
+      }),
   };
 
   updateStats();

@@ -8,6 +8,8 @@ import { describe, expect, it } from 'vitest';
 import {
   generateNearTextures,
   nearTextureAverages,
+  pickImageTier,
+  type ImageTier,
   NEAR_TEXTURE_NAMES,
   TEX_W,
   TEX_H,
@@ -78,5 +80,35 @@ describe('nearTextureAverages (per-layer dominant colour for tint)', () => {
     expect(a[0]).toBeCloseTo(want, 6);
     expect(a[1]).toBeCloseTo(want, 6);
     expect(a[2]).toBeCloseTo(want, 6);
+  });
+});
+
+describe('pickImageTier (progressive image-source tier selection)', () => {
+  // px doubles as the tier resolution AND its on-screen threshold; tiers are ascending in px.
+  const tiers: ImageTier[] = [128, 512, 1024, 2048].map((px) => ({
+    px,
+    load: () => Promise.reject(new Error('not loaded in a pure test')),
+  }));
+
+  it('falls back to the base tier when the node is smaller than every tier', () => {
+    expect(pickImageTier(tiers, 0)).toBe(0);
+    expect(pickImageTier(tiers, 127)).toBe(0);
+  });
+
+  it('picks the highest tier whose px is ≤ the on-screen px (bigger ⇒ sharper)', () => {
+    expect(pickImageTier(tiers, 128)).toBe(0);
+    expect(pickImageTier(tiers, 400)).toBe(0);
+    expect(pickImageTier(tiers, 512)).toBe(1);
+    expect(pickImageTier(tiers, 1500)).toBe(2);
+    expect(pickImageTier(tiers, 4000)).toBe(3); // caps at the sharpest available
+  });
+
+  it('is non-decreasing in on-screen px (never swaps to a coarser tier as a node grows)', () => {
+    let prev = -1;
+    for (let px = 0; px <= 4096; px += 17) {
+      const t = pickImageTier(tiers, px);
+      expect(t).toBeGreaterThanOrEqual(prev);
+      prev = t;
+    }
   });
 });

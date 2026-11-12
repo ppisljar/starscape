@@ -131,6 +131,16 @@
             >max meshes
             <span class="vd"><input type="range" id="nearCount" min="16" max="2000" step="16" value="128" /><span id="nearCountv">128</span></span>
           </label>
+          <label class="row" title="PIN the selected node (or a fixed showcase node if none is selected) to a real IMAGE texture instead of a procedural planet. The image loads progressively: a low-res tier first, then sharper tiers as you fly closer (an LRU cache releases the high tiers when you fly away). Here the tiers are generated IN-MEMORY so no external photo is needed; dropping assets/earth-4k.jpg and uncommenting one line in demo/main.ts makes it a real Blue-Marble Earth. Turn on 'real 3D nodes' first, then fly into the pinned node."
+            ><span><input type="checkbox" id="nearImg" /> pin as image planet</span>
+          </label>
+          <div
+            id="nearImgNote"
+            style="font-size: 10px; color: #5c6688; line-height: 1.35; padding: 1px 2px 0"
+          >
+            procedural tiers loaded in-memory; fly in to swap low→high. Drop
+            <code>assets/earth-4k.jpg</code> + uncomment one line for a real Earth.
+          </div>
         </div>
       </details>
 
