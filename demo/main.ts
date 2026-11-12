@@ -604,6 +604,7 @@ async function main(): Promise<void> {
     nearShape: document.getElementById('nearShape') as HTMLSelectElement,
     nearTex: document.getElementById('nearTex') as HTMLSelectElement,
     glyphTex: document.getElementById('glyphTex') as HTMLSelectElement,
+    surfaceDetail: document.getElementById('surfaceDetail') as HTMLSelectElement,
     nearPromote: document.getElementById('nearPromote') as HTMLInputElement,
     nearPromotev: document.getElementById('nearPromotev') as HTMLSpanElement,
     nearCount: document.getElementById('nearCount') as HTMLInputElement,
@@ -2464,6 +2465,7 @@ async function main(): Promise<void> {
       promotePx: Number(ui.nearPromote.value),
       shapeFacet: nearShapeFacet(),
       textureFacet: nearTexFacet(),
+      proceduralDetail: ui.surfaceDetail.value === 'procedural',
       // share the ONE array with the billboards whenever either side needs textures (so the LOD
       // and the far billboards sample the identical instance, not two deterministic copies).
       textures: needShared() ? ensureSharedTex().array : undefined,
@@ -2498,6 +2500,11 @@ async function main(): Promise<void> {
   ui.glyphTex.addEventListener('change', () => {
     applyGlyphTexture();
     updateStats();
+  });
+  // SURFACE DETAIL (prototype): baked = today's shader (zero cost); procedural = the jupiter-layer
+  // planet resolves infinite close-up detail in the fragment shader, seamlessly blended from baked.
+  ui.surfaceDetail.addEventListener('change', () => {
+    nearMesh?.setProceduralDetail(ui.surfaceDetail.value === 'procedural');
   });
   ui.nearPromote.addEventListener('input', () => {
     ui.nearPromotev.textContent = `${ui.nearPromote.value} px`;

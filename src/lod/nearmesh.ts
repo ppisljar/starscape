@@ -57,17 +57,26 @@ import {
   TorusGeometry,
   Vector3,
 } from 'three/webgpu';
-import type { BufferGeometry, Object3D } from 'three/webgpu';
+import type { BufferGeometry, Node, Object3D } from 'three/webgpu';
 import {
   Fn,
+  If,
+  abs,
+  asin,
+  atan,
   attribute,
+  clamp,
   dot,
   float,
   int,
   max,
   mix,
   normalLocal,
+  pow,
+  smoothstep,
+  step,
   texture,
+  uint,
   uv,
   vec3,
   vec4,
@@ -396,6 +405,159 @@ export function generateNearTextures(seed = 1): Uint8Array {
   return data;
 }
 
+/* ---- procedural surface detail in the fragment shader (prototype: EARTH only) ---------------
+ *
+ * "Option B" / continuous LOD. The baked textures above run out of pixels when you fly very close
+ * (magnification → soft). For a planet that is BIG on screen we instead evaluate its surface
+ * PROCEDURALLY per-fragment, from the sphere's surface point — continuous, effectively infinite
+ * detail, no texture memory, no generation hitch — and blend baked→procedural over a transition as
+ * the node grows (`iDetail` 0→1). THE BLEND IS SEAMLESS BY CONSTRUCTION: the low octaves below are
+ * a BIT-EXACT TSL port of the CPU value-noise (same `hash`, same lattice, same frequencies/salts),
+ * so at detail=0 the procedural colour equals the baked texel; the extra octaves (freqs the 512×256
+ * texture never stored) fade in with `iDetail`, so detail only ever ADDS, never jumps.
+ *
+ * Prototyped on EARTH — its hard land/sea coastline (a `land > 0.52` threshold in `PLANETS.earth`)
+ * shows the win unmistakably: baked, a magnified coastline blurs into soft blobs; procedural, the
+ * same coastline stays razor-sharp AND grows finer fractal inlets from the extra octaves. Opt-in and
+ * self-contained like the rest of the file; OFF (the default) compiles the exact material shipped
+ * today, references no `iDetail`, uploads nothing — zero added cost. */
+
+/** Layer that gets procedural detail in this prototype. Earth's thresholded coastline shows the
+ *  baked-blur-vs-procedural-sharp win most clearly. */
+export const PROCEDURAL_LAYER = NEAR_TEXTURE_NAMES.indexOf('earth');
+/** On-screen glyph radius (CSS px) where baked→procedural detail ramps 0→1. Below LO it is pure
+ *  baked (today's look); above HI it is full procedural. ~LO is roughly where the 256-tall baked
+ *  texture starts to magnify (planet screen-diameter ≳ texture height). */
+const DETAIL_PX_LO = 90;
+const DETAIL_PX_HI = 360;
+/** Extra octaves added BEYOND the baked set, and how hard their (ramped-in) contribution hits — the
+ *  finer coastline the low-res texture never had. Modest, because near the land/sea threshold a
+ *  small perturbation already carves visible new inlets. */
+const DETAIL_OCTAVES = 4;
+const DETAIL_GAIN = 2.2;
+
+const INV_2PI = 1 / (2 * Math.PI);
+const INV_PI = 1 / Math.PI;
+
+type FNode = Node<'float'>;
+type UNode = Node<'uint'>;
+
+/** Exact TSL port of `core/hash.ts` `hash(i, salt)` in uint32 (WGSL/GLSL uint arithmetic wraps mod
+ *  2^32, matching `Math.imul` bit-for-bit — verified bit-exact). `idx` a uint node; `saltU` the
+ *  salt as an UNSIGNED JS int (`salt >>> 0`). Returns the noise draw in [0, 1) as a float node. */
+function tslHash(idx: UNode, saltU: number): FNode {
+  const K = uint(0x9e3779b1); // 2654435761 — the golden-ratio multiplier (same constant twice)
+  let x = idx.bitXor(uint(saltU >>> 0).mul(K)).mul(K);
+  x = x.bitXor(x.shiftRight(uint(15)));
+  x = x.mul(uint(2246822519));
+  x = x.bitXor(x.shiftRight(uint(13)));
+  return x.toFloat().mul(1 / 4294967296) as unknown as FNode;
+}
+
+/** Exact TSL port of `wnoise(u, y, period, salt)`: seamless-in-longitude value noise. `uu` ∈ [0,1)
+ *  longitude, `yy` the latitude coordinate already in lattice units. `period`/`saltU` are the
+ *  octave's compile-time constants (inlined). Lattice wraps modulo `period` in x exactly as the CPU
+ *  does, so the sphere has no longitude seam. (iy < 4096 here, so the CPU's `& 4095` is identity.) */
+function wnoiseTSL(uu: FNode, yy: FNode, period: number, saltU: number): FNode {
+  const pf = float(period);
+  const x = uu.mul(period);
+  const x0 = x.floor();
+  const y0 = yy.floor();
+  const xf = x.sub(x0);
+  const yf = yy.sub(y0);
+  const su = xf.mul(xf).mul(float(3).sub(xf.mul(2)));
+  const sv = yf.mul(yf).mul(float(3).sub(yf.mul(2)));
+  const wrapF = (ixF: FNode): FNode => ixF.sub(ixF.div(pf).floor().mul(pf)) as unknown as FNode; // [0, period)
+  const corner = (ixF: FNode, iyF: FNode): FNode =>
+    tslHash(uint(wrapF(ixF).add(iyF.mul(8192))), saltU);
+  const a = corner(x0, y0);
+  const b = corner(x0.add(1), y0);
+  const c = corner(x0, y0.add(1));
+  const d = corner(x0.add(1), y0.add(1));
+  return mix(mix(a, b, su), mix(c, d, su), sv) as unknown as FNode;
+}
+
+/** Ramped fbm matching the CPU `wfbm(u, vy, cells, yscale, salt, bakedOct)`: the BAKED octaves are
+ *  bit-exact; `DETAIL_OCTAVES` finer octaves are added, their contribution scaled by `detail` (0 at
+ *  the baked scale → seamless; growing as the node fills the screen). Normalised by the BAKED norm so
+ *  the low frequencies keep their exact baked amplitude. Returns the fbm value in ~[0,1]. */
+function fbmField(
+  uu: FNode,
+  vy: FNode,
+  detail: FNode,
+  cells: number,
+  yscale: number,
+  bakedOct: number,
+  saltBase: number,
+): FNode {
+  const octSalt = (i: number): number => ((saltBase + i * 0x9e37) | 0) >>> 0;
+  let p = cells;
+  let ys = yscale;
+  let amp = 0.5;
+  let norm = 0;
+  let low = wnoiseTSL(uu, vy.mul(ys), p, octSalt(0)).mul(amp);
+  norm += amp;
+  for (let i = 1; i < bakedOct; i++) {
+    p *= 2;
+    ys *= 2;
+    amp *= 0.5;
+    norm += amp;
+    low = low.add(wnoiseTSL(uu, vy.mul(ys), p, octSalt(i)).mul(amp)) as unknown as FNode;
+  }
+  // detail octaves: continue the doubling past the baked resolution, ramped in by `detail`.
+  let detailSum: FNode | null = null;
+  for (let i = bakedOct; i < bakedOct + DETAIL_OCTAVES; i++) {
+    p *= 2;
+    ys *= 2;
+    amp *= 0.5;
+    const term = wnoiseTSL(uu, vy.mul(ys), p, octSalt(i)).mul(amp);
+    detailSum = detailSum ? (detailSum.add(term) as unknown as FNode) : (term as unknown as FNode);
+  }
+  const summed = detailSum
+    ? (low.add(detailSum.mul(detail).mul(DETAIL_GAIN)) as unknown as FNode)
+    : low;
+  return summed.mul(1 / norm) as unknown as FNode;
+}
+
+/** sRGB [0,1] → linear, matching three's SRGBColorSpace decode (the baked DataArrayTexture is sRGB,
+ *  so its sampled `.rgb` is already linear; the procedural colour must decode identically to blend
+ *  without a brightness seam). */
+function srgb2lin(c: FNode): FNode {
+  return mix(c.mul(1 / 12.92), pow(c.add(0.055).mul(1 / 1.055), 2.4), step(0.04045, c)) as unknown as FNode;
+}
+
+/** A sRGB byte-triple (0..255) → a linear-RGB vec3 node, the colour the baked texel decodes to. */
+function rgb255(r: number, g: number, b: number): Node<'vec3'> {
+  return vec3(srgb2lin(float(r / 255)), srgb2lin(float(g / 255)), srgb2lin(float(b / 255)));
+}
+
+/** Earth's surface colour (linear RGB) evaluated procedurally at the sphere point `N` (unit
+ *  object-space normal) — a per-fragment TSL re-implementation of `PLANETS.earth`. `detail` ramps the
+ *  extra high-frequency octaves in. `saltBase` is the layer's seeded salt (matches the baked
+ *  texture's). The longitude is aligned to the BAKED sampling coordinate (SphereGeometry uv.x), which
+ *  sits +0.25 off `atan(N.x,N.z)` — corrected here so the continents register exactly.
+ *
+ *  The land/sea boundary is a hard `land > 0.52` step, so the coastline is infinitely sharp per
+ *  fragment (vs the baked texture's bilinear-magnified blur) and the extra octaves wiggle it into
+ *  finer fractal inlets — the clearest read of the continuous-LOD win. */
+function earthProceduralRGB(N: Node<'vec3'>, detail: FNode, saltBase: number): Node<'vec3'> {
+  const uu = atan(N.x, N.z).mul(INV_2PI).add(0.25).fract();
+  const v = asin(clamp(N.y, -1, 1)).mul(INV_PI).add(0.5);
+  const lat = abs(v.sub(0.5)).mul(2); // 0 equator .. 1 pole
+  const land = fbmField(uu, v, detail, 5, 3, 5, saltBase); // CPU: wfbm(u,v,5,3,salt,5)
+  const ice = smoothstep(0.82, 0.96, lat);
+  // land branch (green → grey highlands, whitened to ice at the poles)
+  const hgt = smoothstep(0.52, 0.8, land);
+  const landCol = mix(rgb255(70, 120, 55), rgb255(150, 150, 95), hgt);
+  const landIced = mix(landCol, rgb255(235, 240, 245), ice);
+  // ocean branch (deep blue → shallow)
+  const deep = smoothstep(0.2, 0.52, land);
+  const oceanCol = mix(rgb255(14, 54, 120), rgb255(40, 110, 165), deep);
+  // the hard coastline: step(0.52, land) selects land over ocean, razor-sharp per fragment.
+  const isLand = step(0.52, land);
+  return mix(oceanCol, landIced, isLand) as unknown as Node<'vec3'>;
+}
+
 /* ---- the factory --------------------------------------------------------------------------- */
 
 export interface NearMeshOpts {
@@ -414,6 +576,11 @@ export interface NearMeshOpts {
   /** Facet name → texture layer (value index k → texture k mod 10). null = flat tinted shading,
    *  no texture sampled and NONE generated. */
   textureFacet?: string | null;
+  /** PROTOTYPE opt-in: evaluate the `PROCEDURAL_LAYER` planet's surface procedurally in the fragment
+   *  shader when a node is big on screen, blending baked→procedural for continuous close-up detail
+   *  (no texture magnification blur). Default false ⇒ the exact material shipped today, zero cost.
+   *  Needs a textureFacet (it refines one baked layer). Live via `setProceduralDetail`. */
+  proceduralDetail?: boolean;
   /** Override the built-in shape registry (unit-radius geometries, index 0 the default). */
   shapes?: BufferGeometry[];
   /** Override the built-in textures: one DataArrayTexture (RGBA, A = emissive), or a raw
@@ -448,6 +615,9 @@ export interface NearMesh {
   /** Rebind the texture facet (null = flat, no sampling). Switching from null generates the
    *  textures on demand (once). Live. */
   setTextureFacet(facet: string | null): void;
+  /** Toggle procedural surface detail for the `PROCEDURAL_LAYER` planet (prototype). Rebuilds the
+   *  material (like a texture-facet switch); off restores the exact shipped shader. Live. */
+  setProceduralDetail(on: boolean): void;
   /** How many nodes are drawn as meshes right now (telemetry). */
   readonly promoted: number;
   /** How many draw calls the near pools add this frame (telemetry; 0 when nothing promotes). */
@@ -461,8 +631,10 @@ interface Pool {
   mesh: InstancedMesh;
   iTint: Float32Array;
   iTexLayer: Float32Array;
+  iDetail: Float32Array; // per-instance baked→procedural blend (0 unless procedural detail is on)
   tintAttr: InstancedBufferAttribute;
   texAttr: InstancedBufferAttribute;
+  detailAttr: InstancedBufferAttribute;
 }
 
 /** Create the near-mesh LOD layer for a field. Opt-in: the consumer calls this (and adds
@@ -481,6 +653,10 @@ export function createNearMesh(graph: Graph, field: Field, opts: NearMeshOpts = 
 
   let shapeFacet: string | null = opts.shapeFacet ?? null;
   let textureFacet: string | null = opts.textureFacet ?? null;
+  let proceduralDetail = opts.proceduralDetail ?? false;
+  // the PROCEDURAL_LAYER planet's seeded salt — must equal `generateNearTextures`' per-layer salt so
+  // the shader's low octaves reproduce the baked texel exactly (seamless blend).
+  const proceduralSalt = (textureSeed * 0x1000193 + PROCEDURAL_LAYER * 0x9e3779b1) | 0;
   const facetData = (key: string | null): ArrayLike<number> | null =>
     key !== null && graph.facets[key] ? graph.facets[key]!.data : null;
   let shapeCodes = facetData(shapeFacet);
@@ -541,8 +717,20 @@ export function createNearMesh(graph: Graph, field: Field, opts: NearMeshOpts = 
         const tex = ensureTextures();
         const layer = int(attribute('iTexLayer', 'float'));
         const sampled = texture(tex, uv()).depth(layer);
+        const bodyRgb = sampled.rgb.toVar();
+        // PROTOTYPE: procedural surface detail. iDetail is per-instance (0 for every layer but the
+        // PROCEDURAL_LAYER planet, and 0 until it is big on screen), so this If is instance-uniform —
+        // whole non-detailed instances skip the noise entirely. At detail>0 we blend the baked texel
+        // toward the per-fragment procedural colour; its low octaves equal the texel, so no seam.
+        if (proceduralDetail) {
+          const detail = attribute('iDetail', 'float');
+          If(detail.greaterThan(0.001), () => {
+            const proc = earthProceduralRGB(N, detail, proceduralSalt);
+            bodyRgb.assign(mix(sampled.rgb, proc, detail));
+          });
+        }
         // let the texture carry the identity; the node tint only hints (so a planet stays a planet)
-        const albedo = sampled.rgb.mul(mix(vec3(1, 1, 1), tint, float(0.25)));
+        const albedo = bodyRgb.mul(mix(vec3(1, 1, 1), tint, float(0.25)));
         const emissive = sampled.rgb.mul(sampled.a).mul(1.7);
         const outc = albedo.mul(lightAmt).add(emissive);
         return vec4(outc, 1) as unknown as ReturnType<typeof vec4>;
@@ -566,18 +754,24 @@ export function createNearMesh(graph: Graph, field: Field, opts: NearMeshOpts = 
     const geo = getShapeGeo(shape).clone();
     const iTint = new Float32Array(count * 3);
     const iTexLayer = new Float32Array(count);
+    const iDetail = new Float32Array(count); // 0 unless procedural detail is on (then set per frame)
     const tintAttr = new InstancedBufferAttribute(iTint, 3);
     const texAttr = new InstancedBufferAttribute(iTexLayer, 1);
+    const detailAttr = new InstancedBufferAttribute(iDetail, 1);
     tintAttr.setUsage(DynamicDrawUsage);
     texAttr.setUsage(DynamicDrawUsage);
+    detailAttr.setUsage(DynamicDrawUsage);
     geo.setAttribute('iTint', tintAttr);
     geo.setAttribute('iTexLayer', texAttr);
+    // iDetail is referenced by the shader ONLY when proceduralDetail is on; off ⇒ the attribute is
+    // never bound/uploaded (the default material does not read it), so the default path stays free.
+    geo.setAttribute('iDetail', detailAttr);
     const mesh = new InstancedMesh(geo, material, count);
     mesh.count = 0;
     mesh.instanceMatrix.setUsage(DynamicDrawUsage); // rewritten every active frame
     mesh.frustumCulled = false;
     mesh.renderOrder = 2;
-    const pool: Pool = { shape, geo, mesh, iTint, iTexLayer, tintAttr, texAttr };
+    const pool: Pool = { shape, geo, mesh, iTint, iTexLayer, iDetail, tintAttr, texAttr, detailAttr };
     pools.set(shape, pool);
     group.add(mesh);
     return pool;
@@ -851,7 +1045,18 @@ export function createNearMesh(graph: Graph, field: Field, opts: NearMeshOpts = 
       pool.iTint[o3] = colors[i * 3]!;
       pool.iTint[o3 + 1] = colors[i * 3 + 1]!;
       pool.iTint[o3 + 2] = colors[i * 3 + 2]!;
-      pool.iTexLayer[w] = texCodes ? texCodes[i]! % texCount : 0;
+      const layer = texCodes ? texCodes[i]! % texCount : 0;
+      pool.iTexLayer[w] = layer;
+      // procedural detail blend: ramp 0→1 as the node's projected radius crosses the kick-in band,
+      // but ONLY for the prototype layer (every other layer, and every far node, stays pure baked).
+      if (proceduralDetail) {
+        let det = 0;
+        if (layer === PROCEDURAL_LAYER) {
+          const t = clamp01((candPx[j]! - DETAIL_PX_LO) / (DETAIL_PX_HI - DETAIL_PX_LO));
+          det = t * t * (3 - 2 * t); // smoothstep
+        }
+        pool.iDetail[w] = det;
+      }
       w++;
       fill.set(shape, w);
     }
@@ -864,6 +1069,7 @@ export function createNearMesh(graph: Graph, field: Field, opts: NearMeshOpts = 
         p.mesh.instanceMatrix.needsUpdate = true;
         p.tintAttr.needsUpdate = true;
         if (textured) p.texAttr.needsUpdate = true;
+        if (proceduralDetail) p.detailAttr.needsUpdate = true;
       }
     }
 
@@ -926,6 +1132,22 @@ export function createNearMesh(graph: Graph, field: Field, opts: NearMeshOpts = 
         for (const p of pools.values()) p.mesh.material = material;
         old.dispose();
       }
+    },
+    setProceduralDetail(on: boolean): void {
+      if (on === proceduralDetail) return;
+      proceduralDetail = on;
+      // rebuild the material so OFF compiles the exact shipped shader (references no iDetail) and ON
+      // splices the procedural branch in; the next update fills iDetail for promoted prototype nodes.
+      const old = material;
+      material = buildMaterial(textured);
+      for (const p of pools.values()) {
+        p.mesh.material = material;
+        if (!on) {
+          p.iDetail.fill(0); // leave the buffers clean when off (no stale blend if re-enabled)
+          p.detailAttr.needsUpdate = true;
+        }
+      }
+      old.dispose();
     },
     get promoted(): number {
       return promotedCount;
