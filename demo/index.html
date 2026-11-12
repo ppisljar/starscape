@@ -123,6 +123,9 @@
               <option value="procedural">procedural (hard-edge)</option>
             </select>
           </label>
+          <label class="row" title="TRUE DISPLACED TERRAIN (prototype: Earth). When you descend onto a solid earth planet, its textured sphere becomes real geometry — mountains and valleys with silhouettes you fly over and land on, displaced by Earth's own height field so the relief registers with the coastlines. It resolves in seamlessly as you get close (the displacement ramps up from the sphere), and the flycam lands on the terrain, not the bounding sphere. Needs a 'texture by' facet AND procedural surface detail (it reuses the earth colour). Fly into an EARTH node (texture value mod 10 = 0). Off = the stage-A sphere, zero cost."
+            ><span><input type="checkbox" id="nearTerrain" /> displaced terrain (earth)</span>
+          </label>
           <label class="row" title="a node becomes a 3D mesh when its on-screen glyph radius exceeds this many pixels — larger = promote later / closer"
             >promote &gt;
             <span class="vd"><input type="range" id="nearPromote" min="0" max="48" step="1" value="18" /><span id="nearPromotev">18 px</span></span>

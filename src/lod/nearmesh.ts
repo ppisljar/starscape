@@ -81,6 +81,7 @@ import {
   texture,
   uint,
   uv,
+  vec2,
   vec3,
   vec4,
 } from 'three/tsl';
@@ -90,6 +91,14 @@ import { buildGrid, cellMaxOf, type Grid } from '../pick/grid';
 import { glyphPx } from '../field/channels';
 import { hash } from '../core/hash';
 import { D_REF_FRACTION, FALLOFF, NODE_SCALE, SIZE_MAX_WORLD } from '../field/constants';
+import {
+  createTerrain,
+  earthTerrainSource,
+  TERRAIN_ALT_ON,
+  type Terrain,
+  type TerrainColorNode,
+  type TerrainHeightSource,
+} from './terrain';
 
 /* ---- registries (v1) ------------------------------------------------------------------- */
 
@@ -181,7 +190,7 @@ function faceted(geo: BufferGeometry): BufferGeometry {
 /** Seamless-in-longitude value noise: the x lattice wraps modulo `period` so the equirectangular
  *  texture has no visible seam when wrapped around a sphere. `u` ∈ [0,1) is longitude, `y` is a
  *  free (latitude) coordinate already scaled to lattice units. */
-function wnoise(u: number, y: number, period: number, salt: number): number {
+export function wnoise(u: number, y: number, period: number, salt: number): number {
   const x = u * period;
   const x0 = Math.floor(x);
   const y0 = Math.floor(y);
@@ -443,8 +452,8 @@ const DETAIL_PX_HI = 360;
 /** Extra octaves added BEYOND the baked set, and how hard their (ramped-in) contribution hits — the
  *  finer coastline the low-res texture never had. Modest, because near the land/sea threshold a
  *  small perturbation already carves visible new inlets. */
-const DETAIL_OCTAVES = 4;
-const DETAIL_GAIN = 2.2;
+export const DETAIL_OCTAVES = 4;
+export const DETAIL_GAIN = 2.2;
 /** Pole-pinch guard. The equirect uv from `normalLocal` (asin/atan) degenerates toward the poles —
  *  longitude spins faster and faster, so BOTH the baked texel (its texture columns converge) and the
  *  procedural noise smear into a radial starburst over a real polar cap, not just the exact point. We
@@ -500,7 +509,7 @@ function wnoiseTSL(uu: FNode, yy: FNode, period: number, saltU: number): FNode {
  *  bit-exact; `DETAIL_OCTAVES` finer octaves are added, their contribution scaled by `detail` (0 at
  *  the baked scale → seamless; growing as the node fills the screen). Normalised by the BAKED norm so
  *  the low frequencies keep their exact baked amplitude. Returns the fbm value in ~[0,1]. */
-function fbmField(
+export function fbmField(
   uu: FNode,
   vy: FNode,
   detail: FNode,
@@ -576,7 +585,7 @@ function poleCap(colour: Node<'vec3'>, lat: FNode, poleColour: Node<'vec3'>): No
 
 /** Earth — a hard `land > 0.52` coastline (razor-sharp per fragment vs the baked bilinear blur),
  *  green→grey highlands, whitened to an ice cap at the poles; extra octaves carve finer inlets. */
-function earthProceduralRGBA(
+export function earthProceduralRGBA(
   uu: FNode,
   v: FNode,
   lat: FNode,
@@ -754,6 +763,18 @@ export interface NearMeshOpts {
    *  magnification blur). Default false ⇒ the exact material shipped today, zero cost. Needs a
    *  textureFacet (it refines the hard-edge baked layers). Live via `setProceduralDetail`. */
   proceduralDetail?: boolean;
+  /** Opt-in: TRUE displaced terrain for the single SOLID planet you descend onto (prototype: Earth).
+   *  When on AND you are close to a promoted earth planet, that one node's instanced sphere is replaced
+   *  by a higher-detail icosphere displaced by Earth's own height field — real mountains with silhouettes
+   *  you fly over and land on, resolving SEAMLESSLY out of the textured sphere. Needs a textureFacet and
+   *  proceduralDetail (it reuses the earth colour so the handoff is invisible). Default false ⇒ the
+   *  terrain subsystem is never created, zero cost. Live via `setTerrain`. */
+  terrain?: boolean;
+  /** Peak terrain displacement as a fraction of planet radius at full descent (default 0.05 —
+   *  exaggerated so silhouettes read in the prototype; a DEM would carry true scale). */
+  terrainHeightScale?: number;
+  /** Finest terrain icosphere subdivision near the ground (default 6 = 81,920 tris). */
+  terrainMaxSubdiv?: number;
   /** Override the built-in shape registry (unit-radius geometries, index 0 the default). */
   shapes?: BufferGeometry[];
   /** Override the built-in textures: one DataArrayTexture (RGBA, A = emissive), or a raw
@@ -791,7 +812,15 @@ export interface NearMesh {
    *  returned object is REUSED each call (mutated in place): read it, do not keep it. Feeds a
    *  consumer camera's surface floor + altitude speed-scale (see flycam `surfaceAt`). */
   nearestSurface(cameraWorldPos: { x: number; y: number; z: number }):
-    | { center: readonly [number, number, number]; radius: number }
+    | {
+        center: readonly [number, number, number];
+        radius: number;
+        /** When the nearest body is the TERRAIN-active solid planet: its effective surface radius
+         *  along a unit direction from the centre (sphere radius + displaced terrain height). A
+         *  consumer camera (flycam `surfaceAt`) uses this to land ON the terrain, not the bounding
+         *  sphere. Absent for a plain sphere body (stage-A behaviour, byte-identical). */
+        terrain?: (dx: number, dy: number, dz: number) => number;
+      }
     | null;
   /** Turn the subsystem on/off. Off restores every faded billboard and does zero per-frame work;
    *  buffers allocate lazily on the first enabled update. Default: enabled. */
@@ -809,6 +838,11 @@ export interface NearMesh {
   /** Toggle procedural surface detail for the `PROCEDURAL_LAYERS` planets. Rebuilds the material
    *  (like a texture-facet switch); off restores the exact shipped shader. Live. */
   setProceduralDetail(on: boolean): void;
+  /** Toggle TRUE displaced terrain for the close solid planet (prototype: Earth). Off hides it and
+   *  the node returns to its instanced sphere next frame. Needs a textureFacet + proceduralDetail to
+   *  activate (it reuses the earth colour). The terrain subsystem is created lazily on first
+   *  activation ⇒ off, or never close to earth, costs nothing. Live. */
+  setTerrain(on: boolean): void;
   /** Replace the per-node texture-source overrides live. Passing null/`{}` removes every override
    *  (image nodes return to the instanced procedural pools) and disposes the image-tier cache. */
   setOverrides(map: Record<number, NodeSource> | null): void;
@@ -820,6 +854,11 @@ export interface NearMesh {
   /** How many individual image-override meshes are visible this frame (telemetry; 0 with no image
    *  overrides). */
   readonly imageMeshes: number;
+  /** True while the displaced terrain mesh is drawing for the close solid planet (telemetry). */
+  readonly terrainActive: boolean;
+  /** Current terrain LOD triangle count (0 when inactive) and subdivision level (telemetry). */
+  readonly terrainTriangles: number;
+  readonly terrainSubdiv: number;
   /** Current estimated image-tier LRU cache size in bytes (telemetry; 0 with no image overrides). */
   readonly imageCacheBytes: number;
   /** The visible image nodes this frame with their active tier index (-1 = loading, nothing shown
@@ -857,6 +896,13 @@ export function createNearMesh(graph: Graph, field: Field, opts: NearMeshOpts = 
   let shapeFacet: string | null = opts.shapeFacet ?? null;
   let textureFacet: string | null = opts.textureFacet ?? null;
   let proceduralDetail = opts.proceduralDetail ?? false;
+  let terrainEnabled = opts.terrain ?? false;
+  const terrainHeightScale = Number.isFinite(opts.terrainHeightScale)
+    ? (opts.terrainHeightScale as number)
+    : undefined;
+  const terrainMaxSubdiv = Number.isFinite(opts.terrainMaxSubdiv)
+    ? (opts.terrainMaxSubdiv as number)
+    : undefined;
 
   /* ---- per-node texture-source overrides (opt-in; empty ⇒ zero machinery). ------------------- */
   let overrides: Record<number, NodeSource> = opts.overrides ?? {};
@@ -1162,8 +1208,11 @@ export function createNearMesh(graph: Graph, field: Field, opts: NearMeshOpts = 
     surfRadii = new Float32Array(c);
   };
   // reused result object (mutated each call) so the per-frame query allocates nothing.
-  const surfOut: { center: [number, number, number]; radius: number } =
-    { center: [0, 0, 0], radius: 0 };
+  const surfOut: {
+    center: [number, number, number];
+    radius: number;
+    terrain?: (dx: number, dy: number, dz: number) => number;
+  } = { center: [0, 0, 0], radius: 0 };
 
   const worldPx = (sizeWorld: number, dist: number): number =>
     glyphPx(sizeWorld, dist, halfH, tanHalf, dRef, falloff);
@@ -1436,6 +1485,69 @@ export function createNearMesh(graph: Graph, field: Field, opts: NearMeshOpts = 
     hideAllImages();
   };
 
+  /* ---- TRUE displaced terrain for the close solid planet (opt-in; lazy; see terrain.ts) ----------
+   * Only the single nearest promoted EARTH planet, when you are close enough (altitude < TERRAIN_ALT_ON),
+   * gets real displaced geometry; its instanced sphere is suppressed so the two never double-draw, and
+   * the handoff is seamless (amplitude ramps from 0 at the swap altitude). Everything is created lazily
+   * on the first activation, so the feature off — or never close to earth — costs nothing. */
+  let terrain: Terrain | null = null;
+  let heightSrc: TerrainHeightSource | null = null;
+  let terrainActive = false; // drawing this frame (gates the collision sampler + telemetry)
+  let terrainSurfIdx = -1; // which `surfCenters`/`surfRadii` slot is the terrain planet
+  let terrainRadius = 0;
+  let terrainAmpFrac = 0; // displacement fraction in play (matches the GPU uniform) — collision height
+  let terrainDetail = 0;
+
+  /** The earth colour drape for the terrain mesh: byte-for-byte the instanced earth shading (baked
+   *  texel ↔ procedural blend by `detail`, pole cap, node tint, the fixed key light) but lit by the
+   *  DISPLACED terrain normal — so at amplitude 0 (the swap) it equals the instanced sphere exactly,
+   *  and as the relief resolves in only the lighting bends. UV + baked layer come from the ORIGINAL
+   *  (undisplaced) direction so continents register with the coastline. */
+  const buildTerrainColor = (): TerrainColorNode => {
+    const texArr = ensureTextures();
+    return (d, normal, detail, tint) => {
+      const N = normal.normalize();
+      const Lk = vec3(0.412, 0.7726, 0.4827);
+      const ndl = max(dot(N, Lk), float(0));
+      const hemi = N.y.mul(0.5).add(0.5);
+      const ambient = float(0.26).add(hemi.mul(0.22));
+      const lightAmt = ambient.add(ndl.mul(0.85));
+      const uu = atan(d.x, d.z).mul(INV_2PI).add(0.25).fract();
+      const vLat = asin(clamp(d.y, -1, 1)).mul(INV_PI).add(0.5);
+      const lat = abs(vLat.sub(0.5)).mul(2);
+      const sampled = texture(texArr, vec2(uu, vLat)).depth(int(L_EARTH));
+      const proc = earthProceduralRGBA(uu as FNode, vLat as FNode, lat as FNode, detail, earthSalt);
+      const bodyRgb = mix(sampled.rgb, proc.xyz, detail);
+      const bodyA = mix(sampled.a, proc.w, detail);
+      const albedo = bodyRgb.mul(mix(vec3(1, 1, 1), tint, float(0.25)));
+      const emissive = bodyRgb.mul(bodyA).mul(1.7);
+      return vec4(albedo.mul(lightAmt).add(emissive), 1) as unknown as ReturnType<typeof vec4>;
+    };
+  };
+
+  const ensureTerrain = (): Terrain => {
+    if (terrain) return terrain;
+    heightSrc = earthTerrainSource(earthSalt);
+    terrain = createTerrain({
+      height: heightSrc,
+      colorNode: buildTerrainColor(),
+      heightScale: terrainHeightScale,
+      maxSubdiv: terrainMaxSubdiv,
+    });
+    group.add(terrain.object);
+    return terrain;
+  };
+
+  /** Effective surface radius along a unit direction = sphere radius + displaced terrain height. Fed
+   *  to the flycam (via `nearestSurface().terrain`) so it lands on the relief, not the bounding sphere.
+   *  Uses the SAME height field + amplitude the GPU displaced with this frame. */
+  const terrainSample = (dx: number, dy: number, dz: number): number => {
+    if (!heightSrc) return terrainRadius;
+    const len = Math.hypot(dx, dy, dz) || 1;
+    const h = heightSrc.height(dx / len, dy / len, dz / len, terrainDetail);
+    return terrainRadius * (1 + h * terrainAmpFrac);
+  };
+
   let enabled = true;
   let promotedCount = 0;
 
@@ -1451,6 +1563,7 @@ export function createNearMesh(graph: Graph, field: Field, opts: NearMeshOpts = 
     ensureBuffers();
     ensureSurf(count);
     surfCount = 0; // rebuilt below from the promoted set; 0 ⇒ nearestSurface returns null
+    terrainSurfIdx = -1; // which surface slot (if any) is the terrain planet this frame
 
     // keep the grid fresh: build once, on every settle edge, and throttled while in motion.
     const settled = field.settled();
@@ -1552,6 +1665,8 @@ export function createNearMesh(graph: Graph, field: Field, opts: NearMeshOpts = 
       clearPools();
       restoreAll();
       if (imageSlots) hideAllImages();
+      if (terrain) terrain.setVisible(false);
+      terrainActive = false;
       promotedCount = 0;
       return;
     }
@@ -1569,6 +1684,53 @@ export function createNearMesh(graph: Graph, field: Field, opts: NearMeshOpts = 
       const t = order[s]!;
       order[s] = order[bestJ]!;
       order[bestJ] = t;
+    }
+
+    /* TERRAIN pre-scan: pick the single nearest promoted EARTH planet the camera is close enough to
+     * descend onto (altitude < TERRAIN_ALT_ON). That one node's instanced sphere is suppressed in the
+     * fill loop and drawn instead by the displaced terrain mesh. Gated on the master switch AND a
+     * textured + procedural-detail material (the drape reuses the exact earth colour, so the handoff is
+     * seamless); off / not-close ⇒ terrainNode stays −1 and nothing changes. */
+    let terrainNode = -1;
+    let terrainJ = -1;
+    let terrainAltFrac = 0;
+    if (terrainEnabled && textured && proceduralDetail) {
+      // pick the earth planet you are DESCENDING ONTO: the smallest altitude RELATIVE to its radius
+      // (altitude / radius), not the smallest absolute distance — otherwise a tiny earth that happens
+      // to drift close in world units would steal terrain from the big planet filling your view.
+      let bestAlt = Infinity;
+      for (let s = 0; s < take; s++) {
+        const j = order[s]!;
+        const i = candIdx[j]!;
+        let layer = texCodes ? texCodes[i]! % texCount : 0;
+        if (hasOverrides) {
+          const src = overrides[i];
+          if (src && src.kind === 'image') continue; // image nodes are not terrain
+          if (src && src.kind === 'procedural') {
+            const pl = planetLayer(src.planet);
+            if (pl >= 0) layer = pl;
+          }
+        }
+        if (layer !== L_EARTH) continue; // prototype: solid terrain is Earth only
+        const p3 = j * 3;
+        const dx = candPos[p3]! - cam.x;
+        const dy = candPos[p3 + 1]! - cam.y;
+        const dz = candPos[p3 + 2]! - cam.z;
+        const r = field.sizeOf(i) * NODE_SCALE;
+        const altF = (Math.sqrt(dx * dx + dy * dy + dz * dz) - r) / r; // altitude in radius units
+        if (altF < bestAlt) {
+          bestAlt = altF;
+          terrainNode = i;
+          terrainJ = j;
+        }
+      }
+      if (terrainNode >= 0) {
+        terrainAltFrac = bestAlt;
+        if (!(bestAlt < TERRAIN_ALT_ON)) {
+          terrainNode = -1; // promoted but still too high — keep the instanced sphere
+          terrainJ = -1;
+        }
+      }
     }
 
     // reset pool fills
@@ -1592,6 +1754,14 @@ export function createNearMesh(graph: Graph, field: Field, opts: NearMeshOpts = 
         surfCenters[s3 + 2] = candPos[p3 + 2]!;
         surfRadii[surfCount] = field.sizeOf(i) * NODE_SCALE;
         surfCount++;
+        // the terrain planet is still a collidable surface — but drawn by the displaced terrain mesh,
+        // not the instanced pool. Remember its surface slot (so nearestSurface attaches the terrain
+        // sampler) and skip its instanced instance so the two never double-draw.
+        if (i === terrainNode) {
+          terrainSurfIdx = surfCount - 1;
+          nextFaded.add(i); // promoted (drawn as terrain) ⇒ fade its billboard
+          continue;
+        }
       }
       const src = hasOverrides ? (overrides[i] ?? null) : null;
       if (src && src.kind === 'image') {
@@ -1681,6 +1851,37 @@ export function createNearMesh(graph: Graph, field: Field, opts: NearMeshOpts = 
     }
     if (alphaDirty) alphaAttr.needsUpdate = true;
 
+    /* drive (or hide) the displaced terrain mesh for the suppressed earth node. Its live centre is
+     * candPos[terrainJ] (exactly where its instanced sphere / faded billboard sat), so it tracks the
+     * spinning / morphing field. detail = the SAME px→detail ramp the instanced planet uses, so the
+     * draped earth colour matches at the swap. The terrain owns the amplitude ramp; we read its
+     * ampFrac back for the collision floor. */
+    if (terrainNode >= 0 && terrainJ >= 0) {
+      const t = ensureTerrain();
+      const p3 = terrainJ * 3;
+      const r = field.sizeOf(terrainNode) * NODE_SCALE;
+      const tt = clamp01((candPx[terrainJ]! - DETAIL_PX_LO) / (DETAIL_PX_HI - DETAIL_PX_LO));
+      const det = tt * tt * (3 - 2 * tt); // smoothstep, matching the instanced detail ramp
+      t.update({
+        cx: candPos[p3]!,
+        cy: candPos[p3 + 1]!,
+        cz: candPos[p3 + 2]!,
+        radius: r,
+        altFrac: terrainAltFrac,
+        detail: det,
+        tintR: colors[terrainNode * 3]!,
+        tintG: colors[terrainNode * 3 + 1]!,
+        tintB: colors[terrainNode * 3 + 2]!,
+      });
+      terrainActive = true;
+      terrainRadius = r;
+      terrainAmpFrac = t.ampFrac;
+      terrainDetail = det;
+    } else {
+      if (terrain) terrain.setVisible(false);
+      terrainActive = false;
+    }
+
     promotedCount = take;
   };
 
@@ -1708,6 +1909,10 @@ export function createNearMesh(graph: Graph, field: Field, opts: NearMeshOpts = 
       surfOut.center[1] = surfCenters[best * 3 + 1]!;
       surfOut.center[2] = surfCenters[best * 3 + 2]!;
       surfOut.radius = surfRadii[best]!;
+      // when the nearest body is the terrain planet, hand back the per-direction terrain floor so the
+      // camera lands on the relief, not the sphere. Any other body stays a plain sphere (stage A).
+      surfOut.terrain =
+        terrainActive && best === terrainSurfIdx && heightSrc ? terrainSample : undefined;
       return surfOut;
     },
     setEnabled(on: boolean): void {
@@ -1717,9 +1922,21 @@ export function createNearMesh(graph: Graph, field: Field, opts: NearMeshOpts = 
         clearPools();
         restoreAll();
         if (imageSlots) hideAllImages();
+        if (terrain) terrain.setVisible(false);
+        terrainActive = false;
         promotedCount = 0;
       } else {
         builtOnce = false; // rebuild the grid against the current arrangement on the next update
+      }
+    },
+    setTerrain(on: boolean): void {
+      if (on === terrainEnabled) return;
+      terrainEnabled = on;
+      // off: hide immediately (the node returns to its instanced sphere next update). On: the next
+      // update lazily creates the mesh once you are actually close to an earth planet.
+      if (!on && terrain) {
+        terrain.setVisible(false);
+        terrainActive = false;
       }
     },
     setView(heightCss: number, fovDeg: number): void {
@@ -1776,10 +1993,20 @@ export function createNearMesh(graph: Graph, field: Field, opts: NearMeshOpts = 
       let d = 0;
       for (const p of pools.values()) if (p.mesh.count > 0) d++;
       d += visibleImages; // each visible image node is its own draw call
+      if (terrainActive) d++; // the displaced terrain mesh is its own draw call
       return d;
     },
     get imageMeshes(): number {
       return enabled ? visibleImages : 0;
+    },
+    get terrainActive(): boolean {
+      return enabled && terrainActive;
+    },
+    get terrainTriangles(): number {
+      return enabled && terrain ? terrain.triangles : 0;
+    },
+    get terrainSubdiv(): number {
+      return terrain ? terrain.subdiv : 0;
     },
     get imageCacheBytes(): number {
       return cacheBytes;
@@ -1797,6 +2024,11 @@ export function createNearMesh(graph: Graph, field: Field, opts: NearMeshOpts = 
       }
       pools.clear();
       material.dispose();
+      if (terrain) {
+        group.remove(terrain.object);
+        terrain.dispose();
+        terrain = null;
+      }
       for (const g of shapeGeos) if (g) g.dispose();
       if (texArray && ownsTexArray) texArray.dispose();
       // image infra: dispose every cached tier, the slot meshes/materials, the shared geo + placeholder.

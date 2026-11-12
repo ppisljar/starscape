@@ -453,7 +453,11 @@ async function main(): Promise<void> {
   const surfaceQ = { x: 0, y: 0, z: 0 };
   const surfaceAt = (
     p: readonly [number, number, number],
-  ): { center: readonly [number, number, number]; radius: number } | null => {
+  ): {
+    center: readonly [number, number, number];
+    radius: number;
+    terrain?: (dx: number, dy: number, dz: number) => number;
+  } | null => {
     if (!nearMesh) return null;
     surfaceQ.x = p[0];
     surfaceQ.y = p[1];
@@ -636,6 +640,7 @@ async function main(): Promise<void> {
     nearTex: document.getElementById('nearTex') as HTMLSelectElement,
     glyphTex: document.getElementById('glyphTex') as HTMLSelectElement,
     surfaceDetail: document.getElementById('surfaceDetail') as HTMLSelectElement,
+    nearTerrain: document.getElementById('nearTerrain') as HTMLInputElement,
     nearPromote: document.getElementById('nearPromote') as HTMLInputElement,
     nearPromotev: document.getElementById('nearPromotev') as HTMLSpanElement,
     nearCount: document.getElementById('nearCount') as HTMLInputElement,
@@ -2620,6 +2625,7 @@ async function main(): Promise<void> {
       shapeFacet: nearShapeFacet(),
       textureFacet: nearTexFacet(),
       proceduralDetail: ui.surfaceDetail.value === 'procedural',
+      terrain: ui.nearTerrain.checked,
       // share the ONE array with the billboards whenever either side needs textures (so the LOD
       // and the far billboards sample the identical instance, not two deterministic copies).
       textures: needShared() ? ensureSharedTex().array : undefined,
@@ -2664,6 +2670,30 @@ async function main(): Promise<void> {
   // baked, with their poles guarded against the equirect pinch.
   ui.surfaceDetail.addEventListener('change', () => {
     nearMesh?.setProceduralDetail(ui.surfaceDetail.value === 'procedural');
+  });
+  /* DISPLACED TERRAIN prereqs: terrain needs a texture facet (so nodes have a planet layer — earth is
+   * layer 0) AND procedural surface detail (the terrain reuses the earth colour, seamless at the swap).
+   * Turning terrain on forces both; the terrain subsystem is created lazily on the first close approach. */
+  const ensureTerrainPrereqs = (): void => {
+    if (ui.nearTex.value === 'none') {
+      const facets = Object.keys(graph.facets);
+      const pick = facets.includes('type') ? 'type' : (facets[0] ?? 'none');
+      if (pick !== 'none') {
+        ui.nearTex.value = pick;
+        nearMesh?.setTextureFacet(pick);
+        if (glyphMode() !== 'off') applyGlyphTexture();
+      }
+    }
+    if (ui.surfaceDetail.value !== 'procedural') {
+      ui.surfaceDetail.value = 'procedural';
+      nearMesh?.setProceduralDetail(true);
+    }
+  };
+  ui.nearTerrain.addEventListener('change', () => {
+    const on = ui.nearTerrain.checked;
+    if (on) ensureTerrainPrereqs();
+    nearMesh?.setTerrain(on);
+    updateStats();
   });
   ui.nearPromote.addEventListener('input', () => {
     ui.nearPromotev.textContent = `${ui.nearPromote.value} px`;
@@ -3539,6 +3569,12 @@ async function main(): Promise<void> {
       ` · look ${store.preset}` +
       `${nearMesh && ui.near.checked ? ` · 3D ${nearMesh.promoted} meshes / ${nearMesh.drawCalls} dc` : ''}` +
       `${
+        nearMesh && ui.near.checked && nearMesh.terrainActive
+          ? ` · terrain L${nearMesh.terrainSubdiv} ${fmt(nearMesh.terrainTriangles)} tris` +
+            `${Number.isFinite(altitude) ? ` · alt ${altitude.toFixed(2)}` : ''}`
+          : ''
+      }` +
+      `${
         nearMesh && ui.near.checked && (nearMesh.imageMeshes > 0 || pinnedImageNode >= 0)
           ? ` · img ${nearMesh.imageMeshes}${
               nearMesh.imageInfo[0]
@@ -3961,6 +3997,35 @@ async function main(): Promise<void> {
     setTurntable: (on: boolean): void => {
       if (fly) fly.spin = on;
     },
+    // terrain stage B: toggle the displaced-terrain feature (forces its prereqs — a texture facet +
+    // procedural detail — and turns 3D nodes on, so one call is enough to see it).
+    setTerrain: (on: boolean): void => {
+      if (on) {
+        ensureTerrainPrereqs(); // sets the texture facet + procedural detail (read by a fresh ensureNear)
+        if (!ui.near.checked) {
+          ui.near.checked = true;
+          ui.nearbox.classList.add('on');
+        }
+        ensureNear().setEnabled(true);
+        ui.nearTerrain.checked = true;
+        nearMesh?.setTerrain(true);
+      } else {
+        ui.nearTerrain.checked = false;
+        nearMesh?.setTerrain(false);
+      }
+      updateStats();
+    },
+    terrainState: (): string =>
+      JSON.stringify({
+        active: nearMesh?.terrainActive ?? false,
+        subdiv: nearMesh?.terrainSubdiv ?? 0,
+        triangles: nearMesh?.terrainTriangles ?? 0,
+        promoted: nearMesh?.promoted ?? 0,
+        drawCalls: nearMesh?.drawCalls ?? 0,
+        altitude: Number.isFinite(altitude) ? Number(altitude.toFixed(3)) : null,
+        blocked,
+        fps: Number(fpsMedian().toFixed(1)),
+      }),
     pinImage: (i: number): void => pinImageNode(i),
     nearImageState: (): string =>
       JSON.stringify({

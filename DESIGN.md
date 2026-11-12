@@ -399,3 +399,40 @@ sharper tier resolves. A per-node working set of `{base, shown, desired}` plus a
 (`imageCacheBudget`, ~64 MB; `.dispose()` on eviction) bounds GPU memory and drops a node's high tiers
 back toward the base as it shrinks or flies away. Still OPT-IN: with no `overrides`, no image meshes,
 loaders, or cache exist — byte-identical to today, zero added cost.
+
+## 15. Planetary terrain — the ground (surface collision + true-geometry relief)
+
+The near-mesh (§14) resolves a node from mote → billboard → textured sphere → procedurally-detailed
+sphere. The last band is the **ground**: descend toward a solid planet and its surface becomes real
+displaced geometry — mountains and valleys with silhouettes you fly over and land on — continuous and
+seamless with the textured sphere.
+
+**Two pluggable fields over the sphere.** A planet is colour + height, each either computed (noise) or
+sampled (tiles): `{ colour: procedural | image-tiers, height: procedural | image-tiers }`. The terrain
+renderer only asks *"elevation at surface point P, at detail D?"* — it never cares whether the answer is
+noise or a sampled DEM, so a procedural planet's mountains and the real Earth's mountains run the
+identical displacement / tessellation / collision path. `TerrainHeightSource { height(cpu), node(tsl) }`
+is the seam; swapping `earthTerrainSource` for a tiered-DEM source leaves everything else untouched.
+
+**Displacement.** A unit icosphere is displaced along its normal in the vertex shader by
+`height(dir)·amp·radius` (so amplitude ramps per-frame with no geometry rebuild); the surface normal is
+recomputed analytically from two finite-difference height taps so relief is lit, collapsing to the
+smooth sphere normal at `amp = 0`. The same procedural colour as the instanced sphere is draped on top,
+so only the lighting bends as relief appears. Height reuses the planet's OWN land-mask noise, so relief
+registers to the coastlines (ocean flat, land rises) + a ridged fbm for ranges.
+
+**Seamless handoff.** Amplitude ramps `heightScale·(1 − smoothstep(lo, hi, altitude/radius))` → 0 at the
+swap altitude (sub-pixel) up to full near the ground; nearmesh suppresses that one node's instanced
+sphere so the two never double-draw. Discrete icosphere subdivisions swap by altitude (geometry LOD only
+where you're close). It is the geometry resolving in, exactly as the colour detail (§14) sharpens — no
+switch to hide.
+
+**Collision is the terrain.** `nearestSurface()` returns a `terrain(dir)` sampler for the active planet;
+the flycam (§6) floors the camera at `terrain(surfN) + hover` and scales speed by the altitude above it,
+so you land ON ridges and rise/fall with the relief, not at the bounding sphere. Absent the sampler it is
+the stage-A sphere floor.
+
+Still OPT-IN and bounded: terrain exists only when the LOD is on, the node is textured + detailed, and
+you are close to a solid planet — one planet at a time, created lazily, nothing allocated otherwise. The
+full-generality target (adaptive CDLOD tessellation, every solid planet, real tiered DEMs, erosion) is
+the §12 Milky Way test's last mile; this is its first true-ground implementation.

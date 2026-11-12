@@ -155,7 +155,16 @@ export interface FlycamOptions {
    *  body spins / morphs. */
   surfaceAt?: (
     pos: readonly [number, number, number],
-  ) => { center: readonly [number, number, number]; radius: number } | null;
+  ) => {
+    center: readonly [number, number, number];
+    radius: number;
+    /** OPT-IN terrain floor (near-mesh terrain stage B): the effective surface radius along a UNIT
+     *  direction from the centre (sphere radius + displaced terrain height). When present the camera
+     *  lands on the relief — skimming ridges, settling in valleys — instead of the bounding sphere.
+     *  Absent ⇒ the stage-A sphere floor, byte-identical. Sampled every frame at the camera's radial
+     *  direction, so you rise and fall with the terrain as you fly over it. */
+    terrain?: (dx: number, dy: number, dz: number) => number;
+  } | null;
   /** Fired on every user input (key, drag, wheel) — hosts use it to wake auto-behaviours. */
   onInput?: () => void;
   /** Where key events live. Defaults to `globalThis`; tests hand in a stub surface. */
@@ -486,9 +495,14 @@ export function createFlycam(camera: RigCamera, cfg: FlycamConfig, opts: FlycamO
         surfN.subVectors(camera.position, surfC);
         const dist = surfN.length();
         if (dist > 1e-6) surfN.multiplyScalar(1 / dist); else surfN.set(0, 1, 0); // radial-out unit
+        // TERRAIN floor (stage B): the displaced surface radius under the camera, else the sphere
+        // (stage A). Sampled at the live radial direction, so the floor rises and falls with the
+        // relief as you skim over it. The speed-scale / brake bands keep using the sphere radius as
+        // their SCALE (the planet's size), so only the floor itself follows the terrain.
+        const rFloor = surf.terrain ? surf.terrain(surfN.x, surfN.y, surfN.z) : rSurf;
         const hover = Math.max(rSurf * HOVER_FRAC, HOVER_MIN);
-        floor = rSurf + hover;
-        altitude = dist - rSurf; // height above the true surface
+        floor = rFloor + hover;
+        altitude = dist - rFloor; // height above the true (terrain) surface
         // Holding (the CapsLock speed-lock) bypasses the smooth brake + speed-scale, exactly as it
         // bypasses the node damp; the hard backstop (c) below still runs, so you cannot tunnel.
         if (!hold) {

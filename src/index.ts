@@ -217,6 +217,26 @@ export type {
   NodeSource,
 } from './lod/nearmesh';
 
+/* ---- TRUE displaced planetary terrain (near-mesh terrain stage B): the DEEPEST close look — when
+ * you descend onto a solid planet (prototype: Earth) the near-mesh swaps its textured sphere for a
+ * higher-detail icosphere displaced by the planet's own height field (real mountains + silhouettes you
+ * fly over and land on), resolving in seamlessly. Driven BY `createNearMesh` ({ terrain: true }); these
+ * are the building blocks + the pluggable DEM-ready height source. */
+export {
+  createTerrain,
+  earthTerrainSource,
+  TERRAIN_ALT_ON,
+  TERRAIN_ALT_FULL,
+  TERRAIN_HEIGHT_SCALE,
+} from './lod/terrain';
+export type {
+  Terrain,
+  TerrainColorNode,
+  TerrainHeightSource,
+  TerrainOpts,
+  TerrainUpdate,
+} from './lod/terrain';
+
 /* ---- the HDR bloom post-process (DESIGN.md §5 "tier-3 post-sum pass reusing the tonemap
  * curves"): a helper the CONSUMER installs — scene → additive HDR buffer → bloom → one post-sum
  * tonemap → screen — replacing renderer.render in the loop with post.render(). The library owns
