@@ -2501,8 +2501,9 @@ async function main(): Promise<void> {
     applyGlyphTexture();
     updateStats();
   });
-  // SURFACE DETAIL (prototype): baked = today's shader (zero cost); procedural = the jupiter-layer
-  // planet resolves infinite close-up detail in the fragment shader, seamlessly blended from baked.
+  // SURFACE DETAIL: baked = today's shader (zero cost); procedural = the hard-edge planets (earth,
+  // ice, lava, moon) resolve infinite close-up detail in the fragment shader, seamlessly blended from
+  // baked, with their poles guarded against the equirect pinch.
   ui.surfaceDetail.addEventListener('change', () => {
     nearMesh?.setProceduralDetail(ui.surfaceDetail.value === 'procedural');
   });

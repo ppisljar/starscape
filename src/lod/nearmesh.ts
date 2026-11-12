@@ -70,10 +70,12 @@ import {
   float,
   int,
   max,
+  min,
   mix,
   normalLocal,
   pow,
   smoothstep,
+  sqrt,
   step,
   texture,
   uint,
@@ -405,7 +407,7 @@ export function generateNearTextures(seed = 1): Uint8Array {
   return data;
 }
 
-/* ---- procedural surface detail in the fragment shader (prototype: EARTH only) ---------------
+/* ---- procedural surface detail in the fragment shader (the HARD-EDGE planets) ---------------
  *
  * "Option B" / continuous LOD. The baked textures above run out of pixels when you fly very close
  * (magnification → soft). For a planet that is BIG on screen we instead evaluate its surface
@@ -416,15 +418,22 @@ export function generateNearTextures(seed = 1): Uint8Array {
  * so at detail=0 the procedural colour equals the baked texel; the extra octaves (freqs the 512×256
  * texture never stored) fade in with `iDetail`, so detail only ever ADDS, never jumps.
  *
- * Prototyped on EARTH — its hard land/sea coastline (a `land > 0.52` threshold in `PLANETS.earth`)
- * shows the win unmistakably: baked, a magnified coastline blurs into soft blobs; procedural, the
- * same coastline stays razor-sharp AND grows finer fractal inlets from the extra octaves. Opt-in and
- * self-contained like the rest of the file; OFF (the default) compiles the exact material shipped
- * today, references no `iDetail`, uploads nothing — zero added cost. */
+ * Rolled to the four HARD-EDGE planets whose sharp features a magnified baked texture blurs — EARTH
+ * (land/sea coastline, a `land > 0.52` threshold), ICE (cracked ice sheets), LAVA (glowing cracks,
+ * emissive) and MOON (crater rims). Each has its own TSL colour function mirroring its `PLANETS.*`
+ * baked texel; a fragment runs ONLY its own planet's branch (routed by texture layer in
+ * `buildMaterial`), so the smooth bodies (jupiter/neptune/venus/desert/star/mars) stay pure baked.
+ * Opt-in and self-contained like the rest of the file; OFF (the default) compiles the exact material
+ * shipped today, references no `iDetail`, uploads nothing — zero added cost. */
 
-/** Layer that gets procedural detail in this prototype. Earth's thresholded coastline shows the
- *  baked-blur-vs-procedural-sharp win most clearly. */
-export const PROCEDURAL_LAYER = NEAR_TEXTURE_NAMES.indexOf('earth');
+/** The texture layers that get per-fragment procedural detail: the HARD-EDGE planets whose sharp
+ *  features (earth coastlines, ice fissures, lava cracks, moon crater rims) a magnified baked texture
+ *  blurs. The smooth bodies (jupiter/neptune/venus/desert/star/mars) stay baked — their win is
+ *  negligible and not worth the shader cost. `buildMaterial` routes a fragment to its own planet's
+ *  branch by this membership; the fill loop ramps `iDetail` only for a node on one of these layers. */
+export const PROCEDURAL_LAYERS: ReadonlySet<number> = new Set(
+  (['earth', 'ice', 'lava', 'moon'] as const).map((name) => NEAR_TEXTURE_NAMES.indexOf(name)),
+);
 /** On-screen glyph radius (CSS px) where baked→procedural detail ramps 0→1. Below LO it is pure
  *  baked (today's look); above HI it is full procedural. ~LO is roughly where the 256-tall baked
  *  texture starts to magnify (planet screen-diameter ≳ texture height). */
@@ -435,6 +444,15 @@ const DETAIL_PX_HI = 360;
  *  small perturbation already carves visible new inlets. */
 const DETAIL_OCTAVES = 4;
 const DETAIL_GAIN = 2.2;
+/** Pole-pinch guard. The equirect uv from `normalLocal` (asin/atan) degenerates toward the poles —
+ *  longitude spins faster and faster, so BOTH the baked texel (its texture columns converge) and the
+ *  procedural noise smear into a radial starburst over a real polar cap, not just the exact point. We
+ *  can't fade to baked (baked pinches too), so each planet blends its surface toward a clean constant
+ *  POLE COLOUR across the cap (|latitude| ramps LO→HI, 1 = pole): earth → an ice cap, the moon → its
+ *  mean grey, etc. The constant has no longitude term, so there is nothing left to spin — a clean pole,
+ *  smoothstep-blended so no ring forms where the detailed surface meets it. */
+const POLE_CAP_LO = 0.62;
+const POLE_CAP_HI = 0.84;
 
 const INV_2PI = 1 / (2 * Math.PI);
 const INV_PI = 1 / Math.PI;
@@ -531,31 +549,126 @@ function rgb255(r: number, g: number, b: number): Node<'vec3'> {
   return vec3(srgb2lin(float(r / 255)), srgb2lin(float(g / 255)), srgb2lin(float(b / 255)));
 }
 
-/** Earth's surface colour (linear RGB) evaluated procedurally at the sphere point `N` (unit
- *  object-space normal) — a per-fragment TSL re-implementation of `PLANETS.earth`. `detail` ramps the
- *  extra high-frequency octaves in. `saltBase` is the layer's seeded salt (matches the baked
- *  texture's). The longitude is aligned to the BAKED sampling coordinate (SphereGeometry uv.x), which
- *  sits +0.25 off `atan(N.x,N.z)` — corrected here so the continents register exactly.
- *
- *  The land/sea boundary is a hard `land > 0.52` step, so the coastline is infinitely sharp per
- *  fragment (vs the baked texture's bilinear-magnified blur) and the extra octaves wiggle it into
- *  finer fractal inlets — the clearest read of the continuous-LOD win. */
-function earthProceduralRGB(N: Node<'vec3'>, detail: FNode, saltBase: number): Node<'vec3'> {
-  const uu = atan(N.x, N.z).mul(INV_2PI).add(0.25).fract();
-  const v = asin(clamp(N.y, -1, 1)).mul(INV_PI).add(0.5);
-  const lat = abs(v.sub(0.5)).mul(2); // 0 equator .. 1 pole
+/** The CPU `smooth(a, b, x)` (clamped smoothstep) as TSL, with a/b COMPILE-TIME edges so the edge
+ *  order may DESCEND (b < a) — three/WGSL `smoothstep` is only well-defined for ascending edges, and
+ *  the planets' ridge/crater masks use descending ones. Bit-faithful to the baked texel at the blend
+ *  boundary (same cubic as `core` `smooth`). */
+function smoothT(a: number, b: number, x: FNode): FNode {
+  const t = clamp(x.sub(a).div(b - a), 0, 1);
+  return t.mul(t).mul(float(3).sub(t.mul(2))) as unknown as FNode;
+}
+
+/** Blend a surface colour toward a clean constant `poleColour` across the polar cap (`lat` 0 equator
+ *  .. 1 pole) — the pole-pinch guard. The pole colour carries no longitude term, so the equirect
+ *  singularity has nothing to smear; smoothstep keeps the join to the detailed surface seamless. */
+function poleCap(colour: Node<'vec3'>, lat: FNode, poleColour: Node<'vec3'>): Node<'vec3'> {
+  return mix(colour, poleColour, smoothstep(POLE_CAP_LO, POLE_CAP_HI, lat)) as unknown as Node<'vec3'>;
+}
+
+/* The four procedural planets. Each takes the SHARED sphere uv (`uu` longitude, `v` latitude) and
+ * `lat` (|v−0.5|·2) computed once in `buildMaterial`, its seeded `saltBase` (= the baked layer's salt,
+ * so the low octaves reproduce the texel) and `detail` (ramps the extra octaves in), and returns
+ * linear RGB + emissive A as a vec4 — mirroring the matching `PLANETS.*` baked function so detail=0 is
+ * seamless. The longitude is aligned to the BAKED sampling coordinate (SphereGeometry uv.x), which
+ * sits +0.25 off `atan(N.x,N.z)` — handled by the caller so continents/craters register exactly. Each
+ * blends to a clean POLE COLOUR across the cap (`poleCap`) so the equirect pole does not pinch. */
+
+/** Earth — a hard `land > 0.52` coastline (razor-sharp per fragment vs the baked bilinear blur),
+ *  green→grey highlands, whitened to an ice cap at the poles; extra octaves carve finer inlets. */
+function earthProceduralRGBA(
+  uu: FNode,
+  v: FNode,
+  lat: FNode,
+  detail: FNode,
+  saltBase: number,
+): Node<'vec4'> {
   const land = fbmField(uu, v, detail, 5, 3, 5, saltBase); // CPU: wfbm(u,v,5,3,salt,5)
   const ice = smoothstep(0.82, 0.96, lat);
-  // land branch (green → grey highlands, whitened to ice at the poles)
   const hgt = smoothstep(0.52, 0.8, land);
   const landCol = mix(rgb255(70, 120, 55), rgb255(150, 150, 95), hgt);
   const landIced = mix(landCol, rgb255(235, 240, 245), ice);
-  // ocean branch (deep blue → shallow)
   const deep = smoothstep(0.2, 0.52, land);
   const oceanCol = mix(rgb255(14, 54, 120), rgb255(40, 110, 165), deep);
-  // the hard coastline: step(0.52, land) selects land over ocean, razor-sharp per fragment.
   const isLand = step(0.52, land);
-  return mix(oceanCol, landIced, isLand) as unknown as Node<'vec3'>;
+  const surf = mix(oceanCol, landIced, isLand) as unknown as Node<'vec3'>;
+  return vec4(poleCap(surf, lat, rgb255(235, 240, 245)), 0) as unknown as Node<'vec4'>; // ice-cap pole
+}
+
+/** Ice — a pale base veined by a ridged crack network (`|fbm − 0.5|` → thin blue fissures). The
+ *  cracks are a hard ridge, so they stay crisp per fragment and branch finer as detail→1. */
+function iceProceduralRGBA(
+  uu: FNode,
+  v: FNode,
+  lat: FNode,
+  detail: FNode,
+  saltBase: number,
+): Node<'vec4'> {
+  const base = fbmField(uu, v, detail, 6, 3, 4, saltBase); // wfbm(u,v,6,3,salt,4)
+  const crackN = abs(fbmField(uu, v, detail, 10, 5, 4, (saltBase + 7) | 0).sub(0.5)).mul(2);
+  const crack = smoothT(0.14, 0.0, crackN); // ridged → thin dark-blue fissures
+  const w = mix(float(235), float(205), base.mul(0.5)); // sRGB byte
+  const r = srgb2lin(mix(w, float(150), crack).mul(1 / 255));
+  const g = srgb2lin(mix(w.add(6), float(185), crack).mul(1 / 255));
+  const surf = vec3(r, g, float(1)) as unknown as Node<'vec3'>; // blue channel = 255 → linear 1
+  return vec4(poleCap(surf, lat, rgb255(228, 234, 255)), 0) as unknown as Node<'vec4'>; // pale-ice pole
+}
+
+/** Lava — dark rock veined by GLOWING cracks (a ridged fbm). The crack mask drives BOTH the bright
+ *  albedo and the emissive alpha, so the glow stays sharp (not a magnified blur) and branches finer
+ *  as detail→1. */
+function lavaProceduralRGBA(
+  uu: FNode,
+  v: FNode,
+  lat: FNode,
+  detail: FNode,
+  saltBase: number,
+): Node<'vec4'> {
+  const crackN = abs(fbmField(uu, v, detail, 9, 5, 5, saltBase).sub(0.5)).mul(2); // wfbm(u,v,9,5,salt,5)
+  const crack = smoothT(0.17, 0.0, crackN); // glowing fissures
+  const rock = float(18).add(fbmField(uu, v, detail, 12, 6, 4, (saltBase + 3) | 0).mul(26)); // byte
+  const r = srgb2lin(mix(rock, float(255), crack).mul(1 / 255));
+  const g = srgb2lin(mix(rock.mul(0.6), float(120), crack).mul(1 / 255));
+  const b = srgb2lin(mix(rock.mul(0.6), float(20), crack).mul(1 / 255));
+  const surf = vec3(r, g, b) as unknown as Node<'vec3'>;
+  // cool dark rock at the pole (no glow): fade both the albedo AND the emissive A across the cap.
+  const capped = poleCap(surf, lat, rgb255(30, 18, 18));
+  const emiss = crack.mul(220 / 255).mul(float(1).sub(smoothstep(POLE_CAP_LO, POLE_CAP_HI, lat)));
+  return vec4(capped, emiss) as unknown as Node<'vec4'>;
+}
+
+interface Crater {
+  cu: number;
+  cv: number;
+  rad: number;
+}
+
+/** Moon — a grey fbm plus hashed craters (dark floor, bright rim). The crater centres/radii are
+ *  compile-time constants (hashed from the layer salt in the factory, EXACTLY as `PLANETS.moon`), so
+ *  the loop unrolls to a fixed cost; each rim stays crisp per fragment where the baked texture softens
+ *  it. (The `if (d < 1.25)` CPU guard is a pure speed cull — every term is already 0 past 1.25 — so
+ *  dropping it here is exact.) */
+function moonProceduralRGBA(
+  uu: FNode,
+  v: FNode,
+  lat: FNode,
+  detail: FNode,
+  saltBase: number,
+  craters: Crater[],
+): Node<'vec4'> {
+  const base = fbmField(uu, v, detail, 7, 4, 5, saltBase); // wfbm(u,v,7,4,salt,5)
+  const g = float(120).add(base.sub(0.5).mul(70)).toVar();
+  for (const c of craters) {
+    const du = abs(uu.sub(c.cu));
+    const duw = min(du, float(1).sub(du)); // wrapped-longitude distance
+    const dy = v.sub(c.cv);
+    const d = sqrt(duw.mul(duw).add(dy.mul(dy))).mul(1 / c.rad);
+    const floorT = smoothT(1.0, 0.2, d);
+    const rim = smoothT(0.78, 1.02, d).mul(smoothT(1.25, 1.0, d));
+    g.addAssign(floorT.mul(-38).add(rim.mul(42)));
+  }
+  const gc = clamp(g.mul(1 / 255), 0, 1); // sRGB [0,1]
+  const surf = vec3(srgb2lin(gc), srgb2lin(gc.mul(0.99)), srgb2lin(gc.mul(0.95))) as unknown as Node<'vec3'>;
+  return vec4(poleCap(surf, lat, rgb255(120, 119, 114)), 0) as unknown as Node<'vec4'>; // mean-grey pole
 }
 
 /* ---- the factory --------------------------------------------------------------------------- */
@@ -576,10 +689,10 @@ export interface NearMeshOpts {
   /** Facet name → texture layer (value index k → texture k mod 10). null = flat tinted shading,
    *  no texture sampled and NONE generated. */
   textureFacet?: string | null;
-  /** PROTOTYPE opt-in: evaluate the `PROCEDURAL_LAYER` planet's surface procedurally in the fragment
-   *  shader when a node is big on screen, blending baked→procedural for continuous close-up detail
-   *  (no texture magnification blur). Default false ⇒ the exact material shipped today, zero cost.
-   *  Needs a textureFacet (it refines one baked layer). Live via `setProceduralDetail`. */
+  /** Opt-in: evaluate a `PROCEDURAL_LAYERS` planet's surface procedurally in the fragment shader when
+   *  a node is big on screen, blending baked→procedural for continuous close-up detail (no texture
+   *  magnification blur). Default false ⇒ the exact material shipped today, zero cost. Needs a
+   *  textureFacet (it refines the hard-edge baked layers). Live via `setProceduralDetail`. */
   proceduralDetail?: boolean;
   /** Override the built-in shape registry (unit-radius geometries, index 0 the default). */
   shapes?: BufferGeometry[];
@@ -615,8 +728,8 @@ export interface NearMesh {
   /** Rebind the texture facet (null = flat, no sampling). Switching from null generates the
    *  textures on demand (once). Live. */
   setTextureFacet(facet: string | null): void;
-  /** Toggle procedural surface detail for the `PROCEDURAL_LAYER` planet (prototype). Rebuilds the
-   *  material (like a texture-facet switch); off restores the exact shipped shader. Live. */
+  /** Toggle procedural surface detail for the `PROCEDURAL_LAYERS` planets. Rebuilds the material
+   *  (like a texture-facet switch); off restores the exact shipped shader. Live. */
   setProceduralDetail(on: boolean): void;
   /** How many nodes are drawn as meshes right now (telemetry). */
   readonly promoted: number;
@@ -654,9 +767,24 @@ export function createNearMesh(graph: Graph, field: Field, opts: NearMeshOpts = 
   let shapeFacet: string | null = opts.shapeFacet ?? null;
   let textureFacet: string | null = opts.textureFacet ?? null;
   let proceduralDetail = opts.proceduralDetail ?? false;
-  // the PROCEDURAL_LAYER planet's seeded salt — must equal `generateNearTextures`' per-layer salt so
-  // the shader's low octaves reproduce the baked texel exactly (seamless blend).
-  const proceduralSalt = (textureSeed * 0x1000193 + PROCEDURAL_LAYER * 0x9e3779b1) | 0;
+  // each promoted planet's seeded salt — must equal `generateNearTextures`' per-layer salt so the
+  // shader's low octaves reproduce that planet's baked texel exactly (seamless blend).
+  const layerSalt = (L: number): number => (textureSeed * 0x1000193 + L * 0x9e3779b1) | 0;
+  const L_EARTH = NEAR_TEXTURE_NAMES.indexOf('earth');
+  const L_ICE = NEAR_TEXTURE_NAMES.indexOf('ice');
+  const L_LAVA = NEAR_TEXTURE_NAMES.indexOf('lava');
+  const L_MOON = NEAR_TEXTURE_NAMES.indexOf('moon');
+  const earthSalt = layerSalt(L_EARTH);
+  const iceSalt = layerSalt(L_ICE);
+  const lavaSalt = layerSalt(L_LAVA);
+  const moonSalt = layerSalt(L_MOON);
+  // moon craters: centres/radii hashed from the moon salt EXACTLY as `PLANETS.moon` does, precomputed
+  // once as compile-time shader constants (the TSL loop in `moonProceduralRGBA` unrolls over them).
+  const moonCraters: Crater[] = Array.from({ length: 26 }, (_, k) => ({
+    cu: hash(k, (moonSalt + 11) | 0),
+    cv: 0.1 + hash(k, (moonSalt + 97) | 0) * 0.8,
+    rad: 0.02 + hash(k, (moonSalt + 131) | 0) * 0.06,
+  }));
   const facetData = (key: string | null): ArrayLike<number> | null =>
     key !== null && graph.facets[key] ? graph.facets[key]!.data : null;
   let shapeCodes = facetData(shapeFacet);
@@ -718,18 +846,44 @@ export function createNearMesh(graph: Graph, field: Field, opts: NearMeshOpts = 
         const layer = int(attribute('iTexLayer', 'float'));
         const sampled = texture(tex, uv()).depth(layer);
         const bodyRgb = sampled.rgb.toVar();
-        // PROTOTYPE: procedural surface detail. iDetail is per-instance (0 for every layer but the
-        // PROCEDURAL_LAYER planet, and 0 until it is big on screen), so this If is instance-uniform —
-        // whole non-detailed instances skip the noise entirely. At detail>0 we blend the baked texel
-        // toward the per-fragment procedural colour; its low octaves equal the texel, so no seam.
+        // PROCEDURAL surface detail. iDetail is per-instance (0 for every non-promoted layer, and 0
+        // until a promoted node is big on screen), so this outer If is instance-uniform — whole
+        // non-detailed instances skip the asin/atan and the noise entirely. For a detailed instance we
+        // route BY TEXTURE LAYER so a fragment runs ONLY its own planet's code, blending the baked
+        // texel toward the per-fragment procedural colour (its low octaves equal the texel, so no
+        // seam); each planet guards its own poles by blending to a clean pole colour (`poleCap`).
+        // Emissive (lava's glow) blends through bodyA identically, so the glow stays sharp too.
         if (proceduralDetail) {
+          const bodyA = sampled.a.toVar();
           const detail = attribute('iDetail', 'float');
           If(detail.greaterThan(0.001), () => {
-            const proc = earthProceduralRGB(N, detail, proceduralSalt);
-            bodyRgb.assign(mix(sampled.rgb, proc, detail));
+            const uu = atan(N.x, N.z).mul(INV_2PI).add(0.25).fract();
+            const vLat = asin(clamp(N.y, -1, 1)).mul(INV_PI).add(0.5);
+            const lat = abs(vLat.sub(0.5)).mul(2); // 0 equator .. 1 pole
+            const blend = (proc: Node<'vec4'>): void => {
+              bodyRgb.assign(mix(sampled.rgb, proc.xyz, detail));
+              bodyA.assign(mix(sampled.a, proc.w, detail));
+            };
+            If(layer.equal(int(L_EARTH)), () => {
+              blend(earthProceduralRGBA(uu, vLat, lat, detail, earthSalt));
+            })
+              .ElseIf(layer.equal(int(L_ICE)), () => {
+                blend(iceProceduralRGBA(uu, vLat, lat, detail, iceSalt));
+              })
+              .ElseIf(layer.equal(int(L_LAVA)), () => {
+                blend(lavaProceduralRGBA(uu, vLat, lat, detail, lavaSalt));
+              })
+              .ElseIf(layer.equal(int(L_MOON)), () => {
+                blend(moonProceduralRGBA(uu, vLat, lat, detail, moonSalt, moonCraters));
+              });
           });
+          // let the texture carry the identity; the node tint only hints (so a planet stays a planet)
+          const albedo = bodyRgb.mul(mix(vec3(1, 1, 1), tint, float(0.25)));
+          const emissive = bodyRgb.mul(bodyA).mul(1.7);
+          const outc = albedo.mul(lightAmt).add(emissive);
+          return vec4(outc, 1) as unknown as ReturnType<typeof vec4>;
         }
-        // let the texture carry the identity; the node tint only hints (so a planet stays a planet)
+        // DEFAULT (baked): the exact shader shipped today — references no iDetail, uploads nothing.
         const albedo = bodyRgb.mul(mix(vec3(1, 1, 1), tint, float(0.25)));
         const emissive = sampled.rgb.mul(sampled.a).mul(1.7);
         const outc = albedo.mul(lightAmt).add(emissive);
@@ -1048,10 +1202,10 @@ export function createNearMesh(graph: Graph, field: Field, opts: NearMeshOpts = 
       const layer = texCodes ? texCodes[i]! % texCount : 0;
       pool.iTexLayer[w] = layer;
       // procedural detail blend: ramp 0→1 as the node's projected radius crosses the kick-in band,
-      // but ONLY for the prototype layer (every other layer, and every far node, stays pure baked).
+      // but ONLY for a promoted hard-edge layer (every other layer, and every far node, stays baked).
       if (proceduralDetail) {
         let det = 0;
-        if (layer === PROCEDURAL_LAYER) {
+        if (PROCEDURAL_LAYERS.has(layer)) {
           const t = clamp01((candPx[j]! - DETAIL_PX_LO) / (DETAIL_PX_HI - DETAIL_PX_LO));
           det = t * t * (3 - 2 * t); // smoothstep
         }
@@ -1137,7 +1291,7 @@ export function createNearMesh(graph: Graph, field: Field, opts: NearMeshOpts = 
       if (on === proceduralDetail) return;
       proceduralDetail = on;
       // rebuild the material so OFF compiles the exact shipped shader (references no iDetail) and ON
-      // splices the procedural branch in; the next update fills iDetail for promoted prototype nodes.
+      // splices the procedural branch in; the next update fills iDetail for promoted hard-edge nodes.
       const old = material;
       material = buildMaterial(textured);
       for (const p of pools.values()) {

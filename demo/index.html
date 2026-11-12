@@ -116,11 +116,11 @@
               <option value="full">full (planet face)</option>
             </select>
           </label>
-          <label title="PROTOTYPE (earth layer only): when a textured planet is BIG on screen, evaluate its surface PROCEDURALLY in the shader instead of magnifying the baked texture — continuous, infinite close-up detail, no blur. baked = today's behaviour (default, zero cost); procedural = the earth-layer planet keeps a razor-sharp, ever-finer coastline as you fly in, seamlessly blended from the baked texture. Needs a 'texture by' facet (earth = facet value 0)."
+          <label title="HARD-EDGE planets (earth, ice, lava, moon): when a textured planet is BIG on screen, evaluate its surface PROCEDURALLY in the shader instead of magnifying the baked texture — continuous, infinite close-up detail, no blur. baked = today's behaviour (default, zero cost); procedural = earth coastlines, ice fissures, lava cracks (glowing) and moon crater rims stay razor-sharp and ever finer as you fly in, seamlessly blended from the baked texture; the poles are guarded against pinch. The smooth planets stay baked. Needs a 'texture by' facet (each node's planet = facet value mod 10)."
             >surface detail
             <select id="surfaceDetail">
               <option value="baked">baked (soft up close)</option>
-              <option value="procedural">procedural (earth)</option>
+              <option value="procedural">procedural (hard-edge)</option>
             </select>
           </label>
           <label class="row" title="a node becomes a 3D mesh when its on-screen glyph radius exceeds this many pixels — larger = promote later / closer"

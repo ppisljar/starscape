@@ -200,7 +200,7 @@ export {
   wrapNearTextures,
   NEAR_SHAPE_NAMES,
   NEAR_TEXTURE_NAMES,
-  PROCEDURAL_LAYER,
+  PROCEDURAL_LAYERS,
   TEX_W,
   TEX_H,
 } from './lod/nearmesh';
